@@ -1,0 +1,67 @@
+name: tests
+
+on:
+  push:
+    branches: ["main"]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        # 3.8 is the floor the library promises; 3.12 is the ceiling in use.
+        python-version: ["3.8", "3.11", "3.12"]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Install
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e ".[dev]"
+
+      - name: Check the 3.8 compatibility promise
+        run: |
+          python - <<'PY'
+          import ast
+          ast.parse(open("docpipe.py", encoding="utf-8").read(), feature_version=(3, 8))
+          print("docpipe.py parses as Python 3.8")
+          PY
+
+      - name: Import without any optional dependency
+        # The core must stay pure-stdlib importable: a missing optional
+        # dependency has to fail at the point of use, not at import time.
+        run: |
+          python - <<'PY'
+          import subprocess, sys, textwrap
+          script = textwrap.dedent("""
+              import builtins
+              blocked = {"numpy", "cv2", "PIL", "fitz", "pymupdf", "pydantic"}
+              real = builtins.__import__
+              def guard(name, *a, **k):
+                  if name.split(".")[0] in blocked:
+                      raise ImportError("blocked for this check: " + name)
+                  return real(name, *a, **k)
+              builtins.__import__ = guard
+              import docpipe
+              assert docpipe.parse_amount("1,23,456.78") is not None
+              assert docpipe.fuse_confidence({"validation": 0.9}) > 0.5
+              print("core imports and runs with no optional dependencies")
+          """)
+          sys.exit(subprocess.call([sys.executable, "-c", script]))
+          PY
+
+      - name: Tests
+        run: pytest -q
+
+      - name: Tests with OpenCV disabled
+        # Exercises the pure-NumPy image-op fallbacks end to end.
+        env:
+          DOCPIPE_DISABLE_OPENCV: "1"
+        run: pytest -q tests/test_image_ops.py tests/test_quality.py tests/test_preprocess.py
