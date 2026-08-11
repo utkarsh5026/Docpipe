@@ -200,6 +200,12 @@ class MissingDependency(DocpipeError, ImportError):
     """An optional dependency is required for the requested operation."""
 
     def __init__(self, module: str, purpose: str = "", extra: str = ""):
+        """Build the error, including the ``pip install`` line that fixes it.
+
+        :param module: the import name that failed
+        :param purpose: what it was needed for, e.g. "PDF handling"
+        :param extra: the pip name, when it differs from the import name
+        """
         self.module = module
         self.purpose = purpose
         hint = extra or module
@@ -334,10 +340,12 @@ class _OpenCVDisabled(object):
     """Context manager forcing NumPy fallbacks inside a block."""
 
     def __enter__(self):
+        """Turn OpenCV off, remembering the previous setting."""
         self._prev = set_opencv_enabled(False)
         return self
 
     def __exit__(self, *exc):
+        """Restore the previous setting.  Never swallows an exception."""
         set_opencv_enabled(self._prev)
         return False
 
@@ -414,6 +422,7 @@ def clamp(value: float, lo: float, hi: float) -> float:
 
 
 def _safe_div(a: float, b: float, default: float = 0.0) -> float:
+    """``a / b``, or ``default`` when ``b`` is zero."""
     return a / b if b else default
 
 
@@ -485,19 +494,23 @@ class Timer(object):
     __slots__ = ("start", "end")
 
     def __init__(self):
+        """Start at zero; the clock only runs between ``__enter__`` and ``__exit__``."""
         self.start = 0.0
         self.end = 0.0
 
     def __enter__(self):
+        """Start the clock."""
         self.start = time.time()
         return self
 
     def __exit__(self, *exc):
+        """Stop the clock.  Never swallows an exception."""
         self.end = time.time()
         return False
 
     @property
     def ms(self) -> float:
+        """Elapsed milliseconds -- so far, if the block has not exited yet."""
         end = self.end or time.time()
         return (end - self.start) * 1000.0
 
@@ -566,6 +579,7 @@ def _map_maybe_parallel(fn: Callable[[Any], Any], items: Sequence[Any],
 
 
 def _utcnow() -> str:
+    """Current UTC time as a second-resolution ISO-8601 string."""
     return _dt.datetime.utcnow().replace(microsecond=0).isoformat() + "Z"
 
 
@@ -643,6 +657,7 @@ class PageKind(str, enum.Enum):
     BLANK = "blank"                    #: nothing worth reading
 
     def __str__(self):
+        """The bare value, so formatting a kind never leaks ``PageKind.``."""
         return self.value
 
 
@@ -654,6 +669,7 @@ class Verdict(str, enum.Enum):
     UNREADABLE = "unreadable"
 
     def __str__(self):
+        """The bare value, so formatting a verdict never leaks ``Verdict.``."""
         return self.value
 
 
@@ -671,6 +687,7 @@ class RegionKind(str, enum.Enum):
     UNKNOWN = "unknown"
 
     def __str__(self):
+        """The bare value, so formatting a kind never leaks ``RegionKind.``."""
         return self.value
 
 
@@ -691,6 +708,7 @@ class BBox(object):
     def __post_init__(self):
         # Normalise inverted rectangles rather than rejecting them: several
         # OCR engines emit quads in arbitrary vertex order.
+        """Normalise the rectangle so width and height are never negative."""
         if self.x1 < self.x0:
             low, high = self.x1, self.x0
             object.__setattr__(self, "x0", low)
@@ -703,18 +721,22 @@ class BBox(object):
     # -- geometry ---------------------------------------------------------
     @property
     def width(self) -> float:
+        """Width in points (never negative -- see :meth:`__post_init__`)."""
         return self.x1 - self.x0
 
     @property
     def height(self) -> float:
+        """Height in points (never negative -- see :meth:`__post_init__`)."""
         return self.y1 - self.y0
 
     @property
     def area(self) -> float:
+        """Area in square points."""
         return max(0.0, self.width) * max(0.0, self.height)
 
     @property
     def center(self) -> Tuple[float, float]:
+        """``(x, y)`` of the centre, in points."""
         return ((self.x0 + self.x1) / 2.0, (self.y0 + self.y1) / 2.0)
 
     def union(self, other: BBox) -> BBox:
@@ -745,25 +767,36 @@ class BBox(object):
         return _safe_div(inter.area, denom)
 
     def contains(self, other: BBox, tolerance: float = 0.0) -> bool:
+        """True when ``other`` lies inside this box on the same page.
+
+        ``tolerance`` slackens every edge outward, which matters because OCR
+        boxes and layout boxes come from different estimators and rarely nest
+        exactly.
+        """
         return (other.page == self.page
                 and other.x0 >= self.x0 - tolerance and other.y0 >= self.y0 - tolerance
                 and other.x1 <= self.x1 + tolerance and other.y1 <= self.y1 + tolerance)
 
     def overlaps(self, other: BBox) -> bool:
+        """True when the two boxes share any area on the same page."""
         return self.intersection(other) is not None
 
     def expand(self, margin: float) -> BBox:
+        """This box grown by ``margin`` points on every side (negative shrinks)."""
         return BBox(self.page, self.x0 - margin, self.y0 - margin,
                     self.x1 + margin, self.y1 + margin)
 
     def scaled(self, factor: float) -> BBox:
+        """This box with every coordinate multiplied by ``factor``."""
         return BBox(self.page, self.x0 * factor, self.y0 * factor,
                     self.x1 * factor, self.y1 * factor)
 
     def translated(self, dx: float, dy: float) -> BBox:
+        """This box shifted by ``(dx, dy)`` points."""
         return BBox(self.page, self.x0 + dx, self.y0 + dy, self.x1 + dx, self.y1 + dy)
 
     def clipped(self, width: float, height: float) -> BBox:
+        """This box confined to a ``width`` x ``height`` page."""
         return BBox(self.page,
                     clamp(self.x0, 0.0, width), clamp(self.y0, 0.0, height),
                     clamp(self.x1, 0.0, width), clamp(self.y1, 0.0, height))
@@ -784,6 +817,7 @@ class BBox(object):
 
     @classmethod
     def from_xywh(cls, page: int, x: float, y: float, w: float, h: float) -> BBox:
+        """Build from a top-left corner plus a width and height."""
         return cls(page, x, y, x + w, y + h)
 
     @classmethod
@@ -795,19 +829,23 @@ class BBox(object):
 
     @classmethod
     def whole_page(cls, page: int, width_pt: float, height_pt: float) -> BBox:
+        """A box covering the entire page -- the default evidence region."""
         return cls(page, 0.0, 0.0, width_pt, height_pt)
 
     # -- serialisation ----------------------------------------------------
     def to_dict(self) -> Dict[str, float]:
+        """JSON-ready dict; coordinates are rounded to 3 decimals (~0.001 pt)."""
         return {"page": self.page, "x0": round(self.x0, 3), "y0": round(self.y0, 3),
                 "x1": round(self.x1, 3), "y1": round(self.y1, 3)}
 
     @classmethod
     def from_dict(cls, d: Mapping[str, Any]) -> BBox:
+        """Inverse of :meth:`to_dict`."""
         return cls(int(d["page"]), float(d["x0"]), float(d["y0"]),
                    float(d["x1"]), float(d["y1"]))
 
     def __repr__(self):
+        """``BBox(page=3, 72.0, 90.0, 300.0, 110.0)``."""
         return "BBox(page=%d, %.1f, %.1f, %.1f, %.1f)" % (
             self.page, self.x0, self.y0, self.x1, self.y1)
 
@@ -841,13 +879,21 @@ class TextSpan(object):
 
     @property
     def page(self) -> int:
+        """Index of the page this span sits on."""
         return self.bbox.page
 
     @property
     def is_empty(self) -> bool:
+        """True when the span carries no non-whitespace text."""
         return not self.text.strip()
 
     def to_dict(self) -> Dict[str, Any]:
+        """JSON-ready dict.
+
+        Optional fields are omitted when unset rather than serialised as null:
+        a document's span list is the bulk of its JSON, and absent-means-unknown
+        round-trips through :meth:`from_dict` unchanged.
+        """
         d = {"text": self.text, "bbox": self.bbox.to_dict(), "source": self.source}
         if self.confidence is not None:
             d["confidence"] = round(float(self.confidence), 4)
@@ -863,6 +909,7 @@ class TextSpan(object):
 
     @classmethod
     def from_dict(cls, d: Mapping[str, Any]) -> TextSpan:
+        """Inverse of :meth:`to_dict`."""
         return cls(text=d["text"], bbox=BBox.from_dict(d["bbox"]),
                    source=d.get("source", "unknown"), confidence=d.get("confidence"),
                    script=d.get("script"), line=d.get("line"), block=d.get("block"),
@@ -891,6 +938,7 @@ class PageQuality(object):
 
     @property
     def is_readable(self) -> bool:
+        """True unless the page was judged :attr:`Verdict.UNREADABLE`."""
         return self.verdict is not Verdict.UNREADABLE
 
     @property
@@ -912,6 +960,7 @@ class PageQuality(object):
         return round(sum(w * v for w, v in terms), 4)
 
     def to_dict(self) -> Dict[str, Any]:
+        """JSON-ready dict, including the derived :attr:`score`."""
         return {
             "blur": round(self.blur, 4), "skew_deg": round(self.skew_deg, 3),
             "contrast": round(self.contrast, 4), "ink_coverage": round(self.ink_coverage, 4),
@@ -923,6 +972,7 @@ class PageQuality(object):
 
     @classmethod
     def from_dict(cls, d: Mapping[str, Any]) -> PageQuality:
+        """Inverse of :meth:`to_dict` (the derived ``score`` key is ignored)."""
         return cls(blur=float(d.get("blur", 1.0)), skew_deg=float(d.get("skew_deg", 0.0)),
                    contrast=float(d.get("contrast", 1.0)),
                    ink_coverage=float(d.get("ink_coverage", 0.0)),
@@ -934,6 +984,7 @@ class PageQuality(object):
                    extra=dict(d.get("extra") or {}))
 
     def __repr__(self):
+        """The handful of numbers worth seeing in a log line or a REPL."""
         return ("PageQuality(verdict=%s, blur=%.2f, skew=%.2f deg, contrast=%.2f, "
                 "dpi~%d, score=%.2f)" % (self.verdict, self.blur, self.skew_deg,
                                          self.contrast, self.effective_dpi, self.score))
@@ -949,11 +1000,13 @@ class LayoutRegion(object):
     meta: Dict[str, Any] = field(default_factory=dict)
 
     def to_dict(self) -> Dict[str, Any]:
+        """JSON-ready dict."""
         return {"kind": str(self.kind), "bbox": self.bbox.to_dict(),
                 "confidence": round(self.confidence, 4), "meta": _as_jsonable(self.meta)}
 
     @classmethod
     def from_dict(cls, d: Mapping[str, Any]) -> LayoutRegion:
+        """Inverse of :meth:`to_dict`."""
         return cls(RegionKind(d.get("kind", "unknown")), BBox.from_dict(d["bbox"]),
                    float(d.get("confidence", 1.0)), dict(d.get("meta") or {}))
 
@@ -965,25 +1018,31 @@ class Layout(object):
     regions: List[LayoutRegion] = field(default_factory=list)
 
     def of_kind(self, kind: RegionKind) -> List[LayoutRegion]:
+        """Every region of exactly ``kind``, in detection order."""
         return [r for r in self.regions if r.kind is kind]
 
     @property
     def is_tabular(self) -> bool:
+        """True when at least one table region was detected."""
         return bool(self.of_kind(RegionKind.TABLE))
 
     @property
     def has_handwriting(self) -> bool:
+        """True when at least one handwriting region was detected."""
         return bool(self.of_kind(RegionKind.HANDWRITING))
 
     @property
     def has_stamps(self) -> bool:
+        """True when at least one stamp region was detected."""
         return bool(self.of_kind(RegionKind.STAMP))
 
     def to_dict(self) -> Dict[str, Any]:
+        """JSON-ready dict."""
         return {"regions": [r.to_dict() for r in self.regions]}
 
     @classmethod
     def from_dict(cls, d: Mapping[str, Any]) -> Layout:
+        """Inverse of :meth:`to_dict`."""
         return cls([LayoutRegion.from_dict(r) for r in (d.get("regions") or [])])
 
 
@@ -1001,6 +1060,7 @@ class OpRecord(object):
     note: str = ""
 
     def to_dict(self) -> Dict[str, Any]:
+        """JSON-ready dict, omitting empty params and notes."""
         d = {"op": self.op, "ms": round(self.ms, 2)}
         if self.params:
             d["params"] = _as_jsonable(self.params)
@@ -1009,6 +1069,7 @@ class OpRecord(object):
         return d
 
     def __str__(self):
+        """``op(param=value, ...)`` -- how history reads in a log line."""
         if not self.params:
             return self.op
         args = ", ".join("%s=%r" % (k, v) for k, v in sorted(self.params.items()))
@@ -1105,6 +1166,11 @@ class Page(object):
 
     def set_raster_provider(self, provider: RasterProvider,
                             dpi: Optional[int] = None) -> Page:
+        """Attach a lazy raster source, e.g. a PDF page renderer.
+
+        :param provider: called as ``provider(dpi)`` and must return an ImageArray
+        :param dpi: the resolution to assume until one is requested explicitly
+        """
         self._raster_provider = provider
         if dpi:
             self._raster_dpi = int(dpi)
@@ -1118,6 +1184,7 @@ class Page(object):
 
     @property
     def raster_dpi(self) -> int:
+        """Resolution of the current raster, falling back to :data:`DEFAULT_DPI`."""
         return self._raster_dpi or DEFAULT_DPI
 
     @property
@@ -1153,23 +1220,39 @@ class Page(object):
 
     @property
     def char_count(self) -> int:
+        """Total non-whitespace characters across every span on the page."""
         return sum(len(s.text.strip()) for s in self.spans)
 
     @property
     def is_blank(self) -> bool:
+        """True when the page is worth skipping entirely.
+
+        Either it was classified blank at ingest, or it has no text *and*
+        essentially no ink -- both checks are needed, because an unread scan of a
+        full page also has a character count of zero.
+        """
         return self.kind is PageKind.BLANK or (self.char_count == 0
                                                and self.quality.ink_coverage < 0.002)
 
     # -- bookkeeping ------------------------------------------------------
     def record(self, op: str, params: Optional[Dict[str, Any]] = None, ms: float = 0.0,
                note: str = "") -> Page:
+        """Append an entry to this page's processing history.  Returns ``self``.
+
+        :param op: the op's registered name
+        :param params: the arguments it ran with, for reproducibility
+        :param ms: wall-clock duration
+        :param note: anything worth knowing, e.g. why an op declined to run
+        """
         self.history.append(OpRecord(op=op, params=dict(params or {}), ms=ms, note=note))
         return self
 
     def history_summary(self) -> str:
+        """The op history as one ``a -> b -> c`` line."""
         return " -> ".join(str(h) for h in self.history)
 
     def bbox(self) -> BBox:
+        """A box covering the whole page, in points."""
         return BBox.whole_page(self.index, self.width_pt, self.height_pt)
 
     def copy(self, deep_spans: bool = True) -> Page:
@@ -1192,6 +1275,11 @@ class Page(object):
         return new
 
     def to_dict(self, include_spans: bool = True) -> Dict[str, Any]:
+        """JSON-ready dict.
+
+        ``include_spans=False`` keeps the structure and the measurements but drops
+        the text, which is what the eval harness stores for a fixture.
+        """
         d = {
             "index": self.index, "kind": str(self.kind),
             "width_pt": round(self.width_pt, 2), "height_pt": round(self.height_pt, 2),
@@ -1206,6 +1294,7 @@ class Page(object):
 
     @classmethod
     def from_dict(cls, d: Mapping[str, Any]) -> Page:
+        """Inverse of :meth:`to_dict`.  The raster is *not* restored."""
         page = cls(
             index=int(d["index"]),
             width_pt=float(d.get("width_pt", 612.0)),
@@ -1223,6 +1312,7 @@ class Page(object):
         return page
 
     def __repr__(self):
+        """Index, kind, size, span count and quality verdict."""
         return "Page(index=%d, kind=%s, %dx%d pt, spans=%d, %s)" % (
             self.index, self.kind, self.width_pt, self.height_pt,
             len(self.spans), self.quality.verdict)
@@ -1238,12 +1328,15 @@ class Document(object):
     warnings: List[str] = field(default_factory=list)
 
     def __len__(self):
+        """Number of pages."""
         return len(self.pages)
 
     def __iter__(self) -> Iterator[Page]:
+        """Iterate over pages in order."""
         return iter(self.pages)
 
     def __getitem__(self, i: int) -> Page:
+        """Page by list position (see :meth:`page` for lookup by page index)."""
         return self.pages[i]
 
     def page(self, index: int) -> Page:
@@ -1254,9 +1347,11 @@ class Document(object):
         raise KeyError("no page with index %d" % index)
 
     def text(self, separator: str = "\n\n") -> str:
+        """Reading-order text of every non-empty page, joined by ``separator``."""
         return separator.join(p.text() for p in self.pages if p.text().strip())
 
     def spans(self) -> List[TextSpan]:
+        """Every span in the document, page by page, in order."""
         out: List[TextSpan] = []
         for p in self.pages:
             out.extend(p.spans)
@@ -1264,9 +1359,11 @@ class Document(object):
 
     @property
     def char_count(self) -> int:
+        """Total non-whitespace characters in the document."""
         return sum(p.char_count for p in self.pages)
 
     def kinds(self) -> Dict[str, int]:
+        """Count of pages per :class:`PageKind`, e.g. ``{"scanned": 12}``."""
         counts: Dict[str, int] = {}
         for p in self.pages:
             key = str(p.kind)
@@ -1274,12 +1371,18 @@ class Document(object):
         return counts
 
     def warn(self, message: str) -> Document:
+        """Record a de-duplicated warning and log it.  Returns ``self``.
+
+        Warnings survive on the Document rather than being raised because a bad
+        page is not a bad document: the caller usually wants the other 40 pages.
+        """
         if message not in self.warnings:
             self.warnings.append(message)
         logger.warning("%s: %s", self.source_uri or "<doc>", message)
         return self
 
     def copy(self) -> Document:
+        """Deep-enough copy: pages are copied, rasters are shared."""
         return Document(source_uri=self.source_uri, pages=[p.copy() for p in self.pages],
                         meta=dict(self.meta), warnings=list(self.warnings))
 
@@ -1296,6 +1399,7 @@ class Document(object):
                         meta=dict(self.meta), warnings=list(self.warnings))
 
     def to_dict(self, include_spans: bool = True) -> Dict[str, Any]:
+        """JSON-ready dict; ``include_spans=False`` drops the text."""
         return {
             "source_uri": self.source_uri,
             "meta": _as_jsonable(self.meta),
@@ -1305,22 +1409,26 @@ class Document(object):
 
     @classmethod
     def from_dict(cls, d: Mapping[str, Any]) -> Document:
+        """Inverse of :meth:`to_dict`.  Rasters are *not* restored."""
         return cls(source_uri=d.get("source_uri", ""),
                    pages=[Page.from_dict(p) for p in (d.get("pages") or [])],
                    meta=dict(d.get("meta") or {}),
                    warnings=list(d.get("warnings") or []))
 
     def save_json(self, path: str, include_spans: bool = True) -> str:
+        """Write :meth:`to_dict` to ``path`` as UTF-8 JSON.  Returns ``path``."""
         with open(path, "w", encoding="utf-8") as fh:
             fh.write(to_json(self.to_dict(include_spans=include_spans)))
         return path
 
     @classmethod
     def load_json(cls, path: str) -> Document:
+        """Read a document back from a file written by :meth:`save_json`."""
         with open(path, "r", encoding="utf-8") as fh:
             return cls.from_dict(json.load(fh))
 
     def __repr__(self):
+        """Source, page count and character count."""
         return "Document(%r, pages=%d, chars=%d)" % (
             self.source_uri, len(self.pages), self.char_count)
 
@@ -1337,6 +1445,11 @@ class Cost(object):
     wasted_calls: int = 0  #: attempts that failed *after* the provider billed us
 
     def __add__(self, other: Cost) -> Cost:
+        """Sum two costs.
+
+        Mixing currencies raises :class:`ConfigError` -- unless one side is zero,
+        which is what makes ``sum(costs)`` (starting from ``0``) work.
+        """
         if not isinstance(other, Cost):
             return NotImplemented
         if self.amount and other.amount and self.currency != other.currency:
@@ -1352,18 +1465,22 @@ class Cost(object):
 
     @classmethod
     def zero(cls, currency: str = "USD") -> Cost:
+        """An empty cost in ``currency`` -- the identity for addition."""
         return cls(currency=currency)
 
     @property
     def total_tokens(self) -> int:
+        """Input plus output tokens."""
         return self.input_tokens + self.output_tokens
 
     def to_dict(self) -> Dict[str, Any]:
+        """JSON-ready dict; the amount keeps 6 decimals (sub-cent per page)."""
         return {"currency": self.currency, "amount": round(self.amount, 6),
                 "input_tokens": self.input_tokens, "output_tokens": self.output_tokens,
                 "calls": self.calls, "wasted_calls": self.wasted_calls}
 
     def __repr__(self):
+        """Amount, currency and token counts."""
         return "Cost(%.6f %s, in=%d, out=%d, calls=%d)" % (
             self.amount, self.currency, self.input_tokens, self.output_tokens, self.calls)
 
@@ -1384,10 +1501,12 @@ class Cost(object):
 
 
 def is_gray(img: ImageArray) -> bool:
+    """True for a single-channel ``(H, W)`` array."""
     return getattr(img, "ndim", 0) == 2
 
 
 def is_color(img: ImageArray) -> bool:
+    """True for a multi-channel ``(H, W, C>=3)`` array."""
     return getattr(img, "ndim", 0) == 3 and img.shape[2] >= 3
 
 
@@ -1466,6 +1585,7 @@ def window_stats(gray: GrayImage, window: int) -> Tuple[FloatArray, FloatArray]:
     x1 = np.clip(xs + r + 1, 0, w)
 
     def block(integral):
+        """Sum over every clipped window at once, from a summed-area table."""
         return (integral[np.ix_(y1, x1)] - integral[np.ix_(y0, x1)]
                 - integral[np.ix_(y1, x0)] + integral[np.ix_(y0, x0)])
 
@@ -1760,6 +1880,7 @@ def ink_mask(gray: GrayImage, threshold: Optional[int] = None,
 
 
 def _percentile_np(arr: ImageArray, q: float) -> float:
+    """``q``-th percentile of an array, via NumPy when it is loaded."""
     np = _np()
     return float(np.percentile(arr, q))
 
@@ -2083,6 +2204,11 @@ def estimate_skew(gray: GrayImage, max_angle: float = 15.0, method: str = "auto"
         # percent of the page, so shifting the *coordinates* of the ink is
         # dramatically cheaper than shearing the whole raster once per angle --
         # and this search evaluates ~50 angles.
+        """Coarse-to-fine search for the angle with the sharpest projection.
+
+        Returns ``0.0`` when no angle beats the straight-page hypothesis by
+        ``min_improvement``.
+        """
         height, width = mask.shape[:2]
         ink_y, ink_x = np.nonzero(mask)
         if ink_y.size < 32:
@@ -2094,6 +2220,7 @@ def estimate_skew(gray: GrayImage, max_angle: float = 15.0, method: str = "auto"
             # text lines only stack into tall, narrow bands when horizontal.
             # Forward map, so the sign is the negative of the inverse-mapped
             # shear in row_projection_at_angle -- the two must agree.
+            """Variance of the row-projection profile after shearing by ``angle``."""
             shifted = ink_y - np.round(centred_x * math.tan(math.radians(angle)))
             # Ink sheared off the page is *discarded*, not clamped.  Clamping
             # heaps every out-of-range pixel onto the first or last row, and
@@ -2146,6 +2273,11 @@ def estimate_skew(gray: GrayImage, max_angle: float = 15.0, method: str = "auto"
         return refined_angle
 
     def by_hough():
+        """Median angle of near-horizontal Hough segments, or ``None``.
+
+        ``None`` means "no opinion" -- OpenCV missing, no lines found, or too few
+        to be worth a median -- and the caller drops it from the consensus.
+        """
         cv = _cv2()
         if cv is None:
             return None
@@ -2170,6 +2302,10 @@ def estimate_skew(gray: GrayImage, max_angle: float = 15.0, method: str = "auto"
         return float(statistics.median(angles))
 
     def by_minarearect():
+        """Angle of the minimum-area rectangle around all ink, or ``None``.
+
+        ``None`` means "no opinion" (see ``by_hough``).
+        """
         cv = _cv2()
         if cv is None:
             return None
@@ -2630,6 +2766,7 @@ def _pdf_raster_provider(fdoc: Any, pno: int) -> RasterProvider:
     file alive exactly as long as some page might still need to render.
     """
     def provider(dpi):
+        """Render this PDF page at ``dpi`` on demand."""
         np = _np()
         fitz = _fitz(required=True)
         matrix = fitz.Matrix(dpi / 72.0, dpi / 72.0)
@@ -2676,6 +2813,7 @@ def _ingest_pdf_pdfium(source: Source, max_pages: int = 0,
         page.quality.raster_dpi = render_dpi
 
         def provider(dpi, _pno=pno):
+            """Render this PDF page at ``dpi`` on demand."""
             bitmap = pdf[_pno].render(scale=dpi / 72.0)
             return np.ascontiguousarray(np.asarray(bitmap.to_pil().convert("RGB")))
 
@@ -3098,6 +3236,16 @@ class Op(object):
 
     def __init__(self, name: str, fn: OpFn, params: Optional[Dict[str, Any]] = None,
                  geometric: bool = False, needs_raster: bool = True) -> None:
+        """Bind a raster function and its parameters into a reusable op.
+
+        :param name: the registered name, used for history and serialisation
+        :param fn: ``fn(img, page, **params) -> Optional[ImageArray]``; returning
+            ``None`` means "declined, leave the raster alone"
+        :param geometric: True when the op changes the page's pixel dimensions, so
+            that point-space geometry is recomputed afterwards
+        :param needs_raster: when True the op is skipped (and says so in the
+            history) on a page that has no raster
+        """
         self.name = name
         self.fn = fn
         self.params = dict(params or {})
@@ -3105,6 +3253,12 @@ class Op(object):
         self.needs_raster = needs_raster
 
     def __call__(self, page: Page) -> Page:
+        """Run the op, returning a *new* page.  The input page is never mutated.
+
+        Timing and parameters land in the returned page's history whether or not
+        the op actually changed anything, so a pipeline is reconstructable from
+        its output alone.
+        """
         out = page.copy()
         if self.needs_raster and not out.has_raster():
             out.record(self.name, self.params, 0.0, note="skipped: no raster")
@@ -3122,12 +3276,15 @@ class Op(object):
         return out
 
     def then(self, other: Op) -> Op:
+        """``a.then(b)`` -- a composite that runs this op, then ``other``."""
         return compose(self, other)
 
     def to_dict(self) -> Dict[str, Any]:
+        """JSON-ready dict; feed it back to :func:`op_from_dict`."""
         return {"op": self.name, "params": _as_jsonable(self.params)}
 
     def __repr__(self):
+        """``Op(deskew, max_angle=15.0)``."""
         if not self.params:
             return "Op(%s)" % self.name
         return "Op(%s, %s)" % (self.name, ", ".join(
@@ -3152,6 +3309,7 @@ def _map_span_points(page: Page,
     dropped, which is the whole reason it is threaded through the IR.
     """
     def remap(b: BBox) -> BBox:
+        """Map a box's four corners, then take their axis-aligned hull."""
         corners = [mapper(b.x0, b.y0), mapper(b.x1, b.y0),
                    mapper(b.x1, b.y1), mapper(b.x0, b.y1)]
         xs = [c[0] for c in corners]
@@ -3173,6 +3331,7 @@ def register_op(name: str, geometric: bool = False,
     shows the real documentation.
     """
     def decorator(fn):
+        """Register ``fn`` under ``name`` and return its Op factory."""
         try:
             import inspect
             sig = inspect.signature(fn)
@@ -3185,6 +3344,12 @@ def register_op(name: str, geometric: bool = False,
 
         @functools.wraps(fn)
         def factory(*args, **kwargs):
+            """Build an :class:`Op` from positional/keyword op parameters.
+
+            Unknown or surplus arguments raise :class:`TypeError` here rather than
+            surfacing much later as a confusing failure inside the raster function.
+
+            """
             params = dict(defaults)
             for i, value in enumerate(args):
                 if i >= len(names):
@@ -3215,20 +3380,24 @@ class CompositeOp(Op):
     __slots__ = ("ops",)
 
     def __init__(self, ops: Sequence[Op]) -> None:
+        """Wrap an ordered sequence of ops as a single op."""
         Op.__init__(self, "compose", lambda img, page: img,
                     {"ops": [o.name for o in ops]}, needs_raster=False)
         self.ops = list(ops)
 
     def __call__(self, page: Page) -> Page:
+        """Run every op in order, threading the page through."""
         out = page
         for op in self.ops:
             out = op(out)
         return out
 
     def to_dict(self) -> Dict[str, Any]:
+        """JSON-ready dict containing each member op."""
         return {"op": "compose", "ops": [o.to_dict() for o in self.ops]}
 
     def __repr__(self):
+        """``compose(Op(deskew), Op(binarize))``."""
         return "compose(%s)" % ", ".join(repr(o) for o in self.ops)
 
 
@@ -3255,7 +3424,7 @@ def apply_ops(page: Page, ops: Sequence[Op]) -> Page:
 # -- colour / tone -----------------------------------------------------------
 
 @register_op("to_grayscale")
-def to_grayscale(img, page):
+def to_grayscale(img: ImageArray, page: Page) -> Optional[ImageArray]:
     """Collapse to a single channel.
 
     Do this before classical OCR (which discards colour anyway) but *not*
@@ -3265,7 +3434,8 @@ def to_grayscale(img, page):
 
 
 @register_op("invert_if_dark")
-def invert_if_dark(img, page, ink_threshold=0.55):
+def invert_if_dark(img: ImageArray, page: Page,
+                   ink_threshold: float = 0.55) -> Optional[ImageArray]:
     """Invert white-on-black pages (negative scans, some fax modes).
 
     Every downstream measurement assumes dark ink on light paper; a negative
@@ -3281,7 +3451,8 @@ def invert_if_dark(img, page, ink_threshold=0.55):
 
 
 @register_op("autocontrast")
-def autocontrast(img, page, low_pct=1.0, high_pct=99.0):
+def autocontrast(img: ImageArray, page: Page, low_pct: float = 1.0,
+                 high_pct: float = 99.0) -> Optional[ImageArray]:
     """Stretch the ``[low_pct, high_pct]`` intensity range to full scale.
 
     Percentile-based so that a punch hole or a black scan border does not eat
@@ -3299,7 +3470,7 @@ def autocontrast(img, page, low_pct=1.0, high_pct=99.0):
 
 
 @register_op("gamma")
-def gamma(img, page, value=1.0):
+def gamma(img: ImageArray, page: Page, value: float = 1.0) -> Optional[ImageArray]:
     """Apply gamma correction.  ``value < 1`` brightens, ``> 1`` darkens."""
     np = _np()
     if abs(value - 1.0) < 1e-6:
@@ -3309,7 +3480,8 @@ def gamma(img, page, value=1.0):
 
 
 @register_op("clahe")
-def clahe(img, page, clip=2.0, grid=8):
+def clahe(img: ImageArray, page: Page, clip: float = 2.0,
+          grid: int = 8) -> Optional[ImageArray]:
     """Contrast-limited adaptive histogram equalisation.
 
     The right tool for a page that is faded in one corner and fine elsewhere --
@@ -3327,6 +3499,11 @@ def clahe(img, page, clip=2.0, grid=8):
 
 def _autocontrast_array(gray: GrayImage, low_pct: float = 1.0,
                         high_pct: float = 99.0) -> GrayImage:
+    """Stretch ``gray`` so ``low_pct``..``high_pct`` spans the full 0-255 range.
+
+    Percentiles rather than min/max, so one dust speck and one blown-out
+    highlight cannot define the range for the whole page.
+    """
     np = _np()
     lo = _percentile_np(gray, low_pct)
     hi = _percentile_np(gray, high_pct)
@@ -3336,7 +3513,8 @@ def _autocontrast_array(gray: GrayImage, low_pct: float = 1.0,
 
 
 @register_op("normalize_illumination")
-def normalize_illumination(img, page, radius=None, strength=1.0):
+def normalize_illumination(img: ImageArray, page: Page, radius: Optional[int] = None,
+                           strength: float = 1.0) -> Optional[ImageArray]:
     """Flatten uneven lighting by dividing out the estimated background.
 
     This is the fix for phone photos and book scans with a shadow gradient.
@@ -3354,7 +3532,7 @@ def normalize_illumination(img, page, radius=None, strength=1.0):
 
 
 @register_op("remove_shadow")
-def remove_shadow(img, page, radius=21):
+def remove_shadow(img: ImageArray, page: Page, radius: int = 21) -> Optional[ImageArray]:
     """Remove cast shadows via dilate-then-median background subtraction.
 
     The classic recipe: dilating with a mid-sized kernel removes text, the
@@ -3377,7 +3555,8 @@ def remove_shadow(img, page, radius=21):
 # -- geometry ----------------------------------------------------------------
 
 @register_op("rescale", geometric=True)
-def rescale(img, page, factor=1.0, interpolation="auto"):
+def rescale(img: ImageArray, page: Page, factor: float = 1.0,
+            interpolation: str = "auto") -> Optional[ImageArray]:
     """Scale the raster by ``factor``, keeping physical page size constant.
 
     Point-space coordinates are unaffected because DPI scales with the pixels;
@@ -3392,7 +3571,8 @@ def rescale(img, page, factor=1.0, interpolation="auto"):
 
 
 @register_op("ensure_dpi", geometric=True)
-def ensure_dpi(img, page, min_dpi=300, max_dpi=600, interpolation="auto"):
+def ensure_dpi(img: ImageArray, page: Page, min_dpi: int = 300, max_dpi: int = 600,
+               interpolation: str = "auto") -> Optional[ImageArray]:
     """Upsample until the page reaches ``min_dpi``, capped at ``max_dpi``.
 
     Upsampling adds no information -- but Tesseract's and PaddleOCR's character
@@ -3417,7 +3597,8 @@ def ensure_dpi(img, page, min_dpi=300, max_dpi=600, interpolation="auto"):
 
 
 @register_op("resize_max_side", geometric=True)
-def resize_max_side(img, page, max_px=2000, interpolation="area"):
+def resize_max_side(img: ImageArray, page: Page, max_px: int = 2000,
+                    interpolation: str = "area") -> Optional[ImageArray]:
     """Cap the longest side.  Vision-model cost is ~linear in pixels, and most
     providers downscale above ~1500px anyway -- paying to upload pixels the
     provider will discard is pure waste."""
@@ -3433,7 +3614,8 @@ def resize_max_side(img, page, max_px=2000, interpolation="area"):
 
 
 @register_op("deskew", geometric=True)
-def deskew(img, page, max_angle=15.0, min_angle=0.4, method="auto", angle=None):
+def deskew(img: ImageArray, page: Page, max_angle: float = 15.0, min_angle: float = 0.4,
+           method: str = "auto", angle: Optional[float] = None) -> Optional[ImageArray]:
     """Rotate the page so its text lines are horizontal.
 
     Rotation is skipped below ``min_angle`` because resampling always costs a
@@ -3461,6 +3643,7 @@ def deskew(img, page, max_angle=15.0, min_angle=0.4, method="auto", angle=None):
     nx, ny = after_w / 2.0 * 72.0 / dpi, after_h / 2.0 * 72.0 / dpi
 
     def mapper(x, y):
+        """Point-space image of ``(x, y)`` under the same rotation the raster took."""
         dx, dy = x - cx, y - cy
         return (cos_t * dx - sin_t * dy + nx, sin_t * dx + cos_t * dy + ny)
 
@@ -3472,7 +3655,7 @@ def deskew(img, page, max_angle=15.0, min_angle=0.4, method="auto", angle=None):
 
 
 @register_op("rotate", geometric=True)
-def rotate(img, page, degrees=0):
+def rotate(img: ImageArray, page: Page, degrees: int = 0) -> Optional[ImageArray]:
     """Rotate by an exact multiple of 90 degrees (lossless)."""
     np = _np()
     turns = int(round(degrees / 90.0)) % 4
@@ -3485,6 +3668,7 @@ def rotate(img, page, degrees=0):
     def mapper(x, y, _t=turns, _w=w * 72.0 / dpi, _h=h * 72.0 / dpi):
         # One clockwise quarter-turn sends (x, y) -> (H - y, x) and swaps the
         # page's width and height; apply that `turns` times.
+        """Point-space image of ``(x, y)`` after ``_t`` clockwise quarter-turns."""
         for _ in range(_t):
             x, y = _h - y, x
             _w, _h = _h, _w
@@ -3495,7 +3679,8 @@ def rotate(img, page, degrees=0):
 
 
 @register_op("auto_orient", geometric=True)
-def auto_orient(img, page, use_osd=True, min_confidence=1.0):
+def auto_orient(img: ImageArray, page: Page, use_osd: bool = True,
+                min_confidence: float = 1.0) -> Optional[ImageArray]:
     """Detect and correct 90/180/270-degree page rotation.
 
     Tesseract's orientation-and-script-detection is used when available because
@@ -3545,7 +3730,8 @@ def _osd_rotation(img: ImageArray, min_confidence: float = 1.0) -> Optional[int]
 
 
 @register_op("crop_to_content", geometric=True)
-def crop_to_content(img, page, margin_pt=6.0, min_keep=0.25):
+def crop_to_content(img: ImageArray, page: Page, margin_pt: float = 6.0,
+                    min_keep: float = 0.25) -> Optional[ImageArray]:
     """Crop away empty margins, keeping ``margin_pt`` of whitespace.
 
     Guarded by ``min_keep``: if the detected content occupies less than that
@@ -3578,7 +3764,8 @@ def crop_to_content(img, page, margin_pt=6.0, min_keep=0.25):
 
 
 @register_op("remove_border", geometric=True)
-def remove_border(img, page, max_frac=0.08, dark_threshold=90):
+def remove_border(img: ImageArray, page: Page, max_frac: float = 0.08,
+                  dark_threshold: int = 90) -> Optional[ImageArray]:
     """Trim the black frame a flatbed leaves when the lid is open.
 
     Those frames wreck contrast measurement and ink coverage, and Tesseract
@@ -3612,7 +3799,8 @@ def remove_border(img, page, max_frac=0.08, dark_threshold=90):
 
 
 @register_op("pad", geometric=True)
-def pad(img, page, margin_px=16, value=255):
+def pad(img: ImageArray, page: Page, margin_px: int = 16,
+        value: int = 255) -> Optional[ImageArray]:
     """Add a quiet margin.  Tesseract's layout analysis degrades noticeably
     when glyphs touch the image edge."""
     np = _np()
@@ -3627,7 +3815,8 @@ def pad(img, page, margin_px=16, value=255):
 
 
 @register_op("perspective_correct", geometric=True)
-def perspective_correct(img, page, min_area_ratio=0.35, epsilon_frac=0.02):
+def perspective_correct(img: ImageArray, page: Page, min_area_ratio: float = 0.35,
+                        epsilon_frac: float = 0.02) -> Optional[ImageArray]:
     """Flatten a photographed page by warping its detected quadrilateral.
 
     Only fires when a convincing four-sided contour covering most of the frame
@@ -3678,7 +3867,8 @@ def perspective_correct(img, page, min_area_ratio=0.35, epsilon_frac=0.02):
 # -- noise and sharpness -----------------------------------------------------
 
 @register_op("denoise")
-def denoise(img, page, strength="light", method="auto"):
+def denoise(img: ImageArray, page: Page, strength: str = "light",
+            method: str = "auto") -> Optional[ImageArray]:
     """Suppress scanner noise.
 
     ``method="auto"`` picks bilateral filtering, which smooths flat paper while
@@ -3709,7 +3899,7 @@ def denoise(img, page, strength="light", method="auto"):
 
 
 @register_op("despeckle")
-def despeckle(img, page, min_area_px=6):
+def despeckle(img: ImageArray, page: Page, min_area_px: int = 6) -> Optional[ImageArray]:
     """Remove ink blobs smaller than ``min_area_px``.
 
     Dust, fax speckle and JPEG mosquito noise become spurious punctuation
@@ -3742,7 +3932,8 @@ def despeckle(img, page, min_area_px=6):
 
 
 @register_op("unsharp")
-def unsharp(img, page, amount=1.0, radius=2.0, threshold=0):
+def unsharp(img: ImageArray, page: Page, amount: float = 1.0, radius: float = 2.0,
+            threshold: int = 0) -> Optional[ImageArray]:
     """Unsharp masking: ``img + amount * (img - blur(img))``.
 
     The one operation that genuinely recovers readability on soft scans.
@@ -3759,7 +3950,8 @@ def unsharp(img, page, amount=1.0, radius=2.0, threshold=0):
 
 
 @register_op("morphology")
-def morphology(img, page, operation="open", ksize=3, iterations=1):
+def morphology(img: ImageArray, page: Page, operation: str = "open", ksize: int = 3,
+               iterations: int = 1) -> Optional[ImageArray]:
     """Grayscale morphology.  ``close`` fills broken strokes in faded thermal
     print; ``open`` thins bleed-through from the reverse side."""
     np = _np()
@@ -3867,7 +4059,9 @@ def binarize_array(gray: GrayImage, method: str = "sauvola", window: int = 31,
 
 
 @register_op("binarize")
-def binarize(img, page, method="sauvola", window=31, k=None, offset=10, min_std=8.0):
+def binarize(img: ImageArray, page: Page, method: str = "sauvola", window: int = 31,
+             k: Optional[float] = None, offset: int = 10,
+             min_std: float = 8.0) -> Optional[ImageArray]:
     """Binarise the page.
 
     Deliberately *not* part of :func:`default_policy`.  Binarisation reliably
@@ -3881,8 +4075,9 @@ def binarize(img, page, method="sauvola", window=31, k=None, offset=10, min_std=
 
 
 @register_op("remove_lines")
-def remove_lines(img, page, direction="both", min_len_ratio=0.4, thickness=2,
-                 keep_text=True):
+def remove_lines(img: ImageArray, page: Page, direction: str = "both",
+                 min_len_ratio: float = 0.4, thickness: int = 2,
+                 keep_text: bool = True) -> Optional[ImageArray]:
     """Erase long ruled lines (table borders, form rules, underlines).
 
     Ruled lines merge with glyphs during OCR line segmentation and turn
@@ -3924,7 +4119,8 @@ def remove_lines(img, page, direction="both", min_len_ratio=0.4, thickness=2,
 
 
 @register_op("remove_stamps")
-def remove_stamps(img, page, saturation_min=70, value_min=40, coverage_max=0.25):
+def remove_stamps(img: ImageArray, page: Page, saturation_min: int = 70,
+                  value_min: int = 40, coverage_max: float = 0.25) -> Optional[ImageArray]:
     """Suppress coloured stamps, seals and signatures, keeping black print.
 
     Purple "PAID" stamps and blue ink signatures land on top of the numbers
@@ -3992,6 +4188,11 @@ def split_multi_bill_page(page: Page, axis: str = "auto", min_gap_frac: float = 
         return [page]
 
     def gutters(profile, length, min_gap):
+        """Midpoints of runs of near-empty rows/columns at least ``min_gap`` long.
+
+        :param profile: the ink projection profile along the splitting axis
+        :param length: the page's extent along that axis, in pixels
+        """
         empty = profile < (profile.max() * 0.02)
         cuts = []
         start = None
@@ -4144,6 +4345,7 @@ def no_policy(page: Page) -> List[Op]:
 def fixed_policy(*ops: Op) -> PolicyFn:
     """Turn a fixed op list into a policy, for A/B against adaptive ones."""
     def policy(page):
+        """Return the same op list for every page."""
         return list(ops)
     return policy
 
@@ -4166,6 +4368,7 @@ def preprocess(doc: Document, policy: Optional[PolicyFn] = default_policy,
     target = doc if in_place else doc.copy()
 
     def handle(page: Page) -> Page:
+        """Measure, choose ops, apply them, then re-measure one page."""
         if not page.has_raster():
             return page
         if measure:
@@ -4212,9 +4415,11 @@ class ReadResult(object):
 
     @property
     def text(self) -> str:
+        """All non-empty spans joined by spaces, in the order returned."""
         return " ".join(s.text for s in self.spans if s.text.strip())
 
     def to_dict(self) -> Dict[str, Any]:
+        """JSON-ready dict.  ``raw`` is deliberately excluded (unbounded size)."""
         return {"backend": self.backend, "spans": [s.to_dict() for s in self.spans],
                 "cost": self.cost.to_dict(), "latency_ms": round(self.latency_ms, 1),
                 "warnings": list(self.warnings)}
@@ -4226,12 +4431,15 @@ class TextBackend(Protocol):  # pragma: no cover - structural type only
     name = ""
 
     def supports(self, page: Page) -> bool:
+        """Whether this backend can read ``page`` at all."""
         ...
 
     def estimate_cost(self, page: Page) -> Cost:
+        """Predicted cost of reading ``page``, before doing it."""
         ...
 
     def read(self, page: Page) -> ReadResult:
+        """Read ``page`` and return its spans, cost and timing."""
         ...
 
 
@@ -4245,6 +4453,12 @@ class BaseBackend(object):
     preferred_dpi = DEFAULT_DPI
 
     def __init__(self, name: Optional[str] = None, **options: Any) -> None:
+        """Configure the backend.
+
+        :param name: overrides the class-level registry name, so the same engine
+            can be registered twice with different options
+        :param options: passed through to the underlying engine at construction
+        """
         if name:
             self.name = name
         self.options = dict(options)
@@ -4279,6 +4493,11 @@ class BaseBackend(object):
         return result
 
     def _read(self, page: Page) -> ReadResult:
+        """Do the actual reading.  Subclasses implement this, not :meth:`read`.
+
+        Timing, span sourcing and script detection are handled by :meth:`read`,
+        so an implementation only has to produce spans.
+        """
         raise NotImplementedError
 
     # -- helpers ----------------------------------------------------------
@@ -4292,6 +4511,7 @@ class BaseBackend(object):
         return BBox.from_pixels(page.index, x0, y0, x1, y1, dpi or page.raster_dpi)
 
     def __repr__(self):
+        """``TesseractOCR(name='tesseract')``."""
         return "%s(name=%r)" % (type(self).__name__, self.name)
 
 
@@ -4304,6 +4524,7 @@ class BackendRegistry(object):
     """
 
     def __init__(self):
+        """Start empty.  Factories are registered, never instances."""
         self._factories: Dict[str, Callable[[], Any]] = {}
         self._instances: Dict[str, Any] = {}
         self._lock = threading.Lock()
@@ -4337,12 +4558,15 @@ class BackendRegistry(object):
             return instance
 
     def __contains__(self, name):
+        """``"tesseract" in registry`` -- true if registered, available or not."""
         return name in self._factories
 
     def __getitem__(self, name):
+        """``registry["tesseract"]`` -- alias for :meth:`get`."""
         return self.get(name)
 
     def names(self) -> List[str]:
+        """Every registered name, sorted."""
         return sorted(self._factories)
 
     def available(self) -> List[str]:
@@ -4357,6 +4581,11 @@ class BackendRegistry(object):
         return out
 
     def clear_instances(self) -> None:
+        """Drop cached instances, keeping the factories.
+
+        Next use reconstructs them -- which is how a test swaps a backend's
+        configuration, and how a long-lived process releases model weights.
+        """
         with self._lock:
             self._instances.clear()
 
@@ -4380,9 +4609,11 @@ class PyMuPDFTextLayer(BaseBackend):
     needs_raster = False
 
     def supports(self, page: Page) -> bool:
+        """True only for a page that already carries a trustworthy text layer."""
         return page.kind in (PageKind.DIGITAL_NATIVE, PageKind.HYBRID) and bool(page.spans)
 
     def _read(self, page: Page) -> ReadResult:
+        """Return the page's existing native spans, re-tagged as this backend's."""
         spans = [dataclasses.replace(s, source=self.name)
                  for s in page.spans if s.source in ("pymupdf", "unknown") and s.text.strip()]
         return ReadResult(spans=spans, cost=Cost.zero(), backend=self.name)
@@ -4409,6 +4640,14 @@ class TesseractOCR(BaseBackend):
     def __init__(self, lang: str = "eng", psm: int = 3, oem: int = 3, config: str = "",
                  min_confidence: float = 0.0, name: Optional[str] = None,
                  **options: Any) -> None:
+        """Configure the engine.
+
+        :param lang: Tesseract language code(s), e.g. ``"eng"`` or ``"eng+hin"``
+        :param psm: page segmentation mode (3 = fully automatic)
+        :param oem: OCR engine mode (3 = default, LSTM where available)
+        :param config: extra flags appended to the command line
+        :param min_confidence: drop words below this confidence in ``[0, 1]``
+        """
         BaseBackend.__init__(self, name=name, **options)
         self.lang = lang
         self.psm = psm
@@ -4417,12 +4656,15 @@ class TesseractOCR(BaseBackend):
         self.min_confidence = min_confidence
 
     def is_available(self) -> bool:
+        """True when either ``pytesseract`` or the ``tesseract`` binary is present."""
         return have("pytesseract") or shutil.which("tesseract") is not None
 
     def _config_string(self) -> str:
+        """The ``--psm``/``--oem``/extra flags as one command-line string."""
         return ("--psm %d --oem %d %s" % (self.psm, self.oem, self.config)).strip()
 
     def _read(self, page: Page) -> ReadResult:
+        """Read via ``pytesseract`` when importable, else via the binary."""
         img = self._image_for(page)
         pt = _try_import("pytesseract")
         if pt is not None:
@@ -4430,6 +4672,7 @@ class TesseractOCR(BaseBackend):
         return self._read_cli(page, img)
 
     def _read_pytesseract(self, page: Page, img: ImageArray, pt: Any) -> ReadResult:
+        """Read through ``pytesseract``'s word-level TSV output."""
         pil = require("PIL.Image", "Tesseract input conversion")
         data = pt.image_to_data(pil.fromarray(to_rgb(img)), lang=self.lang,
                                 config=self._config_string(),
@@ -4519,15 +4762,23 @@ class PaddleOCRBackend(BaseBackend):
 
     def __init__(self, lang: str = "en", use_angle_cls: bool = True,
                  name: Optional[str] = None, **options: Any) -> None:
+        """Configure the engine.
+
+        :param lang: PaddleOCR language code, e.g. ``"en"`` or ``"ch"``
+        :param use_angle_cls: run the text-direction classifier (needed for pages
+            with rotated or vertical text)
+        """
         BaseBackend.__init__(self, name=name, **options)
         self.lang = lang
         self.use_angle_cls = use_angle_cls
         self._engine = None
 
     def is_available(self) -> bool:
+        """True when ``paddleocr`` is importable."""
         return have("paddleocr")
 
     def _get_engine(self) -> Any:
+        """Construct the engine once, under the lock.  Loads model weights."""
         if self._engine is None:
             with self._lock:
                 if self._engine is None:
@@ -4538,6 +4789,7 @@ class PaddleOCRBackend(BaseBackend):
         return self._engine
 
     def _read(self, page: Page) -> ReadResult:
+        """Run PP-OCR and convert its quads into spans."""
         np = _np()
         engine = self._get_engine()
         img = to_rgb(self._image_for(page))
@@ -4576,13 +4828,16 @@ class RapidOCRBackend(BaseBackend):
     preferred_dpi = 300
 
     def __init__(self, name=None, **options):
+        """Configure the engine.  ``options`` are passed to ``RapidOCR``."""
         BaseBackend.__init__(self, name=name, **options)
         self._engine = None
 
     def is_available(self) -> bool:
+        """True when either RapidOCR distribution is importable."""
         return have("rapidocr_onnxruntime") or have("rapidocr")
 
     def _get_engine(self) -> Any:
+        """Construct the engine once, under the lock.  Loads ONNX weights."""
         if self._engine is None:
             with self._lock:
                 if self._engine is None:
@@ -4594,6 +4849,7 @@ class RapidOCRBackend(BaseBackend):
         return self._engine
 
     def _read(self, page: Page) -> ReadResult:
+        """Run RapidOCR and convert its quads into spans."""
         np = _np()
         engine = self._get_engine()
         result = engine(np.asarray(to_rgb(self._image_for(page))))
@@ -4626,15 +4882,22 @@ class EasyOCRBackend(BaseBackend):
 
     def __init__(self, languages: Sequence[str] = ("en",), gpu: bool = False,
                  name: Optional[str] = None, **options: Any) -> None:
+        """Configure the engine.
+
+        :param languages: EasyOCR language codes to load together
+        :param gpu: use CUDA if EasyOCR finds it
+        """
         BaseBackend.__init__(self, name=name, **options)
         self.languages = list(languages)
         self.gpu = gpu
         self._engine = None
 
     def is_available(self) -> bool:
+        """True when ``easyocr`` is importable."""
         return have("easyocr")
 
     def _get_engine(self) -> Any:
+        """Construct the reader once, under the lock.  Loads model weights."""
         if self._engine is None:
             with self._lock:
                 if self._engine is None:
@@ -4643,6 +4906,7 @@ class EasyOCRBackend(BaseBackend):
         return self._engine
 
     def _read(self, page: Page) -> ReadResult:
+        """Run EasyOCR and convert its quads into spans."""
         np = _np()
         engine = self._get_engine()
         raw = engine.readtext(np.asarray(to_rgb(self._image_for(page))))
@@ -4672,6 +4936,12 @@ class DocTRBackend(BaseBackend):
 
     def __init__(self, det_arch="db_resnet50", reco_arch="crnn_vgg16_bn",
                  pretrained=True, name=None, **options):
+        """Configure the two-stage predictor.
+
+        :param det_arch: detection architecture, e.g. ``"db_resnet50"``
+        :param reco_arch: recognition architecture, e.g. ``"crnn_vgg16_bn"``
+        :param pretrained: download pretrained weights rather than start cold
+        """
         BaseBackend.__init__(self, name=name, **options)
         self.det_arch = det_arch
         self.reco_arch = reco_arch
@@ -4679,9 +4949,11 @@ class DocTRBackend(BaseBackend):
         self._engine = None
 
     def is_available(self) -> bool:
+        """True when ``doctr`` is importable."""
         return have("doctr")
 
     def _get_engine(self) -> Any:
+        """Build the OCR predictor once, under the lock.  Loads model weights."""
         if self._engine is None:
             with self._lock:
                 if self._engine is None:
@@ -4692,6 +4964,7 @@ class DocTRBackend(BaseBackend):
         return self._engine
 
     def _read(self, page: Page) -> ReadResult:
+        """Run docTR and scale its relative geometry back into pixels."""
         np = _np()
         engine = self._get_engine()
         img = to_rgb(self._image_for(page))
@@ -4733,14 +5006,24 @@ class SuryaBackend(BaseBackend):
     preferred_dpi = 300
 
     def __init__(self, languages=("en",), name=None, **options):
+        """Configure the engine.
+
+        :param languages: script/language hints passed to the recogniser
+        """
         BaseBackend.__init__(self, name=name, **options)
         self.languages = list(languages)
         self._predictors = None
 
     def is_available(self) -> bool:
+        """True when ``surya`` is importable."""
         return have("surya")
 
     def _get_predictors(self) -> Tuple[Any, Any]:
+        """Build ``(detection, recognition)`` predictors once, under the lock.
+
+        Surya's constructor signature has changed across releases, so several
+        known variants are tried before giving up with a clear error.
+        """
         if self._predictors is not None:
             return self._predictors
         with self._lock:
@@ -4765,15 +5048,18 @@ class SuryaBackend(BaseBackend):
 
     @staticmethod
     def _build_with_manager(cls: Any) -> Any:
+        """Construct a predictor via the older ``SuryaInferenceManager`` API."""
         inference = require("surya.inference", "Surya backend")
         return cls(inference.SuryaInferenceManager())
 
     @staticmethod
     def _build_with_foundation(cls: Any) -> Any:
+        """Construct a predictor via the newer ``FoundationPredictor`` API."""
         foundation = require("surya.foundation", "Surya backend")
         return cls(foundation.FoundationPredictor())
 
     def _read(self, page: Page) -> ReadResult:
+        """Run Surya and convert its text lines into spans."""
         pil = require("PIL.Image", "Surya input conversion")
         det, rec = self._get_predictors()
         image = pil.fromarray(to_rgb(self._image_for(page)))
@@ -4894,6 +5180,13 @@ class VisionBackend(BaseBackend):
     def __init__(self, model: str = "", prompt: str = DEFAULT_OCR_PROMPT,
                  max_tokens: int = 8192, temperature: float = 0.0,
                  name: Optional[str] = None, **options: Any) -> None:
+        """Configure the model call.
+
+        :param model: provider model id, used for pricing as well as the request
+        :param prompt: transcription instructions; see :data:`DEFAULT_OCR_PROMPT`
+        :param max_tokens: ceiling on the transcription length
+        :param temperature: 0.0 -- transcription is not a creative task
+        """
         BaseBackend.__init__(self, name=name, **options)
         self.model = model
         self.prompt = prompt
@@ -4901,6 +5194,7 @@ class VisionBackend(BaseBackend):
         self.temperature = temperature
 
     def _image_for(self, page: Page) -> ImageArray:
+        """The page raster, downscaled to ``max_side_px`` so cost stays bounded."""
         img = page.raster()
         h, w = image_shape(img)
         longest = max(h, w)
@@ -4910,6 +5204,11 @@ class VisionBackend(BaseBackend):
         return img
 
     def estimate_cost(self, page: Page) -> Cost:
+        """Price the call before making it, from image tokens plus prompt.
+
+        Approximate by construction -- it is what :class:`BudgetRouter` decides
+        on, so it errs toward the honest side rather than the flattering one.
+        """
         if not page.has_raster():
             return Cost.zero()
         tokens = estimate_image_tokens(self._image_for(page)) + len(self.prompt) // 4
@@ -4937,9 +5236,14 @@ class VisionBackend(BaseBackend):
 
     def _call_model(self, image_bytes: bytes, media_type: str,
                     prompt: str) -> Tuple[str, Cost]:
+        """Send one image and prompt to the provider.
+
+        Subclasses implement this; returns ``(transcription, cost)``.
+        """
         raise NotImplementedError
 
     def _read(self, page: Page) -> ReadResult:
+        """Encode the page as JPEG, transcribe it, and split it into line spans."""
         img = self._image_for(page)
         data = encode_jpeg(img, quality=90)
         text, cost = self._call_model(data, "image/jpeg", self.prompt)
@@ -4957,16 +5261,23 @@ class AnthropicVisionBackend(VisionBackend):
 
     def __init__(self, model: str = "claude-sonnet-5", api_key: Optional[str] = None,
                  client: Any = None, **options: Any) -> None:
+        """Configure the Claude vision call.
+
+        :param api_key: falls back to ``ANTHROPIC_API_KEY``
+        :param client: a pre-built SDK client, e.g. one with custom transport
+        """
         VisionBackend.__init__(self, model=model, **options)
         self._api_key = api_key
         self._client = client
 
     def is_available(self) -> bool:
+        """True with an injected client, or with the SDK plus an API key."""
         if self._client is not None:
             return True
         return have("anthropic") and bool(self._api_key or os.environ.get("ANTHROPIC_API_KEY"))
 
     def _get_client(self) -> Any:
+        """Construct the SDK client once, under the lock."""
         if self._client is None:
             with self._lock:
                 if self._client is None:
@@ -4977,6 +5288,7 @@ class AnthropicVisionBackend(VisionBackend):
 
     def _call_model(self, image_bytes: bytes, media_type: str,
                     prompt: str) -> Tuple[str, Cost]:
+        """One Messages API call; returns the text and its billed cost."""
         client = self._get_client()
         message = client.messages.create(
             model=self.model, max_tokens=self.max_tokens, temperature=self.temperature,
@@ -5000,17 +5312,25 @@ class OpenAIVisionBackend(VisionBackend):
     name = "vlm:openai"
 
     def __init__(self, model="gpt-4o", api_key=None, client=None, detail="high", **options):
+        """Configure the OpenAI vision call.
+
+        :param api_key: falls back to ``OPENAI_API_KEY``
+        :param client: a pre-built SDK client
+        :param detail: image fidelity hint sent to the API
+        """
         VisionBackend.__init__(self, model=model, **options)
         self._api_key = api_key
         self._client = client
         self.detail = detail
 
     def is_available(self) -> bool:
+        """True with an injected client, or with the SDK plus an API key."""
         if self._client is not None:
             return True
         return have("openai") and bool(self._api_key or os.environ.get("OPENAI_API_KEY"))
 
     def _get_client(self) -> Any:
+        """Construct the SDK client once, under the lock."""
         if self._client is None:
             with self._lock:
                 if self._client is None:
@@ -5021,6 +5341,7 @@ class OpenAIVisionBackend(VisionBackend):
 
     def _call_model(self, image_bytes: bytes, media_type: str,
                     prompt: str) -> Tuple[str, Cost]:
+        """One chat-completions call; returns the text and its billed cost."""
         client = self._get_client()
         url = "data:%s;base64,%s" % (media_type, base64.b64encode(image_bytes).decode("ascii"))
         response = client.chat.completions.create(
@@ -5050,6 +5371,11 @@ class CachingBackend(BaseBackend):
 
     def __init__(self, inner: Any, cache: Optional["DiskCache"] = None,
                  namespace: str = "") -> None:
+        """Wrap ``inner`` with a content-addressed read cache.
+
+        :param cache: defaults to a :class:`DiskCache` in the standard location
+        :param namespace: mixed into every key, to separate unrelated runs
+        """
         BaseBackend.__init__(self, name="cached:%s" % inner.name)
         self.inner = inner
         self.cache = cache if cache is not None else DiskCache()
@@ -5059,20 +5385,29 @@ class CachingBackend(BaseBackend):
         self.misses = 0
 
     def is_available(self) -> bool:
+        """Delegates to the wrapped backend."""
         return self.inner.is_available()
 
     def supports(self, page: Page) -> bool:
+        """Delegates to the wrapped backend."""
         return self.inner.supports(page)
 
     def estimate_cost(self, page: Page) -> Cost:
+        """Zero on a cache hit, otherwise the wrapped backend's estimate."""
         return Cost.zero() if self._key(page) in self.cache else self.inner.estimate_cost(page)
 
     def _key(self, page: Page) -> str:
+        """Cache key: the raster's pixels, or the span text when there is no raster.
+
+        Hashing the content rather than the filename is what makes the cache
+        correct across preprocessing changes.
+        """
         raster = array_hash(page.raster()) if page.has_raster() else ""
         spans = stable_hash([s.to_dict() for s in page.spans]) if not raster else ""
         return stable_hash(self.namespace, self.inner.name, raster, spans)
 
     def read(self, page: Page) -> ReadResult:
+        """Return the cached read if there is one, else read and store it."""
         key = self._key(page)
         cached = self.cache.get(key)
         if cached is not None:
@@ -5100,6 +5435,14 @@ class RetryingBackend(BaseBackend):
 
     def __init__(self, inner, attempts=3, base_delay=0.5, retry_on=(Exception,),
                  give_up_on=(MissingDependency, ConfigError)):
+        """Wrap ``inner`` with bounded retries.
+
+        :param attempts: total tries, including the first
+        :param base_delay: seconds before the first retry; doubles thereafter
+        :param retry_on: exception types worth retrying
+        :param give_up_on: exception types that never become successes -- these
+            win over ``retry_on``, so a bad API key fails once, not three times
+        """
         BaseBackend.__init__(self, name="retry:%s" % inner.name)
         self.inner = inner
         self.attempts = attempts
@@ -5109,19 +5452,24 @@ class RetryingBackend(BaseBackend):
         self.needs_raster = getattr(inner, "needs_raster", True)
 
     def is_available(self) -> bool:
+        """Delegates to the wrapped backend."""
         return self.inner.is_available()
 
     def supports(self, page: Page) -> bool:
+        """Delegates to the wrapped backend."""
         return self.inner.supports(page)
 
     def estimate_cost(self, page: Page) -> Cost:
+        """Delegates to the wrapped backend (the estimate excludes retries)."""
         return self.inner.estimate_cost(page)
 
     def read(self, page: Page) -> ReadResult:
+        """Read with retries, recording any billed-but-failed attempts."""
         wasted = [0]
         failures: List[str] = []
 
         def note(attempt, exc, delay):
+            """Count a failed attempt and remember why it failed."""
             wasted[0] += 1
             failures.append("%s: %s" % (type(exc).__name__, exc))
 
@@ -5152,21 +5500,34 @@ class EnsembleBackend(BaseBackend):
     """
 
     def __init__(self, primary, secondary, name=None):
+        """Pair two backends for cross-checked reading.
+
+        :param primary: its spans are returned (better geometry is expected here)
+        :param secondary: read for agreement only
+        """
         BaseBackend.__init__(self, name=name or "ensemble:%s+%s"
                              % (primary.name, secondary.name))
         self.primary = primary
         self.secondary = secondary
 
     def is_available(self) -> bool:
+        """True only when both backends are available."""
         return self.primary.is_available() and self.secondary.is_available()
 
     def supports(self, page: Page) -> bool:
+        """True only when both backends support the page."""
         return self.primary.supports(page) and self.secondary.supports(page)
 
     def estimate_cost(self, page: Page) -> Cost:
+        """The sum of both backends' estimates -- an ensemble is not free."""
         return self.primary.estimate_cost(page) + self.secondary.estimate_cost(page)
 
     def read(self, page: Page) -> ReadResult:
+        """Read with both backends and attach their agreement to every span.
+
+        The agreement score lands in ``span.meta["cross_read_agreement"]``, where
+        confidence fusion picks it up.
+        """
         first = self.primary.read(page)
         second = self.secondary.read(page)
         agreement = cross_read_agreement(first.spans, second.spans)
@@ -5249,14 +5610,25 @@ class RuleRouter(object):
 
     def __init__(self, rules: Optional[Sequence[Tuple[Callable[[Page], bool], str]]] = None,
                  fallback: Optional[str] = None) -> None:
+        """Build a router from ordered rules.
+
+        :param rules: ``(predicate, backend_name)`` pairs, first match wins
+        :param fallback: name returned when no rule matches (``None`` skips)
+        """
         self.rules = list(rules or [])
         self.fallback = fallback
 
     def add(self, predicate: Callable[[Page], bool], backend_name: str) -> RuleRouter:
+        """Append a rule.  Returns ``self``, so rules chain."""
         self.rules.append((predicate, backend_name))
         return self
 
     def __call__(self, page: Page) -> Optional[str]:
+        """The first matching rule's backend, else the fallback.
+
+        A predicate that raises is logged and skipped rather than failing the
+        document: a broken rule should not cost you the other 200 pages.
+        """
         for predicate, name in self.rules:
             try:
                 if predicate(page):
@@ -5276,6 +5648,11 @@ class BudgetRouter(object):
 
     def __init__(self, inner: RouterFn, budget: float, cheap_backend: str = "tesseract",
                  currency: str = "USD") -> None:
+        """Wrap ``inner`` with a spending ceiling.
+
+        :param budget: total spend allowed, in ``currency``
+        :param cheap_backend: what to use once the budget would be exceeded
+        """
         self.inner = inner
         self.budget = float(budget)
         self.cheap_backend = cheap_backend
@@ -5284,12 +5661,19 @@ class BudgetRouter(object):
         self.downgrades = 0
 
     def record(self, cost: Cost) -> None:
+        """Add an actual cost to the running total.  Called by the reader."""
         self.spent += cost.amount
 
     def remaining(self) -> float:
+        """Budget left, never negative."""
         return max(0.0, self.budget - self.spent)
 
     def __call__(self, page: Page) -> Optional[str]:
+        """The inner router's choice, downgraded when it would break the budget.
+
+        Returns ``None`` if even the cheap backend is unavailable -- skipping a
+        page is preferable to silently blowing through a ceiling.
+        """
         name = self.inner(page)
         if name is None:
             return None
@@ -5368,6 +5752,7 @@ def read(doc: Document, backend: Optional[Union[str, TextBackend]] = None,
     choices: Dict[int, str] = {}
 
     def handle(page: Page) -> None:
+        """Read one page, folding its cost and warnings into the document."""
         try:
             result = read_page(page, backend=backend, router=router)
         except Exception as exc:
