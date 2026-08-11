@@ -1,0 +1,73 @@
+name: docs
+
+on:
+  push:
+    branches: ["main"]
+  pull_request:
+  workflow_dispatch:
+
+# Allow the deploy job to publish to Pages.
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+# One deploy at a time; don't cancel a run that is already publishing.
+concurrency:
+  group: pages
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Build the reference
+        # No dependencies to install: the generator reads docpipe.py with `ast`
+        # and never imports it, so it builds with nothing but the stdlib.
+        env:
+          DOCPIPE_REPO: ${{ github.repository }}
+          DOCPIPE_REF: ${{ github.event_name == 'push' && github.sha || github.head_ref }}
+        run: python docs/build_reference.py --out site/index.html
+
+      - name: Check every public name made it into the page
+        run: |
+          python - <<'PY'
+          import ast, io, re, sys
+
+          page = io.open("site/index.html", encoding="utf-8").read()
+          tree = ast.parse(io.open("docpipe.py", encoding="utf-8").read())
+          exported = []
+          for stmt in tree.body:
+              if isinstance(stmt, ast.Assign) and any(
+                      getattr(t, "id", "") == "__all__" for t in stmt.targets):
+                  exported = [e.value for e in stmt.value.elts
+                              if isinstance(e, ast.Constant)]
+          missing = [n for n in exported if "id='%s'" % n not in page]
+          # __version__ is a string constant, not a documented object.
+          missing = [n for n in missing if not n.startswith("__")]
+          if missing:
+              sys.exit("missing from the reference: %s" % ", ".join(missing))
+          print("all %d exported names are documented" % len(exported))
+          PY
+
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: site
+
+  deploy:
+    # Only main publishes; pull requests just prove the page still builds.
+    if: github.ref == 'refs/heads/main' && github.event_name != 'pull_request'
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - id: deployment
+        uses: actions/deploy-pages@v4

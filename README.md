@@ -346,6 +346,26 @@ the same thing to test its own schemas and validators.
 
 ---
 
+## API reference
+
+**[utkarsh5026.github.io/Docpipe](https://utkarsh5026.github.io/Docpipe/)** —
+every class, function and constant, grouped by the same numbered layers the
+source uses, with a filter box and a source link on each entry.
+
+The page is generated from `docpipe.py` itself and rebuilt on every push to
+`main`. To build it locally:
+
+```bash
+python docs/build_reference.py        # -> site/index.html
+```
+
+The generator reads the source with `ast` rather than importing it, so it needs
+no dependencies — not even docpipe's optional ones — and the reference cannot
+drift from the code it documents. CI fails if a name in `__all__` is missing
+from the page.
+
+---
+
 ## Scope boundary
 
 **In scope (library owns):** ingest, format detection, PDF repair,
