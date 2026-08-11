@@ -88,6 +88,13 @@ Compatibility
 Python 3.8+.  No ``X | Y`` annotations, no ``match``, no walrus-in-comprehension
 cleverness -- this file is meant to be dropped into old codebases.
 
+Annotations are written inline and are never evaluated at runtime, because
+``from __future__ import annotations`` (PEP 563) is in force below.  That is
+what lets a 3.8-compatible file use modern annotation syntax and forward
+references without quoting them.  Aliases such as :data:`ImageArray` and
+:data:`Source` name the conventions that the optional-dependency types cannot
+express -- see the type-alias block after the imports.
+
 License: MIT.
 """
 
@@ -132,6 +139,7 @@ from typing import (
     List,
     Mapping,
     Optional,
+    Pattern,
     Sequence,
     Set,
     Tuple,
@@ -170,7 +178,7 @@ FloatArray = Any
 Module = Any
 #: Anything a document can be ingested from: a filesystem path, raw bytes, or an
 #: open binary file object.
-Source = Union[str, "os.PathLike[str]", bytes, bytearray, IO[bytes]]
+Source = Union[str, "os.PathLike", bytes, bytearray, IO[bytes]]
 #: A JSON-serialisable mapping, as produced by every ``to_dict`` in this file.
 JSONDict = Dict[str, Any]
 #: An extraction schema: a pydantic model, a dataclass, or a ``{field: type}``
@@ -199,7 +207,7 @@ class DocpipeError(Exception):
 class MissingDependency(DocpipeError, ImportError):
     """An optional dependency is required for the requested operation."""
 
-    def __init__(self, module: str, purpose: str = "", extra: str = ""):
+    def __init__(self, module: str, purpose: str = "", extra: str = "") -> None:
         """Build the error, including the ``pip install`` line that fixes it.
 
         :param module: the import name that failed
@@ -339,12 +347,12 @@ def _cv2() -> Optional[Module]:
 class _OpenCVDisabled(object):
     """Context manager forcing NumPy fallbacks inside a block."""
 
-    def __enter__(self):
+    def __enter__(self) -> _OpenCVDisabled:
         """Turn OpenCV off, remembering the previous setting."""
         self._prev = set_opencv_enabled(False)
         return self
 
-    def __exit__(self, *exc):
+    def __exit__(self, *exc) -> bool:
         """Restore the previous setting.  Never swallows an exception."""
         set_opencv_enabled(self._prev)
         return False
@@ -493,17 +501,17 @@ class Timer(object):
 
     __slots__ = ("start", "end")
 
-    def __init__(self):
+    def __init__(self) -> None:
         """Start at zero; the clock only runs between ``__enter__`` and ``__exit__``."""
         self.start = 0.0
         self.end = 0.0
 
-    def __enter__(self):
+    def __enter__(self) -> Timer:
         """Start the clock."""
         self.start = time.time()
         return self
 
-    def __exit__(self, *exc):
+    def __exit__(self, *exc) -> bool:
         """Stop the clock.  Never swallows an exception."""
         self.end = time.time()
         return False
@@ -656,7 +664,7 @@ class PageKind(str, enum.Enum):
     HYBRID = "hybrid"                  #: native text plus scanned inserts
     BLANK = "blank"                    #: nothing worth reading
 
-    def __str__(self):
+    def __str__(self) -> str:
         """The bare value, so formatting a kind never leaks ``PageKind.``."""
         return self.value
 
@@ -668,7 +676,7 @@ class Verdict(str, enum.Enum):
     DEGRADED = "degraded"
     UNREADABLE = "unreadable"
 
-    def __str__(self):
+    def __str__(self) -> str:
         """The bare value, so formatting a verdict never leaks ``Verdict.``."""
         return self.value
 
@@ -686,7 +694,7 @@ class RegionKind(str, enum.Enum):
     BARCODE = "barcode"
     UNKNOWN = "unknown"
 
-    def __str__(self):
+    def __str__(self) -> str:
         """The bare value, so formatting a kind never leaks ``RegionKind.``."""
         return self.value
 
@@ -705,10 +713,10 @@ class BBox(object):
     x1: float
     y1: float
 
-    def __post_init__(self):
+    def __post_init__(self) -> None:
+        """Normalise the rectangle so width and height are never negative."""
         # Normalise inverted rectangles rather than rejecting them: several
         # OCR engines emit quads in arbitrary vertex order.
-        """Normalise the rectangle so width and height are never negative."""
         if self.x1 < self.x0:
             low, high = self.x1, self.x0
             object.__setattr__(self, "x0", low)
@@ -844,7 +852,7 @@ class BBox(object):
         return cls(int(d["page"]), float(d["x0"]), float(d["y0"]),
                    float(d["x1"]), float(d["y1"]))
 
-    def __repr__(self):
+    def __repr__(self) -> str:
         """``BBox(page=3, 72.0, 90.0, 300.0, 110.0)``."""
         return "BBox(page=%d, %.1f, %.1f, %.1f, %.1f)" % (
             self.page, self.x0, self.y0, self.x1, self.y1)
@@ -983,7 +991,7 @@ class PageQuality(object):
                    verdict=Verdict(d.get("verdict", "clean")),
                    extra=dict(d.get("extra") or {}))
 
-    def __repr__(self):
+    def __repr__(self) -> str:
         """The handful of numbers worth seeing in a log line or a REPL."""
         return ("PageQuality(verdict=%s, blur=%.2f, skew=%.2f deg, contrast=%.2f, "
                 "dpi~%d, score=%.2f)" % (self.verdict, self.blur, self.skew_deg,
@@ -1068,7 +1076,7 @@ class OpRecord(object):
             d["note"] = self.note
         return d
 
-    def __str__(self):
+    def __str__(self) -> str:
         """``op(param=value, ...)`` -- how history reads in a log line."""
         if not self.params:
             return self.op
@@ -1311,7 +1319,7 @@ class Page(object):
                         h.get("note", ""))
         return page
 
-    def __repr__(self):
+    def __repr__(self) -> str:
         """Index, kind, size, span count and quality verdict."""
         return "Page(index=%d, kind=%s, %dx%d pt, spans=%d, %s)" % (
             self.index, self.kind, self.width_pt, self.height_pt,
@@ -1327,7 +1335,7 @@ class Document(object):
     meta: Dict[str, Any] = field(default_factory=dict)
     warnings: List[str] = field(default_factory=list)
 
-    def __len__(self):
+    def __len__(self) -> int:
         """Number of pages."""
         return len(self.pages)
 
@@ -1427,7 +1435,7 @@ class Document(object):
         with open(path, "r", encoding="utf-8") as fh:
             return cls.from_dict(json.load(fh))
 
-    def __repr__(self):
+    def __repr__(self) -> str:
         """Source, page count and character count."""
         return "Document(%r, pages=%d, chars=%d)" % (
             self.source_uri, len(self.pages), self.char_count)
@@ -1479,7 +1487,7 @@ class Cost(object):
                 "input_tokens": self.input_tokens, "output_tokens": self.output_tokens,
                 "calls": self.calls, "wasted_calls": self.wasted_calls}
 
-    def __repr__(self):
+    def __repr__(self) -> str:
         """Amount, currency and token counts."""
         return "Cost(%.6f %s, in=%d, out=%d, calls=%d)" % (
             self.amount, self.currency, self.input_tokens, self.output_tokens, self.calls)
@@ -1584,7 +1592,7 @@ def window_stats(gray: GrayImage, window: int) -> Tuple[FloatArray, FloatArray]:
     x0 = np.clip(xs - r, 0, w)
     x1 = np.clip(xs + r + 1, 0, w)
 
-    def block(integral):
+    def block(integral: FloatArray) -> FloatArray:
         """Sum over every clipped window at once, from a summed-area table."""
         return (integral[np.ix_(y1, x1)] - integral[np.ix_(y0, x1)]
                 - integral[np.ix_(y1, x0)] + integral[np.ix_(y0, x0)])
@@ -2199,28 +2207,28 @@ def estimate_skew(gray: GrayImage, max_angle: float = 15.0, method: str = "auto"
 
     estimates: List[float] = []
 
-    def by_projection():
-        # Only ink pixels can contribute to the profile, and they are a few
-        # percent of the page, so shifting the *coordinates* of the ink is
-        # dramatically cheaper than shearing the whole raster once per angle --
-        # and this search evaluates ~50 angles.
+    def by_projection() -> float:
         """Coarse-to-fine search for the angle with the sharpest projection.
 
         Returns ``0.0`` when no angle beats the straight-page hypothesis by
         ``min_improvement``.
         """
+        # Only ink pixels can contribute to the profile, and they are a few
+        # percent of the page, so shifting the *coordinates* of the ink is
+        # dramatically cheaper than shearing the whole raster once per angle --
+        # and this search evaluates ~50 angles.
         height, width = mask.shape[:2]
         ink_y, ink_x = np.nonzero(mask)
         if ink_y.size < 32:
             return 0.0
         centred_x = (ink_x - width / 2.0)
 
-        def score(angle):
+        def score(angle: float) -> float:
+            """Variance of the row-projection profile after shearing by ``angle``."""
             # Variance of the projection peaks sharply at the true angle:
             # text lines only stack into tall, narrow bands when horizontal.
             # Forward map, so the sign is the negative of the inverse-mapped
             # shear in row_projection_at_angle -- the two must agree.
-            """Variance of the row-projection profile after shearing by ``angle``."""
             shifted = ink_y - np.round(centred_x * math.tan(math.radians(angle)))
             # Ink sheared off the page is *discarded*, not clamped.  Clamping
             # heaps every out-of-range pixel onto the first or last row, and
@@ -2272,7 +2280,7 @@ def estimate_skew(gray: GrayImage, max_angle: float = 15.0, method: str = "auto"
             return 0.0
         return refined_angle
 
-    def by_hough():
+    def by_hough() -> Optional[float]:
         """Median angle of near-horizontal Hough segments, or ``None``.
 
         ``None`` means "no opinion" -- OpenCV missing, no lines found, or too few
@@ -2301,7 +2309,7 @@ def estimate_skew(gray: GrayImage, max_angle: float = 15.0, method: str = "auto"
             return None
         return float(statistics.median(angles))
 
-    def by_minarearect():
+    def by_minarearect() -> Optional[float]:
         """Angle of the minimum-area rectangle around all ink, or ``None``.
 
         ``None`` means "no opinion" (see ``by_hough``).
@@ -2765,7 +2773,7 @@ def _pdf_raster_provider(fdoc: Any, pno: int) -> RasterProvider:
     Holds a reference to the open PyMuPDF document; that keeps the (in-memory)
     file alive exactly as long as some page might still need to render.
     """
-    def provider(dpi):
+    def provider(dpi: int) -> ImageArray:
         """Render this PDF page at ``dpi`` on demand."""
         np = _np()
         fitz = _fitz(required=True)
@@ -2812,7 +2820,7 @@ def _ingest_pdf_pdfium(source: Source, max_pages: int = 0,
                     kind=PageKind.SCANNED)
         page.quality.raster_dpi = render_dpi
 
-        def provider(dpi, _pno=pno):
+        def provider(dpi: int, _pno: int = pno) -> ImageArray:
             """Render this PDF page at ``dpi`` on demand."""
             bitmap = pdf[_pno].render(scale=dpi / 72.0)
             return np.ascontiguousarray(np.asarray(bitmap.to_pil().convert("RGB")))
@@ -3283,7 +3291,7 @@ class Op(object):
         """JSON-ready dict; feed it back to :func:`op_from_dict`."""
         return {"op": self.name, "params": _as_jsonable(self.params)}
 
-    def __repr__(self):
+    def __repr__(self) -> str:
         """``Op(deskew, max_angle=15.0)``."""
         if not self.params:
             return "Op(%s)" % self.name
@@ -3330,7 +3338,7 @@ def register_op(name: str, geometric: bool = False,
     defaults, so ``deskew(max_angle=10)`` reads naturally and ``help(deskew)``
     shows the real documentation.
     """
-    def decorator(fn):
+    def decorator(fn: OpFn) -> Callable[..., Op]:
         """Register ``fn`` under ``name`` and return its Op factory."""
         try:
             import inspect
@@ -3343,7 +3351,7 @@ def register_op(name: str, geometric: bool = False,
             names, defaults = [], {}
 
         @functools.wraps(fn)
-        def factory(*args, **kwargs):
+        def factory(*args: Any, **kwargs: Any) -> Op:
             """Build an :class:`Op` from positional/keyword op parameters.
 
             Unknown or surplus arguments raise :class:`TypeError` here rather than
@@ -3396,7 +3404,7 @@ class CompositeOp(Op):
         """JSON-ready dict containing each member op."""
         return {"op": "compose", "ops": [o.to_dict() for o in self.ops]}
 
-    def __repr__(self):
+    def __repr__(self) -> str:
         """``compose(Op(deskew), Op(binarize))``."""
         return "compose(%s)" % ", ".join(repr(o) for o in self.ops)
 
@@ -3642,7 +3650,7 @@ def deskew(img: ImageArray, page: Page, max_angle: float = 15.0, min_angle: floa
     cx, cy = before_w / 2.0 * 72.0 / dpi, before_h / 2.0 * 72.0 / dpi
     nx, ny = after_w / 2.0 * 72.0 / dpi, after_h / 2.0 * 72.0 / dpi
 
-    def mapper(x, y):
+    def mapper(x: float, y: float) -> Tuple[float, float]:
         """Point-space image of ``(x, y)`` under the same rotation the raster took."""
         dx, dy = x - cx, y - cy
         return (cos_t * dx - sin_t * dy + nx, sin_t * dx + cos_t * dy + ny)
@@ -3665,10 +3673,11 @@ def rotate(img: ImageArray, page: Page, degrees: int = 0) -> Optional[ImageArray
     h, w = image_shape(img)
     dpi = float(page.raster_dpi)
 
-    def mapper(x, y, _t=turns, _w=w * 72.0 / dpi, _h=h * 72.0 / dpi):
+    def mapper(x: float, y: float, _t: int = turns, _w: float = w * 72.0 / dpi,
+               _h: float = h * 72.0 / dpi) -> Tuple[float, float]:
+        """Point-space image of ``(x, y)`` after ``_t`` clockwise quarter-turns."""
         # One clockwise quarter-turn sends (x, y) -> (H - y, x) and swaps the
         # page's width and height; apply that `turns` times.
-        """Point-space image of ``(x, y)`` after ``_t`` clockwise quarter-turns."""
         for _ in range(_t):
             x, y = _h - y, x
             _w, _h = _h, _w
@@ -4187,7 +4196,7 @@ def split_multi_bill_page(page: Page, axis: str = "auto", min_gap_frac: float = 
     if mask.mean() < 0.005:
         return [page]
 
-    def gutters(profile, length, min_gap):
+    def gutters(profile: FloatArray, length: int, min_gap: int) -> List[int]:
         """Midpoints of runs of near-empty rows/columns at least ``min_gap`` long.
 
         :param profile: the ink projection profile along the splitting axis
@@ -4344,7 +4353,7 @@ def no_policy(page: Page) -> List[Op]:
 
 def fixed_policy(*ops: Op) -> PolicyFn:
     """Turn a fixed op list into a policy, for A/B against adaptive ones."""
-    def policy(page):
+    def policy(page: Page) -> List[Op]:
         """Return the same op list for every page."""
         return list(ops)
     return policy
@@ -4510,7 +4519,7 @@ class BaseBackend(object):
         """Pixel coordinates from an engine -> canonical page points."""
         return BBox.from_pixels(page.index, x0, y0, x1, y1, dpi or page.raster_dpi)
 
-    def __repr__(self):
+    def __repr__(self) -> str:
         """``TesseractOCR(name='tesseract')``."""
         return "%s(name=%r)" % (type(self).__name__, self.name)
 
@@ -4523,7 +4532,7 @@ class BackendRegistry(object):
     document that never routes to it should never pay that.
     """
 
-    def __init__(self):
+    def __init__(self) -> None:
         """Start empty.  Factories are registered, never instances."""
         self._factories: Dict[str, Callable[[], Any]] = {}
         self._instances: Dict[str, Any] = {}
@@ -4557,11 +4566,11 @@ class BackendRegistry(object):
             self._instances[name] = instance
             return instance
 
-    def __contains__(self, name):
+    def __contains__(self, name: str) -> bool:
         """``"tesseract" in registry`` -- true if registered, available or not."""
         return name in self._factories
 
-    def __getitem__(self, name):
+    def __getitem__(self, name: str) -> Any:
         """``registry["tesseract"]`` -- alias for :meth:`get`."""
         return self.get(name)
 
@@ -4827,7 +4836,7 @@ class RapidOCRBackend(BaseBackend):
     name = "rapidocr"
     preferred_dpi = 300
 
-    def __init__(self, name=None, **options):
+    def __init__(self, name: Optional[str] = None, **options: Any) -> None:
         """Configure the engine.  ``options`` are passed to ``RapidOCR``."""
         BaseBackend.__init__(self, name=name, **options)
         self._engine = None
@@ -4934,8 +4943,9 @@ class DocTRBackend(BaseBackend):
     name = "doctr"
     preferred_dpi = 300
 
-    def __init__(self, det_arch="db_resnet50", reco_arch="crnn_vgg16_bn",
-                 pretrained=True, name=None, **options):
+    def __init__(self, det_arch: str = "db_resnet50",
+                 reco_arch: str = "crnn_vgg16_bn", pretrained: bool = True,
+                 name: Optional[str] = None, **options: Any) -> None:
         """Configure the two-stage predictor.
 
         :param det_arch: detection architecture, e.g. ``"db_resnet50"``
@@ -5005,7 +5015,8 @@ class SuryaBackend(BaseBackend):
     name = "surya"
     preferred_dpi = 300
 
-    def __init__(self, languages=("en",), name=None, **options):
+    def __init__(self, languages: Sequence[str] = ("en",),
+                 name: Optional[str] = None, **options: Any) -> None:
         """Configure the engine.
 
         :param languages: script/language hints passed to the recogniser
@@ -5311,7 +5322,9 @@ class OpenAIVisionBackend(VisionBackend):
 
     name = "vlm:openai"
 
-    def __init__(self, model="gpt-4o", api_key=None, client=None, detail="high", **options):
+    def __init__(self, model: str = "gpt-4o", api_key: Optional[str] = None,
+                 client: Any = None, detail: str = "high",
+                 **options: Any) -> None:
         """Configure the OpenAI vision call.
 
         :param api_key: falls back to ``OPENAI_API_KEY``
@@ -5433,8 +5446,11 @@ class RetryingBackend(BaseBackend):
     doubled its bill gets noticed.
     """
 
-    def __init__(self, inner, attempts=3, base_delay=0.5, retry_on=(Exception,),
-                 give_up_on=(MissingDependency, ConfigError)):
+    def __init__(self, inner: TextBackend, attempts: int = 3,
+                 base_delay: float = 0.5,
+                 retry_on: Tuple[type, ...] = (Exception,),
+                 give_up_on: Tuple[type, ...] = (MissingDependency,
+                                                 ConfigError)) -> None:
         """Wrap ``inner`` with bounded retries.
 
         :param attempts: total tries, including the first
@@ -5468,7 +5484,7 @@ class RetryingBackend(BaseBackend):
         wasted = [0]
         failures: List[str] = []
 
-        def note(attempt, exc, delay):
+        def note(attempt: int, exc: BaseException, delay: float) -> None:
             """Count a failed attempt and remember why it failed."""
             wasted[0] += 1
             failures.append("%s: %s" % (type(exc).__name__, exc))
@@ -5499,7 +5515,8 @@ class EnsembleBackend(BaseBackend):
     the secondary's are attached to the result for :func:`cross_read_agreement`.
     """
 
-    def __init__(self, primary, secondary, name=None):
+    def __init__(self, primary: TextBackend, secondary: TextBackend,
+                 name: Optional[str] = None) -> None:
         """Pair two backends for cross-checked reading.
 
         :param primary: its spans are returned (better geometry is expected here)
@@ -6171,6 +6188,15 @@ class DiskCache(object):
 
     def __init__(self, directory: Optional[str] = None, enabled: bool = True,
                  max_entries: int = 0) -> None:
+        """Open (and create) the cache directory.
+
+        :param directory: defaults to ``$DOCPIPE_CACHE_DIR`` or a temp directory
+        :param enabled: False makes every read a miss and every write a no-op
+        :param max_entries: reserved; entries are not evicted yet
+
+        An unusable directory is not fatal -- the cache degrades to memory-only
+        and logs a warning, because a read-only filesystem should not stop a run.
+        """
         self.directory = directory or os.path.join(
             os.environ.get("DOCPIPE_CACHE_DIR")
             or os.path.join(tempfile.gettempdir(), "docpipe-cache"))
@@ -6186,9 +6212,15 @@ class DiskCache(object):
                 self.directory = ""
 
     def _path(self, key: str) -> str:
+        """Filesystem path holding ``key``."""
         return os.path.join(self.directory, "%s.json" % key)
 
     def get(self, key: str) -> Optional[Any]:
+        """The cached value, or ``None`` when absent, disabled or unreadable.
+
+        A corrupt or truncated entry counts as a miss: a cache is an
+        optimisation, and it must never be able to fail a run.
+        """
         if not self.enabled:
             return None
         if key in self._memory:
@@ -6204,6 +6236,11 @@ class DiskCache(object):
         return value
 
     def set(self, key: str, value: Any) -> None:
+        """Store ``value`` under ``key``.
+
+        Written to a temp file and renamed, which is atomic on POSIX -- so a
+        concurrent reader sees either the old entry or the new one, never half.
+        """
         if not self.enabled:
             return
         self._memory[key] = value
@@ -6217,10 +6254,12 @@ class DiskCache(object):
         except (IOError, OSError, TypeError, ValueError) as exc:
             logger.debug("cache write failed for %s: %s", key, exc)
 
-    def __contains__(self, key):
+    def __contains__(self, key: str) -> bool:
+        """``key in cache`` -- true when a value is stored for it."""
         return self.get(key) is not None
 
     def clear(self) -> None:
+        """Drop every entry, in memory and on disk."""
         self._memory.clear()
         if self.directory and os.path.isdir(self.directory):
             for name in os.listdir(self.directory):
@@ -6243,9 +6282,11 @@ class TraceSpan(object):
 
     @property
     def ms(self) -> float:
+        """Duration in milliseconds -- so far, if the span is still open."""
         return ((self.end or time.time()) - self.start) * 1000.0
 
     def to_dict(self) -> Dict[str, Any]:
+        """JSON-ready dict, including nested children."""
         return {"name": self.name, "ms": round(self.ms, 2),
                 "attributes": _as_jsonable(self.attributes),
                 "children": [c.to_dict() for c in self.children]}
@@ -6259,21 +6300,26 @@ class Tracer(object):
     without one.
     """
 
-    def __init__(self, enabled=True):
+    def __init__(self, enabled: bool = True) -> None:
+        """Start a trace.  ``enabled=False`` makes every span a no-op."""
         self.enabled = enabled
         self.root = TraceSpan("root", time.time())
         self._stack = [self.root]
         self._lock = threading.Lock()
 
     class _Span(object):
-        def __init__(self, tracer, span):
+        """Context manager that closes its span and pops the tracer's stack."""
+        def __init__(self, tracer: Tracer, span: TraceSpan) -> None:
+            """Bind a span to the tracer that will close it."""
             self.tracer = tracer
             self.span = span
 
-        def __enter__(self):
+        def __enter__(self) -> TraceSpan:
+            """Give the block the :class:`TraceSpan` itself, for attributes."""
             return self.span
 
-        def __exit__(self, *exc):
+        def __exit__(self, *exc) -> bool:
+            """Close the span and pop it.  Never swallows an exception."""
             self.span.end = time.time()
             with self.tracer._lock:
                 if len(self.tracer._stack) > 1:
@@ -6281,6 +6327,11 @@ class Tracer(object):
             return False
 
     def span(self, name: str, **attributes: Any) -> Any:
+        """``with tracer.span("read", pages=12): ...`` -- open a nested span.
+
+        Returns a no-op context manager when tracing is disabled, so callers
+        never need to branch.
+        """
         if not self.enabled:
             return _NullContext()
         span = TraceSpan(name, time.time(), attributes=dict(attributes))
@@ -6290,18 +6341,23 @@ class Tracer(object):
         return Tracer._Span(self, span)
 
     def finish(self) -> TraceSpan:
+        """Close the root span and return it."""
         self.root.end = time.time()
         return self.root
 
     def to_dict(self) -> Dict[str, Any]:
+        """The finished trace tree as a JSON-ready dict."""
         return self.finish().to_dict()
 
 
 class _NullContext(object):
-    def __enter__(self):
+    """A context manager that does nothing -- used when tracing is off."""
+    def __enter__(self) -> None:
+        """Yield nothing."""
         return None
 
-    def __exit__(self, *exc):
+    def __exit__(self, *exc) -> bool:
+        """Do nothing.  Never swallows an exception."""
         return False
 
 
@@ -6309,12 +6365,25 @@ class CostTracker(object):
     """Accumulate spend, optionally enforcing a hard ceiling."""
 
     def __init__(self, budget: Optional[float] = None, currency: str = "USD") -> None:
+        """Start at zero.
+
+        :param budget: hard ceiling; exceeding it raises :class:`BudgetExceeded`
+        :param currency: the currency every added cost must be in
+        """
         self.budget = budget
         self.total = Cost(currency=currency)
         self._lock = threading.Lock()
         self.by_backend: Dict[str, Cost] = {}
 
     def add(self, cost: Cost, backend: str = "") -> Cost:
+        """Add ``cost`` to the total and return the new total.
+
+        Raises :class:`BudgetExceeded` once the budget is passed.  The cost is
+        recorded before the check, so the reported total is what was actually
+        spent rather than the last figure under the ceiling.
+
+        :param backend: attributes the spend, for the per-backend breakdown
+        """
         with self._lock:
             self.total = self.total + cost
             if backend:
@@ -6325,6 +6394,7 @@ class CostTracker(object):
             return self.total
 
     def to_dict(self) -> Dict[str, Any]:
+        """JSON-ready dict: total, per-backend breakdown, and the budget."""
         return {"total": self.total.to_dict(),
                 "by_backend": dict((k, v.to_dict()) for k, v in self.by_backend.items()),
                 "budget": self.budget}
@@ -6604,19 +6674,28 @@ class Calibrator(object):
     """Base for post-hoc probability calibration."""
 
     def fit(self, scores: Sequence[float], labels: Sequence[bool]) -> Calibrator:
+        """Fit on scores and their correctness labels.  Returns ``self``.
+
+        :param scores: raw fused confidences in ``[0, 1]``
+        :param labels: True where that field was actually correct
+        """
         raise NotImplementedError
 
     def predict(self, score: float) -> float:
+        """Map one raw score onto a calibrated probability."""
         raise NotImplementedError
 
     def predict_many(self, scores: Sequence[float]) -> List[float]:
+        """Calibrate a sequence of scores."""
         return [self.predict(s) for s in scores]
 
     def to_dict(self) -> Dict[str, Any]:
+        """JSON-ready dict, tagged with ``kind`` for :meth:`from_dict`."""
         raise NotImplementedError
 
     @staticmethod
     def from_dict(d: Mapping[str, Any]) -> Calibrator:
+        """Rebuild whichever calibrator ``d`` describes."""
         kind = d.get("kind")
         if kind == "platt":
             return PlattCalibrator.from_dict(d)
@@ -6630,13 +6709,16 @@ class Calibrator(object):
 class IdentityCalibrator(Calibrator):
     """Pass scores through unchanged.  The honest default before fitting."""
 
-    def fit(self, scores, labels):
+    def fit(self, scores: Sequence[float], labels: Sequence[bool]) -> IdentityCalibrator:
+        """Nothing to fit.  Returns ``self``."""
         return self
 
     def predict(self, score: float) -> float:
+        """The score itself, clamped to ``[0, 1]``."""
         return float(clamp(score, 0.0, 1.0))
 
-    def to_dict(self):
+    def to_dict(self) -> Dict[str, Any]:
+        """JSON-ready dict."""
         return {"kind": "identity"}
 
 
@@ -6649,13 +6731,22 @@ class PlattCalibrator(Calibrator):
     recovered as the identity (``a=1, b=0``) instead of being squashed.
     """
 
-    def __init__(self, a=1.0, b=0.0):
+    def __init__(self, a: float = 1.0, b: float = 0.0) -> None:
+        """Start from ``a``, ``b`` -- the defaults are the identity mapping."""
         self.a = float(a)
         self.b = float(b)
         self.n = 0
 
     def fit(self, scores: Sequence[float], labels: Sequence[bool], iterations: int = 400,
             learning_rate: float = 0.25) -> PlattCalibrator:
+        """Fit ``a`` and ``b`` by gradient descent on the log-loss.
+
+        :param iterations: full-batch gradient steps
+        :param learning_rate: step size; the default is stable for this loss
+
+        Targets are smoothed by Platt's correction so a perfectly separable set
+        cannot drive the weights to infinity.  Returns ``self``.
+        """
         xs = [logit(clamp(float(s), 0.0, 1.0)) for s in scores]
         ys = [1.0 if bool(l) else 0.0 for l in labels]
         if len(xs) != len(ys):
@@ -6685,18 +6776,22 @@ class PlattCalibrator(Calibrator):
         return self
 
     def predict(self, score: float) -> float:
+        """``sigmoid(a * logit(score) + b)``."""
         return round(float(sigmoid(self.a * logit(clamp(score, 0.0, 1.0)) + self.b)), 4)
 
-    def to_dict(self):
+    def to_dict(self) -> Dict[str, Any]:
+        """JSON-ready dict, including the sample count it was fitted on."""
         return {"kind": "platt", "a": self.a, "b": self.b, "n": self.n}
 
     @classmethod
-    def from_dict(cls, d):
+    def from_dict(cls, d: Mapping[str, Any]) -> PlattCalibrator:
+        """Rebuild from :meth:`to_dict` output."""
         obj = cls(float(d.get("a", 1.0)), float(d.get("b", 0.0)))
         obj.n = int(d.get("n", 0))
         return obj
 
-    def __repr__(self):
+    def __repr__(self) -> str:
+        """Parameters and the size of the fitting set."""
         return "PlattCalibrator(a=%.4f, b=%.4f, n=%d)" % (self.a, self.b, self.n)
 
 
@@ -6710,13 +6805,22 @@ class IsotonicCalibrator(Calibrator):
     rather than silently producing a step function.
     """
 
-    def __init__(self, thresholds=None, values=None):
+    def __init__(self, thresholds: Optional[Sequence[float]] = None,
+                 values: Optional[Sequence[float]] = None) -> None:
+        """Start from an optional fitted step function."""
         self.thresholds = list(thresholds or [])
         self.values = list(values or [])
         self.n = 0
 
     def fit(self, scores: Sequence[float], labels: Sequence[bool],
             min_samples: int = 50) -> IsotonicCalibrator:
+        """Fit a monotone step function by pool-adjacent-violators.
+
+        :param min_samples: refuse to fit below this, rather than overfit --
+            raises :class:`ConfigError` pointing at :class:`PlattCalibrator`
+
+        Returns ``self``.
+        """
         points = sorted(zip([clamp(float(s), 0.0, 1.0) for s in scores],
                             [1.0 if bool(l) else 0.0 for l in labels]))
         if len(points) < min_samples:
@@ -6743,6 +6847,7 @@ class IsotonicCalibrator(Calibrator):
         return self
 
     def predict(self, score: float) -> float:
+        """The fitted step at ``score``; the raw score when unfitted."""
         if not self.thresholds:
             return float(clamp(score, 0.0, 1.0))
         x = clamp(float(score), 0.0, 1.0)
@@ -6752,17 +6857,20 @@ class IsotonicCalibrator(Calibrator):
         index = int(clamp(index, 0, len(self.values) - 1))
         return round(float(self.values[index]), 4)
 
-    def to_dict(self):
+    def to_dict(self) -> Dict[str, Any]:
+        """JSON-ready dict holding the full step function."""
         return {"kind": "isotonic", "thresholds": self.thresholds,
                 "values": self.values, "n": self.n}
 
     @classmethod
-    def from_dict(cls, d):
+    def from_dict(cls, d: Mapping[str, Any]) -> IsotonicCalibrator:
+        """Rebuild from :meth:`to_dict` output."""
         obj = cls(d.get("thresholds"), d.get("values"))
         obj.n = int(d.get("n", 0))
         return obj
 
-    def __repr__(self):
+    def __repr__(self) -> str:
+        """Number of steps and the size of the fitting set."""
         return "IsotonicCalibrator(blocks=%d, n=%d)" % (len(self.values), self.n)
 
 
@@ -6836,11 +6944,13 @@ class FieldSpec(object):
     item_type: Optional[str] = None
     path: str = ""
 
-    def __post_init__(self):
+    def __post_init__(self) -> None:
+        """Default the lookup ``path`` to the field's own name."""
         if not self.path:
             self.path = self.name
 
     def to_dict(self) -> Dict[str, Any]:
+        """JSON-ready dict."""
         return {"name": self.name, "type": self.type_name, "required": self.required,
                 "description": self.description, "path": self.path}
 
@@ -6902,6 +7012,11 @@ class SchemaAdapter(object):
 
     def __init__(self, schema: SchemaLike, json_schema: Dict[str, Any],
                  fields: List[FieldSpec], name: str = "Extraction") -> None:
+        """Hold a schema alongside its normalised form.
+
+        Built by :meth:`from_schema` rather than directly -- it is the classmethod
+        that knows how to reduce each supported schema shape to these arguments.
+        """
         self.schema = schema
         self.json_schema = json_schema
         self.fields = fields
@@ -6910,6 +7025,12 @@ class SchemaAdapter(object):
     # -- construction -----------------------------------------------------
     @classmethod
     def from_schema(cls, schema: SchemaLike) -> SchemaAdapter:
+        """Adapt any supported schema shape.  The one entry point.
+
+        Accepts a pydantic v1 or v2 model, a dataclass, a ``{field: type}`` dict,
+        or an existing adapter (returned unchanged).  Anything else raises
+        :class:`ConfigError` naming the shapes that do work.
+        """
         if isinstance(schema, SchemaAdapter):
             return schema
         if isinstance(schema, dict):
@@ -6929,6 +7050,12 @@ class SchemaAdapter(object):
     @classmethod
     def _from_json_schema(cls, schema: SchemaLike, json_schema: Dict[str, Any],
                           name: str) -> SchemaAdapter:
+        """Adapt a model that can already emit JSON Schema (pydantic v1/v2).
+
+        ``anyOf``/``oneOf`` branches -- how pydantic renders ``Optional[X]`` --
+        are collapsed to their first non-null type, and date formats are lifted
+        into a ``date`` type so coercion knows to parse them.
+        """
         properties = json_schema.get("properties") or {}
         required = set(json_schema.get("required") or [])
         fields = []
@@ -6951,6 +7078,11 @@ class SchemaAdapter(object):
 
     @classmethod
     def _from_dataclass(cls, schema: SchemaLike) -> SchemaAdapter:
+        """Adapt a dataclass, deriving JSON Schema from its annotations.
+
+        A field with a default (or a default factory) is treated as optional even
+        when its annotation is not ``Optional``, matching what the author meant.
+        """
         try:
             import typing as _typing
             hints = _typing.get_type_hints(schema)
@@ -7013,6 +7145,7 @@ class SchemaAdapter(object):
 
     # -- use --------------------------------------------------------------
     def field(self, name: str) -> Optional[FieldSpec]:
+        """The spec for ``name``, or ``None`` when the schema has no such field."""
         for spec in self.fields:
             if spec.name == name:
                 return spec
@@ -7190,6 +7323,12 @@ class LLMClient(Protocol):  # pragma: no cover - structural type
 
     def complete(self, prompt: str, system: Optional[str] = None,
                  images: Optional[Sequence[bytes]] = None) -> Tuple[str, Cost]:
+        """Complete ``prompt`` and report what it cost.
+
+        :param system: system instructions, when the provider supports them
+        :param images: JPEG page images to send alongside the prompt
+        :returns: ``(text, cost)``
+        """
         ...
 
 
@@ -7198,7 +7337,15 @@ class BaseLLMClient(object):
 
     name = "llm"
 
-    def __init__(self, model="", max_tokens=4096, temperature=0.0, **options):
+    def __init__(self, model: str = "", max_tokens: int = 4096,
+                 temperature: float = 0.0, **options: Any) -> None:
+        """Configure the model call.
+
+        :param model: provider model id -- also the pricing key
+        :param max_tokens: ceiling on the response
+        :param temperature: 0.0 -- extraction is not a creative task
+        :param options: passed through to the underlying SDK
+        """
         self.model = model
         self.max_tokens = max_tokens
         self.temperature = temperature
@@ -7206,10 +7353,12 @@ class BaseLLMClient(object):
         self._lock = threading.Lock()
 
     def is_available(self) -> bool:
+        """Whether this client can be used right now.  True by default."""
         return True
 
     def complete(self, prompt: str, system: Optional[str] = None,
                  images: Optional[Sequence[bytes]] = None) -> Tuple[str, Cost]:
+        """Complete ``prompt``.  Subclasses implement this."""
         raise NotImplementedError
 
 
@@ -7226,6 +7375,13 @@ class EchoClient(BaseLLMClient):
 
     def __init__(self, response: Union[str, Mapping[str, Any], Callable[[str], Any]] = "{}",
                  cost: Optional[Cost] = None, record: bool = True, **options: Any) -> None:
+        """Configure the double.
+
+        :param response: a JSON string, a mapping, or ``fn(prompt) -> response``
+        :param cost: the cost to report, for exercising budget logic
+        :param record: keep every prompt in ``self.prompts``, so a test can assert
+            on what the pipeline actually asked for
+        """
         BaseLLMClient.__init__(self, model="echo", **options)
         self.response = response
         self.cost = cost or Cost(calls=1)
@@ -7234,6 +7390,7 @@ class EchoClient(BaseLLMClient):
 
     def complete(self, prompt: str, system: Optional[str] = None,
                  images: Optional[Sequence[bytes]] = None) -> Tuple[str, Cost]:
+        """Return the canned response (JSON-encoded if it is not a string)."""
         if self.record:
             self.prompts.append(prompt)
         response = self.response(prompt) if callable(self.response) else self.response
@@ -7247,17 +7404,26 @@ class AnthropicClient(BaseLLMClient):
 
     name = "anthropic"
 
-    def __init__(self, model="claude-sonnet-5", api_key=None, client=None, **options):
+    def __init__(self, model: str = "claude-sonnet-5",
+                 api_key: Optional[str] = None, client: Any = None,
+                 **options: Any) -> None:
+        """Configure the Claude client.
+
+        :param api_key: falls back to ``ANTHROPIC_API_KEY``
+        :param client: a pre-built SDK client, injected instead of constructed
+        """
         BaseLLMClient.__init__(self, model=model, **options)
         self._api_key = api_key
         self._client = client
 
     def is_available(self) -> bool:
+        """True with an injected client, or with the SDK plus an API key."""
         if self._client is not None:
             return True
         return have("anthropic") and bool(self._api_key or os.environ.get("ANTHROPIC_API_KEY"))
 
     def _get_client(self) -> Any:
+        """Construct the SDK client once, under the lock."""
         if self._client is None:
             with self._lock:
                 if self._client is None:
@@ -7268,6 +7434,7 @@ class AnthropicClient(BaseLLMClient):
 
     def complete(self, prompt: str, system: Optional[str] = None,
                  images: Optional[Sequence[bytes]] = None) -> Tuple[str, Cost]:
+        """One Messages API call, with any page images attached first."""
         content: List[Dict[str, Any]] = []
         for blob in (images or []):
             content.append({"type": "image", "source": {
@@ -7292,17 +7459,25 @@ class OpenAIClient(BaseLLMClient):
 
     name = "openai"
 
-    def __init__(self, model="gpt-4o", api_key=None, client=None, **options):
+    def __init__(self, model: str = "gpt-4o", api_key: Optional[str] = None,
+                 client: Any = None, **options: Any) -> None:
+        """Configure the OpenAI client.
+
+        :param api_key: falls back to ``OPENAI_API_KEY``
+        :param client: a pre-built SDK client, injected instead of constructed
+        """
         BaseLLMClient.__init__(self, model=model, **options)
         self._api_key = api_key
         self._client = client
 
     def is_available(self) -> bool:
+        """True with an injected client, or with the SDK plus an API key."""
         if self._client is not None:
             return True
         return have("openai") and bool(self._api_key or os.environ.get("OPENAI_API_KEY"))
 
     def _get_client(self) -> Any:
+        """Construct the SDK client once, under the lock."""
         if self._client is None:
             with self._lock:
                 if self._client is None:
@@ -7313,6 +7488,7 @@ class OpenAIClient(BaseLLMClient):
 
     def complete(self, prompt: str, system: Optional[str] = None,
                  images: Optional[Sequence[bytes]] = None) -> Tuple[str, Cost]:
+        """One chat-completions call, with any page images attached."""
         content: List[Dict[str, Any]] = [{"type": "text", "text": prompt}]
         for blob in (images or []):
             url = "data:image/jpeg;base64,%s" % base64.b64encode(blob).decode("ascii")
@@ -7444,6 +7620,7 @@ class Evidence(object):
     source: str = ""
 
     def to_dict(self) -> Dict[str, Any]:
+        """JSON-ready dict."""
         return {"bbox": self.bbox.to_dict(), "score": round(self.score, 4),
                 "text": self.text, "source": self.source}
 
@@ -7621,10 +7798,12 @@ class ValidationIssue(object):
     severity: str = "error"  #: "error" or "warning"
 
     def to_dict(self) -> Dict[str, Any]:
+        """JSON-ready dict."""
         return {"message": self.message, "fields": list(self.fields),
                 "severity": self.severity}
 
-    def __str__(self):
+    def __str__(self) -> str:
+        """``error: line_items sums to 4800 but total is 48250``."""
         return "%s: %s" % (self.severity, self.message)
 
 
@@ -7669,7 +7848,8 @@ def line_items_sum_to_total(items_field: str = "line_items", amount_field: str =
     the reading: an OCR error in any one amount breaks the sum, which is why
     this feeds confidence fusion rather than just producing a warning.
     """
-    def validate(model):
+    def validate(model: Any) -> Optional[ValidationIssue]:
+        """Compare the summed line items against the stated total."""
         items = _get_attr(model, items_field)
         total = _get_attr(model, total_field)
         if not items or total is None:
@@ -7692,7 +7872,8 @@ def line_items_sum_to_total(items_field: str = "line_items", amount_field: str =
 
 def date_order(earlier_field: str, later_field: str, allow_equal: bool = True) -> Validator:
     """Validator factory: one date must not precede another."""
-    def validate(model):
+    def validate(model: Any) -> Optional[ValidationIssue]:
+        """Check that the earlier field really is not after the later one."""
         a = _get_attr(model, earlier_field)
         b = _get_attr(model, later_field)
         if a is None or b is None:
@@ -7711,7 +7892,8 @@ def field_matches(field_name: str, pattern: str,
     """Validator factory: a field must match a regular expression."""
     compiled = re.compile(pattern)
 
-    def validate(model):
+    def validate(model: Any) -> Optional[ValidationIssue]:
+        """Check the field against the compiled pattern."""
         value = _get_attr(model, field_name)
         if value is None:
             return None
@@ -7725,7 +7907,8 @@ def field_matches(field_name: str, pattern: str,
 
 def required_fields(*names: str) -> Validator:
     """Validator factory: these fields must be present and non-empty."""
-    def validate(model):
+    def validate(model: Any) -> List[ValidationIssue]:
+        """Report one issue per missing or blank field."""
         issues = []
         for name in names:
             value = _get_attr(model, name)
@@ -7762,9 +7945,11 @@ class FieldResult(Generic[T]):
 
     @property
     def pages(self) -> List[int]:
+        """Page indices this value has evidence on, ascending."""
         return sorted(set(b.page for b in self.evidence))
 
     def to_dict(self) -> Dict[str, Any]:
+        """JSON-ready dict, including the individual confidence signals."""
         return {"name": self.name, "value": _as_jsonable(self.value),
                 "confidence": round(self.confidence, 4),
                 "evidence": [b.to_dict() for b in self.evidence],
@@ -7773,7 +7958,8 @@ class FieldResult(Generic[T]):
                                 for k, v in self.signals.items()),
                 "warnings": list(self.warnings)}
 
-    def __repr__(self):
+    def __repr__(self) -> str:
+        """Name, value, confidence and how many evidence boxes back it."""
         return "FieldResult(%s=%r, confidence=%.2f, evidence=%d)" % (
             self.name, self.value, self.confidence, len(self.evidence))
 
@@ -7792,18 +7978,26 @@ class Extraction(Generic[T]):
     latency_ms: float = 0.0
 
     def __getitem__(self, name: str) -> FieldResult:
+        """``result["total"]`` -- the :class:`FieldResult`.  Raises on unknown names."""
         return self.fields[name]
 
     def value(self, name: str, default: Any = None) -> Any:
+        """The extracted value for ``name``, or ``default`` if missing or null."""
         result = self.fields.get(name)
         return default if result is None or result.value is None else result.value
 
     def confidence(self, name: str) -> float:
+        """Confidence for ``name``, or ``0.0`` when the field is absent."""
         result = self.fields.get(name)
         return result.confidence if result else 0.0
 
     @property
     def mean_confidence(self) -> float:
+        """Mean confidence over the fields that actually got a value.
+
+        Null fields are excluded rather than scored zero: "not present on this
+        document" is a legitimate answer, not a low-confidence one.
+        """
         values = [f.confidence for f in self.fields.values() if f.value is not None]
         return round(sum(values) / len(values), 4) if values else 0.0
 
@@ -7814,9 +8008,11 @@ class Extraction(Generic[T]):
 
     @property
     def is_valid(self) -> bool:
+        """True when no validator reported an ``error`` (warnings are allowed)."""
         return not any(i.severity == "error" for i in self.issues)
 
     def to_dict(self) -> Dict[str, Any]:
+        """JSON-ready dict of the whole result, fields and all."""
         return {
             "model": _as_jsonable(self.model),
             "fields": dict((k, v.to_dict()) for k, v in self.fields.items()),
@@ -7829,7 +8025,8 @@ class Extraction(Generic[T]):
             "source_uri": self.document.source_uri if self.document else "",
         }
 
-    def __repr__(self):
+    def __repr__(self) -> str:
+        """Field count, mean confidence, validity and cost."""
         return "Extraction(fields=%d, mean_confidence=%.2f, valid=%s, cost=%s)" % (
             len(self.fields), self.mean_confidence, self.is_valid, self.cost)
 
@@ -7910,7 +8107,8 @@ def extract(doc: Document, schema: SchemaLike, context: str = "",
                 images = [encode_jpeg(p.raster(), quality=85)
                           for p in chunk.pages if p.has_raster()][:8]
 
-            def call():
+            def call() -> Tuple[str, Cost]:
+                """One model call for this chunk, wrapped so it can be retried."""
                 return client.complete(prompt, system=system, images=images)
 
             try:
@@ -8075,10 +8273,12 @@ class FieldRule(object):
     max_distance_pt: float = 260.0
     occurrence: int = 0
 
-    def compiled_label(self):
+    def compiled_label(self) -> Pattern:
+        """The label pattern, compiled case-insensitively."""
         return re.compile(self.label, re.IGNORECASE)
 
-    def compiled_value(self):
+    def compiled_value(self) -> Pattern:
+        """The value pattern, compiled case-insensitively."""
         return re.compile(self.value_pattern, re.IGNORECASE)
 
 
@@ -8091,6 +8291,13 @@ def extract_with_rules(doc: Document, rules: Sequence[FieldRule]) -> Dict[str, F
 
 
 def _apply_rule(doc: Document, rule: FieldRule) -> FieldResult:
+    """Apply one label-anchored rule across the document.
+
+    Scans lines for the label, then reads the value from beside or below it,
+    honouring ``rule.occurrence`` when a label repeats (a per-page "Total" on
+    a multi-page bill).  Always returns a :class:`FieldResult` -- a rule that
+    matched nothing reports that in ``warnings`` rather than raising.
+    """
     label_re = rule.compiled_label()
     value_re = rule.compiled_value()
     result = FieldResult(name=rule.name, method="rules")
@@ -8197,6 +8404,7 @@ class EvalCase(object):
     meta: Dict[str, Any] = field(default_factory=dict)
 
     def to_dict(self) -> Dict[str, Any]:
+        """JSON-ready dict."""
         return {"case_id": self.case_id, "path": self.path,
                 "truth": _as_jsonable(self.truth), "tags": list(self.tags)}
 
@@ -8224,6 +8432,7 @@ class FieldOutcome(object):
         return bool(self.exact or self.within_tolerance)
 
     def to_dict(self) -> Dict[str, Any]:
+        """JSON-ready dict, including the derived ``correct`` flag."""
         return {"case_id": self.case_id, "pipeline": self.pipeline, "field": self.field,
                 "expected": _as_jsonable(self.expected),
                 "predicted": _as_jsonable(self.predicted),
@@ -8249,6 +8458,7 @@ class CaseResult(object):
     page_verdict: str = "unknown"
 
     def to_dict(self) -> Dict[str, Any]:
+        """JSON-ready dict of one case's outcomes, cost and timing."""
         return {"case_id": self.case_id, "pipeline": self.pipeline,
                 "outcomes": [o.to_dict() for o in self.outcomes],
                 "cost": self.cost.to_dict(),
@@ -8334,6 +8544,14 @@ class EvalSuite(object):
 
     def __init__(self, cases: Optional[Sequence[EvalCase]] = None, name: str = "",
                  field_types: Optional[Mapping[str, str]] = None) -> None:
+        """Build a suite from cases already in memory.
+
+        :param cases: the labelled documents
+        :param name: shown in reports; :meth:`from_dir` defaults it to the folder
+        :param field_types: declared type per field name, overriding the type
+            inferred from each ground-truth value -- needed when a truth value is
+            a string that should nonetheless be compared as a number or a date
+        """
         self.cases = list(cases or [])
         self.name = name
         self.field_types = dict(field_types or {})
@@ -8374,13 +8592,16 @@ class EvalSuite(object):
         return cls(cases, name=name or os.path.basename(os.path.abspath(directory)))
 
     def add(self, case: EvalCase) -> EvalSuite:
+        """Append a case.  Returns ``self``, so cases chain."""
         self.cases.append(case)
         return self
 
     def filter(self, predicate: Callable[[EvalCase], bool]) -> EvalSuite:
+        """A new suite holding only the cases satisfying ``predicate``."""
         return EvalSuite([c for c in self.cases if predicate(c)], self.name, self.field_types)
 
-    def __len__(self):
+    def __len__(self) -> int:
+        """Number of labelled cases."""
         return len(self.cases)
 
     def run(self, pipelines: Mapping[str, PipelineFn],
@@ -8404,6 +8625,7 @@ class EvalSuite(object):
         for pipeline_name, pipeline in pipelines.items():
             def run_case(case: EvalCase, _pipeline: Any = pipeline,
                          _name: str = pipeline_name) -> CaseResult:
+                """Score one case, binding the pipeline for the thread pool."""
                 return self._run_case(case, _pipeline, _name, numeric_tolerance)
 
             results = _map_maybe_parallel(run_case, self.cases, max_workers, "eval")
@@ -8415,6 +8637,12 @@ class EvalSuite(object):
 
     def _run_case(self, case: EvalCase, pipeline: PipelineFn, pipeline_name: str,
                   numeric_tolerance: float) -> CaseResult:
+        """Run one pipeline over one case and score every truth field.
+
+        A pipeline that raises is captured into ``CaseResult.error`` with its
+        latency intact, so the run continues and the failure still shows up in
+        ``error_rate`` rather than vanishing.
+        """
         result = CaseResult(case_id=case.case_id, pipeline=pipeline_name)
         with Timer() as timer:
             try:
@@ -8477,9 +8705,11 @@ class EvalReport(object):
 
     # -- access -----------------------------------------------------------
     def pipelines(self) -> List[str]:
+        """Names of the pipelines in this report, sorted."""
         return sorted(self.results)
 
     def outcomes(self, pipeline: str) -> List[FieldOutcome]:
+        """Every field outcome for ``pipeline``, across all cases."""
         out: List[FieldOutcome] = []
         for case in self.results.get(pipeline, []):
             out.extend(case.outcomes)
@@ -8720,6 +8950,7 @@ class EvalReport(object):
         return "\n".join(lines)
 
     def to_dict(self) -> Dict[str, Any]:
+        """JSON-ready dict: the computed metrics plus every raw outcome."""
         return {"suite": self.suite, "metrics": list(self.metrics),
                 "created_at": self.created_at, "case_count": self.case_count,
                 "computed": dict((n, self.compute(n)) for n in self.pipelines()),
@@ -8727,6 +8958,11 @@ class EvalReport(object):
                                 for n, cases in self.results.items())}
 
     def save(self, path: str) -> str:
+        """Write the report to ``path``, creating parent directories.
+
+        Returns ``path``.  This is the file :meth:`regression_vs` reads as a
+        baseline, so it is worth committing alongside a release.
+        """
         directory = os.path.dirname(os.path.abspath(path))
         if directory:
             os.makedirs(directory, exist_ok=True)
@@ -8736,6 +8972,7 @@ class EvalReport(object):
 
     @classmethod
     def load(cls, path: str) -> EvalReport:
+        """Read a report back from a file written by :meth:`save`."""
         with open(path, "r", encoding="utf-8") as fh:
             payload = json.load(fh)
         report = cls(suite=payload.get("suite", ""),
@@ -8770,12 +9007,14 @@ class EvalReport(object):
             report.results[name] = loaded
         return report
 
-    def __repr__(self):
+    def __repr__(self) -> str:
+        """Suite name, pipelines and case count."""
         return "EvalReport(suite=%r, pipelines=%s, cases=%d)" % (
             self.suite, self.pipelines(), self.case_count)
 
 
 def _mean(values: Sequence[float]) -> float:
+    """Arithmetic mean, or ``0.0`` for an empty sequence."""
     return float(sum(values)) / len(values) if values else 0.0
 
 
@@ -8811,6 +9050,7 @@ class Pipeline(object):
     name: str = "pipeline"
 
     def ingest(self, source: Source, **kwargs: Any) -> Document:
+        """Ingest ``source`` using this pipeline's DPI and page limit."""
         return ingest(source, render_dpi=self.render_dpi, max_pages=self.max_pages,
                       **kwargs)
 
@@ -8839,9 +9079,15 @@ class Pipeline(object):
                        validators=self.validators, calibrator=self.calibrator)
 
     def __call__(self, source: Source, **kwargs: Any) -> Extraction:
+        """``pipeline(source)`` -- alias for :meth:`run`, so it is a ``PipelineFn``."""
         return self.run(source, **kwargs)
 
     def to_dict(self) -> Dict[str, Any]:
+        """JSON-ready description of how this pipeline is configured.
+
+        Callables are recorded by name, not serialised: the point is to make a
+        report say which policy and router produced it.
+        """
         return {
             "name": self.name,
             "policy": getattr(self.policy, "__name__", str(self.policy)),
@@ -8884,6 +9130,7 @@ def process(source: Source, schema: Optional[SchemaLike] = None, context: str = 
 
 
 def _cli_caps(args: Any) -> int:
+    """``docpipe caps`` -- report importable integrations and backends."""
     caps = capabilities()
     print("docpipe %s on Python %s" % (__version__, sys.version.split()[0]))
     for name in sorted(caps):
@@ -8895,6 +9142,7 @@ def _cli_caps(args: Any) -> int:
 
 
 def _cli_info(args: Any) -> int:
+    """``docpipe info`` -- ingest a document and describe what arrived."""
     doc = ingest(args.path, max_pages=args.max_pages, render_dpi=args.dpi)
     print("source:  %s" % doc.source_uri)
     print("pages:   %d" % len(doc.pages))
@@ -8909,6 +9157,7 @@ def _cli_info(args: Any) -> int:
 
 
 def _cli_quality(args: Any) -> int:
+    """``docpipe quality`` -- measure per-page degradation."""
     doc = ingest(args.path, max_pages=args.max_pages, render_dpi=args.dpi)
     measure_document(doc, max_workers=args.workers)
     for page in doc.pages:
@@ -8919,6 +9168,7 @@ def _cli_quality(args: Any) -> int:
 
 
 def _cli_preprocess(args: Any) -> int:
+    """``docpipe preprocess`` -- apply a policy, optionally writing PNGs."""
     policies = {"default": default_policy, "ocr": ocr_policy, "vlm": vlm_policy,
                 "none": no_policy}
     doc = ingest(args.path, max_pages=args.max_pages, render_dpi=args.dpi)
@@ -8935,6 +9185,7 @@ def _cli_preprocess(args: Any) -> int:
 
 
 def _cli_read(args: Any) -> int:
+    """``docpipe read`` -- preprocess and OCR, printing text or JSON."""
     doc = ingest(args.path, max_pages=args.max_pages, render_dpi=args.dpi)
     if args.policy != "none":
         policies = {"default": default_policy, "ocr": ocr_policy, "vlm": vlm_policy}
@@ -8950,6 +9201,7 @@ def _cli_read(args: Any) -> int:
 
 
 def _cli_extract(args: Any) -> int:
+    """``docpipe extract`` -- run a schema end to end.  Exit 2 if invalid."""
     with open(args.schema, "r", encoding="utf-8") as fh:
         schema = json.load(fh)
     clients = {
@@ -8967,6 +9219,7 @@ def _cli_extract(args: Any) -> int:
 
 
 def _cli_eval(args: Any) -> int:
+    """``docpipe eval`` -- score a dataset, optionally gating on a baseline."""
     suite = EvalSuite.from_dir(args.dataset)
     with open(args.schema, "r", encoding="utf-8") as fh:
         schema = json.load(fh)
@@ -8997,7 +9250,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     parser.add_argument("--quiet", "-q", action="store_true", help="errors only")
     sub = parser.add_subparsers(dest="command")
 
-    def add_common(p, with_path=True):
+    def add_common(p: Any, with_path: bool = True) -> None:
+        """Add the arguments every document subcommand shares."""
         if with_path:
             p.add_argument("path", help="PDF, image, TIFF or .eml file")
         p.add_argument("--dpi", type=int, default=DEFAULT_DPI, help="render resolution")
