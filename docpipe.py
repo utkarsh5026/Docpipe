@@ -66,20 +66,20 @@ Dependencies
 The core (IR, normalisation, confidence, extraction plumbing, eval harness) is
 pure standard library.  Everything heavier is optional and imported lazily:
 
-=================  ==========================================================
-``numpy``          all raster work
-``opencv-python``  fast/high-quality image ops (NumPy fallbacks exist for most)
-``pymupdf``        PDF ingest and native text layers
-``pillow``         image and multi-page TIFF ingest
-``pytesseract``    Tesseract backend (or the ``tesseract`` binary directly)
-``paddleocr``      PaddleOCR backend
-``rapidocr-onnxruntime`` RapidOCR backend (PP-OCR weights, ONNX runtime)
-``easyocr``        EasyOCR backend
-``python-doctr``   docTR backend
-``surya-ocr``      Surya backend (90+ scripts)
+==========================  ================================================
+``numpy``                   all raster work
+``opencv-python``           fast/high-quality image ops (NumPy fallbacks too)
+``pymupdf``                 PDF ingest and native text layers
+``pillow``                  image and multi-page TIFF ingest
+``pytesseract``             Tesseract backend (or the ``tesseract`` binary)
+``paddleocr``               PaddleOCR backend
+``rapidocr-onnxruntime``    RapidOCR backend (PP-OCR weights, ONNX runtime)
+``easyocr``                 EasyOCR backend
+``python-doctr``            docTR backend
+``surya-ocr``               Surya backend (90+ scripts)
 ``anthropic`` / ``openai``  vision-language backends and extraction clients
-``pydantic``       schema-driven extraction (v1 and v2 both supported)
-=================  ==========================================================
+``pydantic``                schema-driven extraction (v1 and v2 supported)
+==========================  ================================================
 
 Call :func:`capabilities` to see what is actually importable right now.
 
