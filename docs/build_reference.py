@@ -759,7 +759,7 @@ JS = """
 """
 
 
-def build(source: str, out_path: str) -> str:
+def build(source: str, out_path: str, fragment: bool = False) -> str:
     module_doc, sections, exported = collect(source)
 
     global KNOWN
@@ -822,10 +822,16 @@ def build(source: str, out_path: str) -> str:
             total += 1
         body.append("</section>")
 
-    page = """<title>docpipe %(version)s &middot; API reference</title>
+    page = """<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>docpipe %(version)s &middot; API reference</title>
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <meta name="description" content="API reference for docpipe, a single-file document intelligence substrate.">
 <style>%(css)s</style>
+</head>
+<body>
 <div class="layout">
   <aside class="sidebar">
     <div class="brand">
@@ -854,6 +860,8 @@ def build(source: str, out_path: str) -> str:
   </main>
 </div>
 <script>%(js)s</script>
+</body>
+</html>
 """ % {
         "version": html.escape(version),
         "css": CSS,
@@ -865,6 +873,12 @@ def build(source: str, out_path: str) -> str:
         "total": total,
         "repo": html.escape(REPO),
     }
+
+    if fragment:
+        page = re.sub(r"^.*?<body>\n", "", page, count=1, flags=re.S)
+        page = page.replace("</body>\n</html>\n", "")
+        page = ('<title>docpipe %s &middot; API reference</title>\n<style>%s</style>\n'
+                % (html.escape(version), CSS)) + page
 
     directory = os.path.dirname(os.path.abspath(out_path))
     if directory:
@@ -879,8 +893,10 @@ def main(argv: Optional[List[str]] = None) -> int:
     parser.add_argument("-o", "--out", default=os.path.join(ROOT, "site", "index.html"),
                         help="output HTML path (default: site/index.html)")
     parser.add_argument("--source", default=SOURCE, help="path to docpipe.py")
+    parser.add_argument("--fragment", action="store_true",
+                        help="omit the <html>/<head>/<body> wrapper")
     args = parser.parse_args(argv)
-    path = build(args.source, args.out)
+    path = build(args.source, args.out, fragment=args.fragment)
     size = os.path.getsize(path) / 1024.0
     print("wrote %s (%.0f KB)" % (path, size))
     return 0
