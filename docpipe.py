@@ -122,10 +122,8 @@ import time
 import unicodedata
 import warnings
 from dataclasses import dataclass, field
-# NOTE: several of these names are referenced only from ``# type:`` comments
-# (this file targets Python 3.8 and keeps annotations out of the signatures),
-# so a linter will report them as unused.  They are not.
 from typing import (
+    IO,
     Any,
     Callable,
     Dict,
@@ -146,8 +144,38 @@ try:  # pragma: no cover - trivial
 except ImportError:  # pragma: no cover - Python 3.7
     Protocol = object  # type: ignore
 
+# -----------------------------------------------------------------------------
+# Type aliases
+# -----------------------------------------------------------------------------
+# Annotations are written inline, but ``from __future__ import annotations`` (at
+# the top of this file) means they are never evaluated at runtime -- so a name
+# used only in a signature costs nothing and forward references need no quotes.
+#
+# Several aliases below resolve to ``Any``.  That is deliberate, not laziness:
+# NumPy, PyMuPDF and the OCR/LLM SDKs are all *optional* dependencies, so their
+# real types cannot be imported at module import time without defeating the
+# point.  The alias carries the contract in its name where the checker cannot.
+
 T = TypeVar("T")
 Number = Union[int, float]
+
+#: A raster image: a ``uint8`` NumPy array, ``(H, W)`` grey or ``(H, W, 3)`` RGB.
+ImageArray = Any
+#: A single-channel ``uint8`` NumPy array, ``(H, W)``.  Ink is dark, paper light.
+GrayImage = Any
+#: A floating-point NumPy array -- an intermediate result of image maths
+#: (projections, integral images, gradient magnitudes) rather than a picture.
+FloatArray = Any
+#: A lazily imported optional dependency, obtained via :func:`require`.
+Module = Any
+#: Anything a document can be ingested from: a filesystem path, raw bytes, or an
+#: open binary file object.
+Source = Union[str, "os.PathLike[str]", bytes, bytearray, IO[bytes]]
+#: A JSON-serialisable mapping, as produced by every ``to_dict`` in this file.
+JSONDict = Dict[str, Any]
+#: An extraction schema: a pydantic model, a dataclass, or a ``{field: type}``
+#: dict spec.  See :class:`SchemaAdapter` for what each form supports.
+SchemaLike = Any
 
 logger = logging.getLogger("docpipe")
 logger.addHandler(logging.NullHandler())
@@ -202,7 +230,7 @@ class BudgetExceeded(DocpipeError):
     """A cost budget was exhausted before the document finished."""
 
 
-_IMPORT_CACHE = {}  # type: Dict[str, Any]
+_IMPORT_CACHE: Dict[str, Any] = {}
 _IMPORT_LOCK = threading.Lock()
 
 #: pip names for modules whose import name differs from their distribution name.
@@ -224,8 +252,7 @@ _PIP_NAMES = {
 }
 
 
-def _try_import(name):
-    # type: (str) -> Any
+def _try_import(name: str) -> Optional[Module]:
     """Import ``name``, returning ``None`` if it is unavailable.
 
     Results (including failures) are cached, so a missing optional dependency is
@@ -247,8 +274,7 @@ def _try_import(name):
         return mod
 
 
-def require(name, purpose=""):
-    # type: (str, str) -> Any
+def require(name: str, purpose: str = "") -> Module:
     """Import ``name`` or raise :class:`MissingDependency` with a pip hint."""
     mod = _try_import(name)
     if mod is None:
@@ -256,20 +282,17 @@ def require(name, purpose=""):
     return mod
 
 
-def have(name):
-    # type: (str) -> bool
+def have(name: str) -> bool:
     """True when optional module ``name`` can be imported."""
     return _try_import(name) is not None
 
 
-def _np():
-    # type: () -> Any
+def _np() -> Module:
     """NumPy, or :class:`MissingDependency`.  Used by every raster code path."""
     return require("numpy", "raster image operations")
 
 
-def _fitz(required=False):
-    # type: (bool) -> Any
+def _fitz(required: bool = False) -> Optional[Module]:
     """PyMuPDF under either of its import names.
 
     The project renamed ``fitz`` to ``pymupdf`` and the old name now emits a
@@ -289,8 +312,7 @@ _USE_OPENCV = os.environ.get("DOCPIPE_DISABLE_OPENCV", "").strip().lower() \
     not in ("1", "true", "yes", "on")
 
 
-def set_opencv_enabled(enabled):
-    # type: (bool) -> bool
+def set_opencv_enabled(enabled: bool) -> bool:
     """Enable/disable OpenCV acceleration globally.  Returns the previous value."""
     global _USE_OPENCV
     prev = _USE_OPENCV
@@ -298,8 +320,7 @@ def set_opencv_enabled(enabled):
     return prev
 
 
-def _cv2():
-    # type: () -> Any
+def _cv2() -> Optional[Module]:
     """OpenCV if available *and* enabled, else ``None``.
 
     Image ops call this and branch: ``cv = _cv2(); if cv is not None: ...``.
@@ -321,14 +342,12 @@ class _OpenCVDisabled(object):
         return False
 
 
-def without_opencv():
-    # type: () -> _OpenCVDisabled
+def without_opencv() -> _OpenCVDisabled:
     """``with docpipe.without_opencv(): ...`` -- force pure-NumPy image ops."""
     return _OpenCVDisabled()
 
 
-def capabilities():
-    # type: () -> Dict[str, bool]
+def capabilities() -> Dict[str, bool]:
     """Report which optional integrations are usable in this interpreter.
 
     Cheap to call and safe at import time; useful in a health check.
@@ -338,7 +357,7 @@ def capabilities():
         "rapidocr_onnxruntime", "easyocr", "doctr", "surya", "pydantic",
         "anthropic", "openai",
     ]
-    caps = {}  # type: Dict[str, bool]
+    caps: Dict[str, bool] = {}
     for n in names:
         caps[n] = have(n)
     caps["pymupdf"] = _fitz() is not None
@@ -352,8 +371,7 @@ def capabilities():
 # =============================================================================
 
 
-def stable_hash(*parts):
-    # type: (*Any) -> str
+def stable_hash(*parts: Any) -> str:
     """A short, stable, cross-process content hash.
 
     ``hash()`` is salted per process and useless for caching; this is not.
@@ -377,8 +395,7 @@ def stable_hash(*parts):
     return h.hexdigest()[:32]
 
 
-def array_hash(arr):
-    # type: (Any) -> str
+def array_hash(arr: ImageArray) -> str:
     """Content hash of a NumPy array, for caching backend reads."""
     try:
         buf = arr.tobytes()
@@ -387,8 +404,7 @@ def array_hash(arr):
     return stable_hash(buf, str(getattr(arr, "shape", "")), str(getattr(arr, "dtype", "")))
 
 
-def clamp(value, lo, hi):
-    # type: (float, float, float) -> float
+def clamp(value: float, lo: float, hi: float) -> float:
     """Clamp ``value`` into ``[lo, hi]``."""
     if value < lo:
         return lo
@@ -397,13 +413,11 @@ def clamp(value, lo, hi):
     return value
 
 
-def _safe_div(a, b, default=0.0):
-    # type: (float, float, float) -> float
+def _safe_div(a: float, b: float, default: float = 0.0) -> float:
     return a / b if b else default
 
 
-def percentile(values, q):
-    # type: (Sequence[float], float) -> float
+def percentile(values: Sequence[float], q: float) -> float:
     """Linear-interpolated percentile without pulling in NumPy.
 
     ``q`` is in ``[0, 100]``.  Returns ``0.0`` for an empty sequence, which is
@@ -423,8 +437,7 @@ def percentile(values, q):
     return float(ordered[lo]) * (1.0 - frac) + float(ordered[hi]) * frac
 
 
-def levenshtein(a, b, max_distance=None):
-    # type: (str, str, Optional[int]) -> int
+def levenshtein(a: str, b: str, max_distance: Optional[int] = None) -> int:
     """Edit distance with an optional early-exit bound.
 
     Iterative two-row DP: O(len(a) * len(b)) time, O(min) space.  When
@@ -457,8 +470,7 @@ def levenshtein(a, b, max_distance=None):
     return previous[-1]
 
 
-def similarity(a, b):
-    # type: (str, str) -> float
+def similarity(a: str, b: str) -> float:
     """Normalised similarity in ``[0, 1]``: ``1 - edit_distance / max_len``."""
     if a == b:
         return 1.0
@@ -485,24 +497,16 @@ class Timer(object):
         return False
 
     @property
-    def ms(self):
-        # type: () -> float
+    def ms(self) -> float:
         end = self.end or time.time()
         return (end - self.start) * 1000.0
 
 
-def retry_call(
-    fn,
-    attempts=3,
-    base_delay=0.5,
-    max_delay=8.0,
-    jitter=0.25,
-    retry_on=(Exception,),
-    give_up_on=(),
-    on_retry=None,
-    sleep=time.sleep,
-):
-    # type: (Callable[[], T], int, float, float, float, Tuple[type, ...], Tuple[type, ...], Optional[Callable[[int, BaseException, float], None]], Callable[[float], None]) -> T
+def retry_call(fn: Callable[[], T], attempts: int = 3, base_delay: float = 0.5,
+               max_delay: float = 8.0, jitter: float = 0.25,
+               retry_on: Tuple[type, ...] = (Exception,), give_up_on: Tuple[type, ...] = (),
+               on_retry: Optional[Callable[[int, BaseException, float], None]] = None,
+               sleep: Callable[[float], None] = time.sleep) -> T:
     """Call ``fn`` with exponential backoff and full jitter.
 
     ``give_up_on`` wins over ``retry_on`` so that non-retryable failures (bad
@@ -512,7 +516,7 @@ def retry_call(
     """
     if attempts < 1:
         raise ConfigError("attempts must be >= 1")
-    last = None  # type: Optional[BaseException]
+    last: Optional[BaseException] = None
     for attempt in range(1, attempts + 1):
         try:
             return fn()
@@ -533,8 +537,7 @@ def retry_call(
     raise last
 
 
-def chunked(seq, size):
-    # type: (Sequence[T], int) -> Iterator[List[T]]
+def chunked(seq: Sequence[T], size: int) -> Iterator[List[T]]:
     """Yield ``seq`` in lists of at most ``size``."""
     if size < 1:
         raise ConfigError("chunk size must be >= 1")
@@ -542,8 +545,8 @@ def chunked(seq, size):
         yield list(seq[i:i + size])
 
 
-def _map_maybe_parallel(fn, items, max_workers=0, label="work"):
-    # type: (Callable[[Any], Any], Sequence[Any], int, str) -> List[Any]
+def _map_maybe_parallel(fn: Callable[[Any], Any], items: Sequence[Any],
+                        max_workers: int = 0, label: str = "work") -> List[Any]:
     """``map`` that goes through a thread pool when ``max_workers > 1``.
 
     Threads (not processes) because the expensive work is either native code
@@ -562,13 +565,11 @@ def _map_maybe_parallel(fn, items, max_workers=0, label="work"):
     return [fn(x) for x in items]
 
 
-def _utcnow():
-    # type: () -> str
+def _utcnow() -> str:
     return _dt.datetime.utcnow().replace(microsecond=0).isoformat() + "Z"
 
 
-def _as_jsonable(obj):
-    # type: (Any) -> Any
+def _as_jsonable(obj: Any) -> Any:
     """Best-effort conversion of nested docpipe/py objects to JSON primitives."""
     if obj is None or isinstance(obj, (bool, int, float, str)):
         return obj
@@ -612,8 +613,7 @@ def _as_jsonable(obj):
     return str(obj)
 
 
-def to_json(obj, indent=2, sort_keys=False):
-    # type: (Any, Optional[int], bool) -> str
+def to_json(obj: Any, indent: Optional[int] = 2, sort_keys: bool = False) -> str:
     """Serialise any docpipe object graph to JSON."""
     return json.dumps(_as_jsonable(obj), indent=indent, sort_keys=sort_keys, ensure_ascii=False)
 
@@ -702,35 +702,29 @@ class BBox(object):
 
     # -- geometry ---------------------------------------------------------
     @property
-    def width(self):
-        # type: () -> float
+    def width(self) -> float:
         return self.x1 - self.x0
 
     @property
-    def height(self):
-        # type: () -> float
+    def height(self) -> float:
         return self.y1 - self.y0
 
     @property
-    def area(self):
-        # type: () -> float
+    def area(self) -> float:
         return max(0.0, self.width) * max(0.0, self.height)
 
     @property
-    def center(self):
-        # type: () -> Tuple[float, float]
+    def center(self) -> Tuple[float, float]:
         return ((self.x0 + self.x1) / 2.0, (self.y0 + self.y1) / 2.0)
 
-    def union(self, other):
-        # type: (BBox) -> BBox
+    def union(self, other: BBox) -> BBox:
         """Smallest box containing both.  Requires the same page."""
         if other.page != self.page:
             raise ValueError("cannot union boxes from pages %d and %d" % (self.page, other.page))
         return BBox(self.page, min(self.x0, other.x0), min(self.y0, other.y0),
                     max(self.x1, other.x1), max(self.y1, other.y1))
 
-    def intersection(self, other):
-        # type: (BBox) -> Optional[BBox]
+    def intersection(self, other: BBox) -> Optional[BBox]:
         """Overlap rectangle, or ``None`` when they do not overlap."""
         if other.page != self.page:
             return None
@@ -742,8 +736,7 @@ class BBox(object):
             return None
         return BBox(self.page, x0, y0, x1, y1)
 
-    def iou(self, other):
-        # type: (BBox) -> float
+    def iou(self, other: BBox) -> float:
         """Intersection over union in ``[0, 1]``."""
         inter = self.intersection(other)
         if inter is None:
@@ -751,78 +744,66 @@ class BBox(object):
         denom = self.area + other.area - inter.area
         return _safe_div(inter.area, denom)
 
-    def contains(self, other, tolerance=0.0):
-        # type: (BBox, float) -> bool
+    def contains(self, other: BBox, tolerance: float = 0.0) -> bool:
         return (other.page == self.page
                 and other.x0 >= self.x0 - tolerance and other.y0 >= self.y0 - tolerance
                 and other.x1 <= self.x1 + tolerance and other.y1 <= self.y1 + tolerance)
 
-    def overlaps(self, other):
-        # type: (BBox) -> bool
+    def overlaps(self, other: BBox) -> bool:
         return self.intersection(other) is not None
 
-    def expand(self, margin):
-        # type: (float) -> BBox
+    def expand(self, margin: float) -> BBox:
         return BBox(self.page, self.x0 - margin, self.y0 - margin,
                     self.x1 + margin, self.y1 + margin)
 
-    def scaled(self, factor):
-        # type: (float) -> BBox
+    def scaled(self, factor: float) -> BBox:
         return BBox(self.page, self.x0 * factor, self.y0 * factor,
                     self.x1 * factor, self.y1 * factor)
 
-    def translated(self, dx, dy):
-        # type: (float, float) -> BBox
+    def translated(self, dx: float, dy: float) -> BBox:
         return BBox(self.page, self.x0 + dx, self.y0 + dy, self.x1 + dx, self.y1 + dy)
 
-    def clipped(self, width, height):
-        # type: (float, float) -> BBox
+    def clipped(self, width: float, height: float) -> BBox:
         return BBox(self.page,
                     clamp(self.x0, 0.0, width), clamp(self.y0, 0.0, height),
                     clamp(self.x1, 0.0, width), clamp(self.y1, 0.0, height))
 
     # -- unit conversion --------------------------------------------------
-    def to_pixels(self, dpi):
-        # type: (float) -> Tuple[int, int, int, int]
+    def to_pixels(self, dpi: float) -> Tuple[int, int, int, int]:
         """``(x0, y0, x1, y1)`` in integer pixels at ``dpi``."""
         s = dpi / 72.0
         return (int(round(self.x0 * s)), int(round(self.y0 * s)),
                 int(round(self.x1 * s)), int(round(self.y1 * s)))
 
     @classmethod
-    def from_pixels(cls, page, x0, y0, x1, y1, dpi):
-        # type: (int, float, float, float, float, float) -> BBox
+    def from_pixels(cls, page: int, x0: float, y0: float, x1: float, y1: float,
+                    dpi: float) -> BBox:
         """Build a point-space BBox from pixel coordinates measured at ``dpi``."""
         s = 72.0 / float(dpi)
         return cls(page, x0 * s, y0 * s, x1 * s, y1 * s)
 
     @classmethod
-    def from_xywh(cls, page, x, y, w, h):
-        # type: (int, float, float, float, float) -> BBox
+    def from_xywh(cls, page: int, x: float, y: float, w: float, h: float) -> BBox:
         return cls(page, x, y, x + w, y + h)
 
     @classmethod
-    def from_quad(cls, page, points):
-        # type: (int, Sequence[Sequence[float]]) -> BBox
+    def from_quad(cls, page: int, points: Sequence[Sequence[float]]) -> BBox:
         """Axis-aligned hull of a polygon -- what most detectors actually emit."""
         xs = [float(p[0]) for p in points]
         ys = [float(p[1]) for p in points]
         return cls(page, min(xs), min(ys), max(xs), max(ys))
 
     @classmethod
-    def whole_page(cls, page, width_pt, height_pt):
-        # type: (int, float, float) -> BBox
+    def whole_page(cls, page: int, width_pt: float, height_pt: float) -> BBox:
         return cls(page, 0.0, 0.0, width_pt, height_pt)
 
     # -- serialisation ----------------------------------------------------
-    def to_dict(self):
-        # type: () -> Dict[str, float]
+    def to_dict(self) -> Dict[str, float]:
         return {"page": self.page, "x0": round(self.x0, 3), "y0": round(self.y0, 3),
                 "x1": round(self.x1, 3), "y1": round(self.y1, 3)}
 
     @classmethod
-    def from_dict(cls, d):
-        # type: (Mapping[str, Any]) -> BBox
+    def from_dict(cls, d: Mapping[str, Any]) -> BBox:
         return cls(int(d["page"]), float(d["x0"]), float(d["y0"]),
                    float(d["x1"]), float(d["y1"]))
 
@@ -831,10 +812,9 @@ class BBox(object):
             self.page, self.x0, self.y0, self.x1, self.y1)
 
 
-def merge_bboxes(boxes):
-    # type: (Sequence[BBox]) -> List[BBox]
+def merge_bboxes(boxes: Sequence[BBox]) -> List[BBox]:
     """Union boxes per page.  Evidence spanning pages stays as one box per page."""
-    by_page = {}  # type: Dict[int, BBox]
+    by_page: Dict[int, BBox] = {}
     for b in boxes:
         cur = by_page.get(b.page)
         by_page[b.page] = b if cur is None else cur.union(b)
@@ -860,17 +840,14 @@ class TextSpan(object):
     meta: Dict[str, Any] = field(default_factory=dict)
 
     @property
-    def page(self):
-        # type: () -> int
+    def page(self) -> int:
         return self.bbox.page
 
     @property
-    def is_empty(self):
-        # type: () -> bool
+    def is_empty(self) -> bool:
         return not self.text.strip()
 
-    def to_dict(self):
-        # type: () -> Dict[str, Any]
+    def to_dict(self) -> Dict[str, Any]:
         d = {"text": self.text, "bbox": self.bbox.to_dict(), "source": self.source}
         if self.confidence is not None:
             d["confidence"] = round(float(self.confidence), 4)
@@ -885,8 +862,7 @@ class TextSpan(object):
         return d
 
     @classmethod
-    def from_dict(cls, d):
-        # type: (Mapping[str, Any]) -> TextSpan
+    def from_dict(cls, d: Mapping[str, Any]) -> TextSpan:
         return cls(text=d["text"], bbox=BBox.from_dict(d["bbox"]),
                    source=d.get("source", "unknown"), confidence=d.get("confidence"),
                    script=d.get("script"), line=d.get("line"), block=d.get("block"),
@@ -914,13 +890,11 @@ class PageQuality(object):
     extra: Dict[str, float] = field(default_factory=dict)
 
     @property
-    def is_readable(self):
-        # type: () -> bool
+    def is_readable(self) -> bool:
         return self.verdict is not Verdict.UNREADABLE
 
     @property
-    def score(self):
-        # type: () -> float
+    def score(self) -> float:
         """Single scalar in ``[0, 1]`` summarising page health.
 
         Used as the prior term in confidence fusion.  Weights are deliberately
@@ -937,8 +911,7 @@ class PageQuality(object):
         ]
         return round(sum(w * v for w, v in terms), 4)
 
-    def to_dict(self):
-        # type: () -> Dict[str, Any]
+    def to_dict(self) -> Dict[str, Any]:
         return {
             "blur": round(self.blur, 4), "skew_deg": round(self.skew_deg, 3),
             "contrast": round(self.contrast, 4), "ink_coverage": round(self.ink_coverage, 4),
@@ -949,8 +922,7 @@ class PageQuality(object):
         }
 
     @classmethod
-    def from_dict(cls, d):
-        # type: (Mapping[str, Any]) -> PageQuality
+    def from_dict(cls, d: Mapping[str, Any]) -> PageQuality:
         return cls(blur=float(d.get("blur", 1.0)), skew_deg=float(d.get("skew_deg", 0.0)),
                    contrast=float(d.get("contrast", 1.0)),
                    ink_coverage=float(d.get("ink_coverage", 0.0)),
@@ -976,14 +948,12 @@ class LayoutRegion(object):
     confidence: float = 1.0
     meta: Dict[str, Any] = field(default_factory=dict)
 
-    def to_dict(self):
-        # type: () -> Dict[str, Any]
+    def to_dict(self) -> Dict[str, Any]:
         return {"kind": str(self.kind), "bbox": self.bbox.to_dict(),
                 "confidence": round(self.confidence, 4), "meta": _as_jsonable(self.meta)}
 
     @classmethod
-    def from_dict(cls, d):
-        # type: (Mapping[str, Any]) -> LayoutRegion
+    def from_dict(cls, d: Mapping[str, Any]) -> LayoutRegion:
         return cls(RegionKind(d.get("kind", "unknown")), BBox.from_dict(d["bbox"]),
                    float(d.get("confidence", 1.0)), dict(d.get("meta") or {}))
 
@@ -994,32 +964,26 @@ class Layout(object):
 
     regions: List[LayoutRegion] = field(default_factory=list)
 
-    def of_kind(self, kind):
-        # type: (RegionKind) -> List[LayoutRegion]
+    def of_kind(self, kind: RegionKind) -> List[LayoutRegion]:
         return [r for r in self.regions if r.kind is kind]
 
     @property
-    def is_tabular(self):
-        # type: () -> bool
+    def is_tabular(self) -> bool:
         return bool(self.of_kind(RegionKind.TABLE))
 
     @property
-    def has_handwriting(self):
-        # type: () -> bool
+    def has_handwriting(self) -> bool:
         return bool(self.of_kind(RegionKind.HANDWRITING))
 
     @property
-    def has_stamps(self):
-        # type: () -> bool
+    def has_stamps(self) -> bool:
         return bool(self.of_kind(RegionKind.STAMP))
 
-    def to_dict(self):
-        # type: () -> Dict[str, Any]
+    def to_dict(self) -> Dict[str, Any]:
         return {"regions": [r.to_dict() for r in self.regions]}
 
     @classmethod
-    def from_dict(cls, d):
-        # type: (Mapping[str, Any]) -> Layout
+    def from_dict(cls, d: Mapping[str, Any]) -> Layout:
         return cls([LayoutRegion.from_dict(r) for r in (d.get("regions") or [])])
 
 
@@ -1036,8 +1000,7 @@ class OpRecord(object):
     ms: float = 0.0
     note: str = ""
 
-    def to_dict(self):
-        # type: () -> Dict[str, Any]
+    def to_dict(self) -> Dict[str, Any]:
         d = {"op": self.op, "ms": round(self.ms, 2)}
         if self.params:
             d["params"] = _as_jsonable(self.params)
@@ -1090,8 +1053,7 @@ class Page(object):
     _raster_provider: Optional[RasterProvider] = field(default=None, repr=False, compare=False)
 
     # -- raster -----------------------------------------------------------
-    def raster(self, dpi=None):
-        # type: (Optional[int]) -> Any
+    def raster(self, dpi: Optional[int] = None) -> ImageArray:
         """Return the page image as a uint8 NumPy array, rendering on demand.
 
         Semantics that matter:
@@ -1124,13 +1086,12 @@ class Page(object):
             "page %d has no raster and no raster provider; ingest it from a "
             "PDF/image or call set_raster()" % self.index)
 
-    def has_raster(self):
-        # type: () -> bool
+    def has_raster(self) -> bool:
         """True when a raster is materialised or can be produced without I/O errors."""
         return self._raster is not None or self._raster_provider is not None
 
-    def set_raster(self, img, dpi=None, keep_provider=False):
-        # type: (Any, Optional[int], bool) -> Page
+    def set_raster(self, img: ImageArray, dpi: Optional[int] = None,
+                   keep_provider: bool = False) -> Page:
         """Install ``img`` as this page's raster.  Ops use this.
 
         Dropping the provider is the default and is deliberate: after a deskew,
@@ -1142,28 +1103,25 @@ class Page(object):
             self._raster_provider = None
         return self
 
-    def set_raster_provider(self, provider, dpi=None):
-        # type: (RasterProvider, Optional[int]) -> Page
+    def set_raster_provider(self, provider: RasterProvider,
+                            dpi: Optional[int] = None) -> Page:
         self._raster_provider = provider
         if dpi:
             self._raster_dpi = int(dpi)
         return self
 
-    def release_raster(self):
-        # type: () -> Page
+    def release_raster(self) -> Page:
         """Drop the materialised raster.  Only safe while a provider remains."""
         if self._raster_provider is not None:
             self._raster = None
         return self
 
     @property
-    def raster_dpi(self):
-        # type: () -> int
+    def raster_dpi(self) -> int:
         return self._raster_dpi or DEFAULT_DPI
 
     @property
-    def pixel_size(self):
-        # type: () -> Tuple[int, int]
+    def pixel_size(self) -> Tuple[int, int]:
         """``(width, height)`` of the current raster in pixels, ``(0, 0)`` if none."""
         if self._raster is None:
             return (0, 0)
@@ -1171,13 +1129,11 @@ class Page(object):
         return (int(shape[1]), int(shape[0]))
 
     # -- text -------------------------------------------------------------
-    def text(self, separator="\n"):
-        # type: (str) -> str
+    def text(self, separator: str = "\n") -> str:
         """Reading-order text.  Spans are sorted by line, then by x."""
         return separator.join(l.strip() for l in self.lines() if l.strip())
 
-    def lines(self, y_tolerance=None):
-        # type: (Optional[float]) -> List[str]
+    def lines(self, y_tolerance: Optional[float] = None) -> List[str]:
         """Group spans into visual lines and return them top-to-bottom.
 
         ``y_tolerance`` defaults to 60% of the median span height, which tracks
@@ -1186,8 +1142,7 @@ class Page(object):
         return [" ".join(s.text.strip() for s in group if s.text.strip())
                 for group in _group_spans_into_lines(self, y_tolerance)]
 
-    def spans_in(self, bbox, min_overlap=0.5):
-        # type: (BBox, float) -> List[TextSpan]
+    def spans_in(self, bbox: BBox, min_overlap: float = 0.5) -> List[TextSpan]:
         """Spans whose area overlaps ``bbox`` by at least ``min_overlap``."""
         out = []
         for s in self.spans:
@@ -1197,32 +1152,27 @@ class Page(object):
         return out
 
     @property
-    def char_count(self):
-        # type: () -> int
+    def char_count(self) -> int:
         return sum(len(s.text.strip()) for s in self.spans)
 
     @property
-    def is_blank(self):
-        # type: () -> bool
+    def is_blank(self) -> bool:
         return self.kind is PageKind.BLANK or (self.char_count == 0
                                                and self.quality.ink_coverage < 0.002)
 
     # -- bookkeeping ------------------------------------------------------
-    def record(self, op, params=None, ms=0.0, note=""):
-        # type: (str, Optional[Dict[str, Any]], float, str) -> Page
+    def record(self, op: str, params: Optional[Dict[str, Any]] = None, ms: float = 0.0,
+               note: str = "") -> Page:
         self.history.append(OpRecord(op=op, params=dict(params or {}), ms=ms, note=note))
         return self
 
-    def history_summary(self):
-        # type: () -> str
+    def history_summary(self) -> str:
         return " -> ".join(str(h) for h in self.history)
 
-    def bbox(self):
-        # type: () -> BBox
+    def bbox(self) -> BBox:
         return BBox.whole_page(self.index, self.width_pt, self.height_pt)
 
-    def copy(self, deep_spans=True):
-        # type: (bool) -> Page
+    def copy(self, deep_spans: bool = True) -> Page:
         """Shallow-copy the page, sharing the raster but not the span list.
 
         Ops use this so that a pipeline never mutates the caller's document --
@@ -1241,8 +1191,7 @@ class Page(object):
         new._raster_provider = self._raster_provider
         return new
 
-    def to_dict(self, include_spans=True):
-        # type: (bool) -> Dict[str, Any]
+    def to_dict(self, include_spans: bool = True) -> Dict[str, Any]:
         d = {
             "index": self.index, "kind": str(self.kind),
             "width_pt": round(self.width_pt, 2), "height_pt": round(self.height_pt, 2),
@@ -1256,8 +1205,7 @@ class Page(object):
         return d
 
     @classmethod
-    def from_dict(cls, d):
-        # type: (Mapping[str, Any]) -> Page
+    def from_dict(cls, d: Mapping[str, Any]) -> Page:
         page = cls(
             index=int(d["index"]),
             width_pt=float(d.get("width_pt", 612.0)),
@@ -1292,74 +1240,62 @@ class Document(object):
     def __len__(self):
         return len(self.pages)
 
-    def __iter__(self):
-        # type: () -> Iterator[Page]
+    def __iter__(self) -> Iterator[Page]:
         return iter(self.pages)
 
-    def __getitem__(self, i):
-        # type: (int) -> Page
+    def __getitem__(self, i: int) -> Page:
         return self.pages[i]
 
-    def page(self, index):
-        # type: (int) -> Page
+    def page(self, index: int) -> Page:
         """Page by its ``index`` attribute (not its list position)."""
         for p in self.pages:
             if p.index == index:
                 return p
         raise KeyError("no page with index %d" % index)
 
-    def text(self, separator="\n\n"):
-        # type: (str) -> str
+    def text(self, separator: str = "\n\n") -> str:
         return separator.join(p.text() for p in self.pages if p.text().strip())
 
-    def spans(self):
-        # type: () -> List[TextSpan]
-        out = []  # type: List[TextSpan]
+    def spans(self) -> List[TextSpan]:
+        out: List[TextSpan] = []
         for p in self.pages:
             out.extend(p.spans)
         return out
 
     @property
-    def char_count(self):
-        # type: () -> int
+    def char_count(self) -> int:
         return sum(p.char_count for p in self.pages)
 
-    def kinds(self):
-        # type: () -> Dict[str, int]
-        counts = {}  # type: Dict[str, int]
+    def kinds(self) -> Dict[str, int]:
+        counts: Dict[str, int] = {}
         for p in self.pages:
             key = str(p.kind)
             counts[key] = counts.get(key, 0) + 1
         return counts
 
-    def warn(self, message):
-        # type: (str) -> Document
+    def warn(self, message: str) -> Document:
         if message not in self.warnings:
             self.warnings.append(message)
         logger.warning("%s: %s", self.source_uri or "<doc>", message)
         return self
 
-    def copy(self):
-        # type: () -> Document
+    def copy(self) -> Document:
         return Document(source_uri=self.source_uri, pages=[p.copy() for p in self.pages],
                         meta=dict(self.meta), warnings=list(self.warnings))
 
-    def release_rasters(self):
-        # type: () -> Document
+    def release_rasters(self) -> Document:
         """Free every materialised raster that can be re-rendered on demand."""
         for p in self.pages:
             p.release_raster()
         return self
 
-    def select(self, predicate):
-        # type: (Callable[[Page], bool]) -> Document
+    def select(self, predicate: Callable[[Page], bool]) -> Document:
         """A new Document containing only pages satisfying ``predicate``."""
         return Document(source_uri=self.source_uri,
                         pages=[p for p in self.pages if predicate(p)],
                         meta=dict(self.meta), warnings=list(self.warnings))
 
-    def to_dict(self, include_spans=True):
-        # type: (bool) -> Dict[str, Any]
+    def to_dict(self, include_spans: bool = True) -> Dict[str, Any]:
         return {
             "source_uri": self.source_uri,
             "meta": _as_jsonable(self.meta),
@@ -1368,22 +1304,19 @@ class Document(object):
         }
 
     @classmethod
-    def from_dict(cls, d):
-        # type: (Mapping[str, Any]) -> Document
+    def from_dict(cls, d: Mapping[str, Any]) -> Document:
         return cls(source_uri=d.get("source_uri", ""),
                    pages=[Page.from_dict(p) for p in (d.get("pages") or [])],
                    meta=dict(d.get("meta") or {}),
                    warnings=list(d.get("warnings") or []))
 
-    def save_json(self, path, include_spans=True):
-        # type: (str, bool) -> str
+    def save_json(self, path: str, include_spans: bool = True) -> str:
         with open(path, "w", encoding="utf-8") as fh:
             fh.write(to_json(self.to_dict(include_spans=include_spans)))
         return path
 
     @classmethod
-    def load_json(cls, path):
-        # type: (str) -> Document
+    def load_json(cls, path: str) -> Document:
         with open(path, "r", encoding="utf-8") as fh:
             return cls.from_dict(json.load(fh))
 
@@ -1403,8 +1336,7 @@ class Cost(object):
     calls: int = 0
     wasted_calls: int = 0  #: attempts that failed *after* the provider billed us
 
-    def __add__(self, other):
-        # type: (Cost) -> Cost
+    def __add__(self, other: Cost) -> Cost:
         if not isinstance(other, Cost):
             return NotImplemented
         if self.amount and other.amount and self.currency != other.currency:
@@ -1419,17 +1351,14 @@ class Cost(object):
     __radd__ = __add__
 
     @classmethod
-    def zero(cls, currency="USD"):
-        # type: (str) -> Cost
+    def zero(cls, currency: str = "USD") -> Cost:
         return cls(currency=currency)
 
     @property
-    def total_tokens(self):
-        # type: () -> int
+    def total_tokens(self) -> int:
         return self.input_tokens + self.output_tokens
 
-    def to_dict(self):
-        # type: () -> Dict[str, Any]
+    def to_dict(self) -> Dict[str, Any]:
         return {"currency": self.currency, "amount": round(self.amount, 6),
                 "input_tokens": self.input_tokens, "output_tokens": self.output_tokens,
                 "calls": self.calls, "wasted_calls": self.wasted_calls}
@@ -1454,24 +1383,20 @@ class Cost(object):
 # the OpenCV boundary is crossed inside these helpers, never outside them.
 
 
-def is_gray(img):
-    # type: (Any) -> bool
+def is_gray(img: ImageArray) -> bool:
     return getattr(img, "ndim", 0) == 2
 
 
-def is_color(img):
-    # type: (Any) -> bool
+def is_color(img: ImageArray) -> bool:
     return getattr(img, "ndim", 0) == 3 and img.shape[2] >= 3
 
 
-def image_shape(img):
-    # type: (Any) -> Tuple[int, int]
+def image_shape(img: ImageArray) -> Tuple[int, int]:
     """``(height, width)`` in pixels."""
     return (int(img.shape[0]), int(img.shape[1]))
 
 
-def ensure_uint8(img):
-    # type: (Any) -> Any
+def ensure_uint8(img: ImageArray) -> ImageArray:
     """Coerce any numeric array to uint8, scaling float [0,1] images by 255."""
     np = _np()
     arr = np.asarray(img)
@@ -1487,8 +1412,7 @@ def ensure_uint8(img):
     return np.clip(arr, 0, 255).astype(np.uint8)
 
 
-def to_gray(img):
-    # type: (Any) -> Any
+def to_gray(img: ImageArray) -> GrayImage:
     """Grayscale view of ``img`` using ITU-R 601 luma weights."""
     np = _np()
     arr = ensure_uint8(img)
@@ -1503,8 +1427,7 @@ def to_gray(img):
     return np.clip(arr[:, :, :3].astype(np.float32).dot(weights), 0, 255).astype(np.uint8)
 
 
-def to_rgb(img):
-    # type: (Any) -> Any
+def to_rgb(img: ImageArray) -> ImageArray:
     """3-channel RGB view of ``img``."""
     np = _np()
     arr = ensure_uint8(img)
@@ -1513,16 +1436,14 @@ def to_rgb(img):
     return np.repeat(arr[:, :, None], 3, axis=2)
 
 
-def _integral(arr):
-    # type: (Any) -> Any
+def _integral(arr: ImageArray) -> FloatArray:
     """Summed-area table with a zero row/column, shape ``(H+1, W+1)``."""
     np = _np()
     cs = np.cumsum(np.cumsum(np.asarray(arr, dtype=np.float64), axis=0), axis=1)
     return np.pad(cs, ((1, 0), (1, 0)), mode="constant")
 
 
-def window_stats(gray, window):
-    # type: (Any, int) -> Tuple[Any, Any]
+def window_stats(gray: GrayImage, window: int) -> Tuple[FloatArray, FloatArray]:
     """Local ``(mean, std)`` over a ``window x window`` neighbourhood.
 
     Uses summed-area tables, so cost is independent of window size -- which is
@@ -1555,8 +1476,7 @@ def window_stats(gray, window):
     return mean, np.sqrt(var)
 
 
-def box_blur(img, radius):
-    # type: (Any, int) -> Any
+def box_blur(img: ImageArray, radius: int) -> ImageArray:
     """Mean filter of radius ``radius`` (integral-image based in the fallback)."""
     np = _np()
     if radius < 1:
@@ -1572,8 +1492,7 @@ def box_blur(img, radius):
     return np.clip(mean, 0, 255).astype(np.uint8)
 
 
-def _box_widths_for_gaussian(sigma, passes=3):
-    # type: (float, int) -> List[int]
+def _box_widths_for_gaussian(sigma: float, passes: int = 3) -> List[int]:
     """Odd box-filter widths whose repeated application matches ``sigma``.
 
     Three successive box filters converge on a Gaussian by the central limit
@@ -1604,8 +1523,7 @@ def _box_widths_for_gaussian(sigma, passes=3):
     return [lower if i < count else upper for i in range(passes)]
 
 
-def gaussian_blur(img, sigma):
-    # type: (Any, float) -> Any
+def gaussian_blur(img: ImageArray, sigma: float) -> ImageArray:
     """Gaussian blur.  The fallback is three variance-matched box blurs.
 
     The fallback still loses a little tail mass, because each pass rounds back
@@ -1627,8 +1545,7 @@ def gaussian_blur(img, sigma):
     return out
 
 
-def median_blur(img, ksize=3):
-    # type: (Any, int) -> Any
+def median_blur(img: ImageArray, ksize: int = 3) -> ImageArray:
     """Median filter -- the right tool for salt-and-pepper scanner speckle."""
     np = _np()
     cv = _cv2()
@@ -1648,8 +1565,8 @@ def median_blur(img, ksize=3):
     return np.median(np.stack(stack, axis=0), axis=0).astype(np.uint8)
 
 
-def resize_image(img, size=None, scale=None, interpolation="auto"):
-    # type: (Any, Optional[Tuple[int, int]], Optional[float], str) -> Any
+def resize_image(img: ImageArray, size: Optional[Tuple[int, int]] = None,
+                 scale: Optional[float] = None, interpolation: str = "auto") -> ImageArray:
     """Resize to ``size=(width, height)`` or by ``scale``.
 
     ``interpolation="auto"`` picks cubic when upscaling (preserves stroke edges
@@ -1695,8 +1612,8 @@ def resize_image(img, size=None, scale=None, interpolation="auto"):
     return np.clip(top * (1 - wy) + bot * wy, 0, 255).astype(np.uint8)
 
 
-def rotate_image(img, angle_deg, border_value=None, expand=True):
-    # type: (Any, float, Optional[int], bool) -> Any
+def rotate_image(img: ImageArray, angle_deg: float, border_value: Optional[int] = None,
+                 expand: bool = True) -> ImageArray:
     """Rotate counter-clockwise by ``angle_deg`` about the image centre.
 
     ``expand=True`` grows the canvas so no content is clipped -- deskewing a
@@ -1758,8 +1675,7 @@ def rotate_image(img, angle_deg, border_value=None, expand=True):
     return np.clip(out, 0, 255).astype(np.uint8)
 
 
-def row_projection_at_angle(gray, angle_deg):
-    # type: (Any, float) -> Any
+def row_projection_at_angle(gray: GrayImage, angle_deg: float) -> FloatArray:
     """Horizontal projection profile as if the image were rotated by ``angle_deg``.
 
     Note carefully which axis is sheared.  Shearing *rows* horizontally --
@@ -1784,8 +1700,7 @@ def row_projection_at_angle(gray, angle_deg):
     return g[rows, cols].sum(axis=1)
 
 
-def otsu_threshold(gray):
-    # type: (Any) -> int
+def otsu_threshold(gray: GrayImage) -> int:
     """Otsu's global threshold via between-class variance maximisation."""
     np = _np()
     g = to_gray(gray)
@@ -1816,8 +1731,8 @@ def otsu_threshold(gray):
 _UNEVEN_ILLUMINATION = 0.55
 
 
-def ink_mask(gray, threshold=None, adaptive="auto"):
-    # type: (Any, Optional[int], Any) -> Any
+def ink_mask(gray: GrayImage, threshold: Optional[int] = None,
+             adaptive: Any = "auto") -> GrayImage:
     """Boolean mask of "ink" pixels (dark on light).
 
     Otsu is the right default: it is cheap, global, and exact on an evenly-lit
@@ -1844,14 +1759,12 @@ def ink_mask(gray, threshold=None, adaptive="auto"):
     return g <= otsu_threshold(g)
 
 
-def _percentile_np(arr, q):
-    # type: (Any, float) -> float
+def _percentile_np(arr: ImageArray, q: float) -> float:
     np = _np()
     return float(np.percentile(arr, q))
 
 
-def encode_png(img):
-    # type: (Any) -> bytes
+def encode_png(img: ImageArray) -> bytes:
     """Encode an array as PNG bytes -- what vision backends actually send."""
     arr = ensure_uint8(img)
     cv = _cv2()
@@ -1869,8 +1782,7 @@ def encode_png(img):
     raise MissingDependency("PIL", "PNG encoding", "pillow")
 
 
-def encode_jpeg(img, quality=88):
-    # type: (Any, int) -> bytes
+def encode_jpeg(img: ImageArray, quality: int = 88) -> bytes:
     """Encode as JPEG.  Preferred for VLM calls: a 300 DPI page as PNG is
     several megabytes, and the artefacts JPEG adds at q>=85 are well below what
     the scanner already introduced."""
@@ -1890,8 +1802,7 @@ def encode_jpeg(img, quality=88):
     raise MissingDependency("PIL", "JPEG encoding", "pillow")
 
 
-def decode_image(data):
-    # type: (bytes) -> Any
+def decode_image(data: bytes) -> ImageArray:
     """Decode image bytes to a uint8 RGB/gray array.
 
     Raises :class:`IngestError` -- not a Pillow or OpenCV exception -- when the
@@ -1928,8 +1839,7 @@ def decode_image(data):
                           % (len(data), data[:8], exc))
 
 
-def save_image(img, path):
-    # type: (Any, str) -> str
+def save_image(img: ImageArray, path: str) -> str:
     """Write an array to disk, choosing the encoder from the extension."""
     ext = os.path.splitext(path)[1].lower()
     data = encode_jpeg(img) if ext in (".jpg", ".jpeg") else encode_png(img)
@@ -1975,8 +1885,7 @@ class QualityThresholds:
 DEFAULT_THRESHOLDS = QualityThresholds()
 
 
-def gradient_magnitude(gray):
-    # type: (Any) -> Any
+def gradient_magnitude(gray: GrayImage) -> FloatArray:
     """Sobel gradient magnitude as float64.  Used by the sharpness metric."""
     np = _np()
     g = to_gray(gray).astype(np.float64)
@@ -2002,8 +1911,7 @@ _BLUR_RATIO_FLOOR, _BLUR_RATIO_CEIL = 0.35, 0.80
 _BLUR_STEEP_FLOOR, _BLUR_STEEP_CEIL = 0.80, 3.50
 
 
-def measure_blur(gray):
-    # type: (Any) -> float
+def measure_blur(gray: GrayImage) -> float:
     """Sharpness in ``[0, 1]``, from edge-transition width.
 
     Variance of the Laplacian is the textbook answer and it is the wrong one
@@ -2059,8 +1967,7 @@ def measure_blur(gray):
     return round(float(min(concentration_score, steepness_score)), 4)
 
 
-def measure_contrast(gray):
-    # type: (Any) -> float
+def measure_contrast(gray: GrayImage) -> float:
     """Contrast in ``[0, 1]`` -- specifically, ink-to-paper separation.
 
     A generic 5th-95th percentile spread is wrong for documents: a perfectly
@@ -2088,15 +1995,13 @@ def measure_contrast(gray):
     return round(float(clamp((hi - lo) / 255.0, 0.0, 1.0)), 4)
 
 
-def measure_ink_coverage(gray):
-    # type: (Any) -> float
+def measure_ink_coverage(gray: GrayImage) -> float:
     """Fraction of pixels that are ink, using an illumination-aware mask."""
     mask = ink_mask(gray)
     return round(float(mask.mean()), 5) if mask.size else 0.0
 
 
-def measure_noise(gray):
-    # type: (Any) -> float
+def measure_noise(gray: GrayImage) -> float:
     """Speckle estimate in ``[0, 1]``.
 
     The high-frequency residual (image minus its median-filtered self) contains
@@ -2115,8 +2020,7 @@ def measure_noise(gray):
     return round(float(clamp(mad / 12.0, 0.0, 1.0)), 4)
 
 
-def measure_illumination(gray):
-    # type: (Any) -> float
+def measure_illumination(gray: GrayImage) -> float:
     """Lighting evenness in ``[0, 1]``; 1 is flat, 0 is a hard shadow gradient.
 
     The page background is estimated by heavy downsampling (which averages text
@@ -2133,9 +2037,9 @@ def measure_illumination(gray):
     return round(float(clamp(1.0 - spread / 120.0, 0.0, 1.0)), 4)
 
 
-def estimate_skew(gray, max_angle=15.0, method="auto", coarse_step=1.0,
-                  fine_step=0.1, min_improvement=0.15):
-    # type: (Any, float, str, float, float, float) -> float
+def estimate_skew(gray: GrayImage, max_angle: float = 15.0, method: str = "auto",
+                  coarse_step: float = 1.0, fine_step: float = 0.1,
+                  min_improvement: float = 0.15) -> float:
     """Estimate the page's skew in degrees (positive = content tilted clockwise).
 
     ``method``:
@@ -2172,7 +2076,7 @@ def estimate_skew(gray, max_angle=15.0, method="auto", coarse_step=1.0,
     if mask.mean() < 0.0005 or mask.mean() > 0.9:
         return 0.0
 
-    estimates = []  # type: List[float]
+    estimates: List[float] = []
 
     def by_projection():
         # Only ink pixels can contribute to the profile, and they are a few
@@ -2299,8 +2203,7 @@ def estimate_skew(gray, max_angle=15.0, method="auto", coarse_step=1.0,
     return round(float(clamp(statistics.median(estimates), -max_angle, max_angle)), 3)
 
 
-def estimate_stroke_width(gray):
-    # type: (Any) -> float
+def estimate_stroke_width(gray: GrayImage) -> float:
     """Mean ink stroke thickness in pixels, from the area-to-perimeter ratio.
 
     For an elongated shape, ``2 * area / perimeter`` is its width.  Cheap and
@@ -2324,8 +2227,7 @@ def estimate_stroke_width(gray):
     return 2.0 * area / perimeter
 
 
-def estimate_line_pitch(gray, min_pitch=8, max_pitch=200):
-    # type: (Any, int, int) -> float
+def estimate_line_pitch(gray: GrayImage, min_pitch: int = 8, max_pitch: int = 200) -> float:
     """Dominant text-line spacing in pixels, via autocorrelation, or ``0.0``.
 
     Blur, fading and threshold choice all move stroke width around; none of
@@ -2396,8 +2298,7 @@ _INCHES_PER_TEXT_LINE = 1.0 / 6.0
 _STROKE_PX_AT_300 = 3.2
 
 
-def estimate_effective_dpi(gray, fallback=0):
-    # type: (Any, int) -> int
+def estimate_effective_dpi(gray: GrayImage, fallback: int = 0) -> int:
     """Estimate the *content* resolution of a page image.
 
     A page can be rendered at 600 DPI and still carry only 120 DPI of signal,
@@ -2431,8 +2332,8 @@ def estimate_effective_dpi(gray, fallback=0):
     return int(clamp(round(estimate), 30, 1200))
 
 
-def classify_quality(q, thresholds=None):
-    # type: (PageQuality, Optional[QualityThresholds]) -> Verdict
+def classify_quality(q: PageQuality,
+                     thresholds: Optional[QualityThresholds] = None) -> Verdict:
     """Turn measurements into ``clean`` / ``degraded`` / ``unreadable``.
 
     ``unreadable`` is a routing signal, not a discard: those pages get the
@@ -2457,9 +2358,9 @@ def classify_quality(q, thresholds=None):
     return Verdict.DEGRADED if degraded else Verdict.CLEAN
 
 
-def measure_quality(img, raster_dpi=0, thresholds=None, skew_method="auto",
-                    max_skew=15.0):
-    # type: (Any, int, Optional[QualityThresholds], str, float) -> PageQuality
+def measure_quality(img: ImageArray, raster_dpi: int = 0,
+                    thresholds: Optional[QualityThresholds] = None,
+                    skew_method: str = "auto", max_skew: float = 15.0) -> PageQuality:
     """Measure every channel-degradation signal for one page image."""
     gray = to_gray(img)
     q = PageQuality(
@@ -2478,8 +2379,8 @@ def measure_quality(img, raster_dpi=0, thresholds=None, skew_method="auto",
     return q
 
 
-def measure_page(page, dpi=None, thresholds=None, **kwargs):
-    # type: (Page, Optional[int], Optional[QualityThresholds], Any) -> Page
+def measure_page(page: Page, dpi: Optional[int] = None,
+                 thresholds: Optional[QualityThresholds] = None, **kwargs: Any) -> Page:
     """Measure ``page`` in place and return it.  No-op for pages without rasters."""
     if not page.has_raster():
         return page
@@ -2491,8 +2392,9 @@ def measure_page(page, dpi=None, thresholds=None, **kwargs):
     return page
 
 
-def measure_document(doc, dpi=None, thresholds=None, max_workers=0, **kwargs):
-    # type: (Document, Optional[int], Optional[QualityThresholds], int, Any) -> Document
+def measure_document(doc: Document, dpi: Optional[int] = None,
+                     thresholds: Optional[QualityThresholds] = None, max_workers: int = 0,
+                     **kwargs: Any) -> Document:
     """Measure every page's quality.  Returns the same Document, mutated."""
     _map_maybe_parallel(
         lambda p: measure_page(p, dpi=dpi, thresholds=thresholds, **kwargs),
@@ -2527,8 +2429,7 @@ _MAGIC = [
 IMAGE_FORMATS = frozenset(["png", "jpeg", "tiff", "bmp", "gif", "webp", "ico"])
 
 
-def sniff_format(data, filename=""):
-    # type: (bytes, str) -> str
+def sniff_format(data: bytes, filename: str = "") -> str:
     """Identify a document format from its bytes, falling back to its name."""
     head = data[:64] if data else b""
     for magic, name in _MAGIC:
@@ -2553,8 +2454,7 @@ def sniff_format(data, filename=""):
     return "unknown"
 
 
-def _read_source(source):
-    # type: (Union[str, bytes, bytearray, Any]) -> Tuple[bytes, str]
+def _read_source(source: Source) -> Tuple[bytes, str]:
     """Normalise a path / bytes / file-like into ``(data, uri)``."""
     if isinstance(source, (bytes, bytearray)):
         return (bytes(source), "<bytes>")
@@ -2580,9 +2480,9 @@ def _read_source(source):
 MIN_NATIVE_CHARS = 48
 
 
-def classify_page_kind(char_count, image_area_ratio, has_images,
-                       min_chars=MIN_NATIVE_CHARS, ink_hint=None):
-    # type: (int, float, bool, int, Optional[float]) -> PageKind
+def classify_page_kind(char_count: int, image_area_ratio: float, has_images: bool,
+                       min_chars: int = MIN_NATIVE_CHARS,
+                       ink_hint: Optional[float] = None) -> PageKind:
     """Decide how a page stores its text, from cheap PDF-level evidence.
 
     ``image_area_ratio`` is the fraction of the page covered by embedded raster
@@ -2602,9 +2502,10 @@ def classify_page_kind(char_count, image_area_ratio, has_images,
     return PageKind.BLANK
 
 
-def ingest_pdf(source, password=None, max_pages=0, page_range=None,
-               render_dpi=DEFAULT_DPI, extract_text=True, min_native_chars=MIN_NATIVE_CHARS):
-    # type: (Any, Optional[str], int, Optional[Sequence[int]], int, bool, int) -> Document
+def ingest_pdf(source: Source, password: Optional[str] = None, max_pages: int = 0,
+               page_range: Optional[Sequence[int]] = None, render_dpi: int = DEFAULT_DPI,
+               extract_text: bool = True,
+               min_native_chars: int = MIN_NATIVE_CHARS) -> Document:
     """Open a PDF, read any native text layer, and attach lazy page renderers.
 
     Handles the three things that break naive PDF ingest in production:
@@ -2722,8 +2623,7 @@ def ingest_pdf(source, password=None, max_pages=0, page_range=None,
     return doc
 
 
-def _pdf_raster_provider(fdoc, pno):
-    # type: (Any, int) -> RasterProvider
+def _pdf_raster_provider(fdoc: Any, pno: int) -> RasterProvider:
     """Closure that renders page ``pno`` at a requested DPI, on demand.
 
     Holds a reference to the open PyMuPDF document; that keeps the (in-memory)
@@ -2742,8 +2642,9 @@ def _pdf_raster_provider(fdoc, pno):
     return provider
 
 
-def _ingest_pdf_pdfium(source, max_pages=0, page_range=None, render_dpi=DEFAULT_DPI):
-    # type: (Any, int, Optional[Sequence[int]], int) -> Document
+def _ingest_pdf_pdfium(source: Source, max_pages: int = 0,
+                       page_range: Optional[Sequence[int]] = None,
+                       render_dpi: int = DEFAULT_DPI) -> Document:
     """Render-only PDF ingest via pypdfium2, when PyMuPDF is unavailable.
 
     No text-layer extraction, so every page is treated as SCANNED.  That is a
@@ -2783,8 +2684,8 @@ def _ingest_pdf_pdfium(source, max_pages=0, page_range=None, render_dpi=DEFAULT_
     return doc
 
 
-def ingest_image(source, dpi=None, page_index=0):
-    # type: (Any, Optional[int], int) -> Document
+def ingest_image(source: Source, dpi: Optional[int] = None,
+                 page_index: int = 0) -> Document:
     """Ingest a single-page image (PNG/JPEG/BMP/WebP) as a one-page Document."""
     data, uri = _read_source(source)
     img = decode_image(data)
@@ -2798,8 +2699,7 @@ def ingest_image(source, dpi=None, page_index=0):
     return doc
 
 
-def ingest_tiff(source, dpi=None):
-    # type: (Any, Optional[int]) -> Document
+def ingest_tiff(source: Source, dpi: Optional[int] = None) -> Document:
     """Ingest a (possibly multi-page) TIFF.  Fax archives are full of these."""
     pil = _try_import("PIL.Image")
     data, uri = _read_source(source)
@@ -2824,8 +2724,7 @@ def ingest_tiff(source, dpi=None):
     return doc
 
 
-def _image_dpi_hint(data):
-    # type: (bytes) -> Optional[int]
+def _image_dpi_hint(data: bytes) -> Optional[int]:
     """Read declared DPI from image metadata, if it looks plausible."""
     pil = _try_import("PIL.Image")
     if pil is None:
@@ -2843,8 +2742,7 @@ def _image_dpi_hint(data):
     return None
 
 
-def _page_from_array(img, index, dpi, uri=""):
-    # type: (Any, int, int, str) -> Page
+def _page_from_array(img: ImageArray, index: int, dpi: int, uri: str = "") -> Page:
     """Wrap a decoded raster as a Page with correct point-space geometry."""
     h, w = image_shape(img)
     page = Page(index=index,
@@ -2857,14 +2755,13 @@ def _page_from_array(img, index, dpi, uri=""):
     return page
 
 
-def page_from_image(img, index=0, dpi=DEFAULT_IMAGE_DPI):
-    # type: (Any, int, int) -> Page
+def page_from_image(img: ImageArray, index: int = 0, dpi: int = DEFAULT_IMAGE_DPI) -> Page:
     """Public helper: build a :class:`Page` from an in-memory array."""
     return _page_from_array(ensure_uint8(img), index, dpi)
 
 
-def document_from_images(images, dpi=DEFAULT_IMAGE_DPI, source_uri="<arrays>"):
-    # type: (Sequence[Any], int, str) -> Document
+def document_from_images(images: Sequence[ImageArray], dpi: int = DEFAULT_IMAGE_DPI,
+                         source_uri: str = "<arrays>") -> Document:
     """Public helper: build a :class:`Document` from in-memory arrays."""
     doc = Document(source_uri=source_uri,
                    meta={"format": "arrays", "page_count": len(images),
@@ -2874,8 +2771,8 @@ def document_from_images(images, dpi=DEFAULT_IMAGE_DPI, source_uri="<arrays>"):
     return doc
 
 
-def ingest_email(source, dpi=None, include_body=True, max_attachments=50):
-    # type: (Any, Optional[int], bool, int) -> Document
+def ingest_email(source: Source, dpi: Optional[int] = None, include_body: bool = True,
+                 max_attachments: int = 50) -> Document:
     """Ingest an ``.eml`` message: every readable attachment becomes pages.
 
     Inbound claim registration lives on this path.  Attachments arrive as
@@ -2897,7 +2794,7 @@ def ingest_email(source, dpi=None, include_body=True, max_attachments=50):
 
     next_index = 0
     attachments = 0
-    body_parts = []  # type: List[str]
+    body_parts: List[str] = []
 
     for part in msg.walk():
         if part.get_content_maintype() == "multipart":
@@ -2951,8 +2848,7 @@ def ingest_email(source, dpi=None, include_body=True, max_attachments=50):
     return doc
 
 
-def _reindex_page(page, new_index):
-    # type: (Page, int) -> Page
+def _reindex_page(page: Page, new_index: int) -> Page:
     """Renumber a page and every bbox on it.  Needed when merging documents."""
     if page.index == new_index:
         return page
@@ -2966,8 +2862,7 @@ def _reindex_page(page, new_index):
     return page
 
 
-def _text_only_page(text, index, source):
-    # type: (str, int, str) -> Page
+def _text_only_page(text: str, index: int, source: str) -> Page:
     """A synthetic page holding plain text (an email body) with no raster.
 
     Laid out as monospaced lines so that bboxes are at least ordinally
@@ -2990,9 +2885,10 @@ def _text_only_page(text, index, source):
     return page
 
 
-def ingest(source, filename="", dpi=None, password=None, max_pages=0,
-           page_range=None, render_dpi=DEFAULT_DPI, min_native_chars=MIN_NATIVE_CHARS):
-    # type: (Any, str, Optional[int], Optional[str], int, Optional[Sequence[int]], int, int) -> Document
+def ingest(source: Source, filename: str = "", dpi: Optional[int] = None,
+           password: Optional[str] = None, max_pages: int = 0,
+           page_range: Optional[Sequence[int]] = None, render_dpi: int = DEFAULT_DPI,
+           min_native_chars: int = MIN_NATIVE_CHARS) -> Document:
     """Ingest anything: PDF, image, multi-page TIFF, ``.eml``, path or bytes.
 
     Format is decided by content, not by extension.  Returns a :class:`Document`
@@ -3035,15 +2931,15 @@ def ingest(source, filename="", dpi=None, password=None, max_pages=0,
     return doc
 
 
-def ingest_dir(directory, pattern=None, recursive=True, **kwargs):
-    # type: (str, Optional[str], bool, Any) -> List[Document]
+def ingest_dir(directory: str, pattern: Optional[str] = None, recursive: bool = True,
+               **kwargs: Any) -> List[Document]:
     """Ingest every readable document in a directory tree.
 
     Unreadable files are reported as warnings on an empty Document rather than
     aborting the batch -- a 5000-file inbox with three corrupt scans should
     still process 4997 of them.
     """
-    out = []  # type: List[Document]
+    out: List[Document] = []
     regex = re.compile(pattern) if pattern else None
     for root, _dirs, files in os.walk(directory):
         for name in sorted(files):
@@ -3063,8 +2959,7 @@ def ingest_dir(directory, pattern=None, recursive=True, **kwargs):
     return out
 
 
-def merge_documents(docs, source_uri="<merged>"):
-    # type: (Sequence[Document], str) -> Document
+def merge_documents(docs: Sequence[Document], source_uri: str = "<merged>") -> Document:
     """Concatenate documents into one, renumbering pages and their bboxes."""
     merged = Document(source_uri=source_uri, meta={"ingested_at": _utcnow(),
                                                    "merged_from": len(docs)})
@@ -3097,8 +2992,7 @@ def merge_documents(docs, source_uri="<merged>"):
 # encoded once here, with an eval set behind it, instead of three times.
 
 
-def _rect_box_sum(arr, kh, kw):
-    # type: (Any, int, int) -> Tuple[Any, Any]
+def _rect_box_sum(arr: ImageArray, kh: int, kw: int) -> Tuple[FloatArray, FloatArray]:
     """``(window_sums, window_counts)`` over a ``kh x kw`` rectangle, clamped."""
     np = _np()
     a = np.asarray(arr, dtype=np.float64)
@@ -3114,8 +3008,7 @@ def _rect_box_sum(arr, kh, kw):
     return sums, counts
 
 
-def morph_binary(mask, kh, kw, operation="erode"):
-    # type: (Any, int, int, str) -> Any
+def morph_binary(mask: GrayImage, kh: int, kw: int, operation: str = "erode") -> GrayImage:
     """Binary morphology with a rectangular structuring element.
 
     Implemented with summed-area tables so that a 1x120 kernel (what line
@@ -3143,8 +3036,7 @@ def morph_binary(mask, kh, kw, operation="erode"):
     raise ConfigError("unknown morphological operation %r" % operation)
 
 
-def estimate_background(gray, radius=None):
-    # type: (Any, Optional[int]) -> Any
+def estimate_background(gray: GrayImage, radius: Optional[int] = None) -> GrayImage:
     """Estimate the page background (paper + lighting) with the text erased.
 
     The kernel has to be *larger than the tallest glyph*, or the middle of a
@@ -3190,7 +3082,7 @@ def estimate_background(gray, radius=None):
 
 OpFn = Callable[..., Any]
 #: Registry of op factories by name, so a serialised policy can be rebuilt.
-OP_FACTORIES = {}  # type: Dict[str, Callable[..., "Op"]]
+OP_FACTORIES: Dict[str, Callable[..., "Op"]] = {}
 
 
 class Op(object):
@@ -3204,16 +3096,15 @@ class Op(object):
 
     __slots__ = ("name", "fn", "params", "geometric", "needs_raster")
 
-    def __init__(self, name, fn, params=None, geometric=False, needs_raster=True):
-        # type: (str, OpFn, Optional[Dict[str, Any]], bool, bool) -> None
+    def __init__(self, name: str, fn: OpFn, params: Optional[Dict[str, Any]] = None,
+                 geometric: bool = False, needs_raster: bool = True) -> None:
         self.name = name
         self.fn = fn
         self.params = dict(params or {})
         self.geometric = geometric
         self.needs_raster = needs_raster
 
-    def __call__(self, page):
-        # type: (Page) -> Page
+    def __call__(self, page: Page) -> Page:
         out = page.copy()
         if self.needs_raster and not out.has_raster():
             out.record(self.name, self.params, 0.0, note="skipped: no raster")
@@ -3230,12 +3121,10 @@ class Op(object):
             _sync_page_geometry(out)
         return out
 
-    def then(self, other):
-        # type: (Op) -> Op
+    def then(self, other: Op) -> Op:
         return compose(self, other)
 
-    def to_dict(self):
-        # type: () -> Dict[str, Any]
+    def to_dict(self) -> Dict[str, Any]:
         return {"op": self.name, "params": _as_jsonable(self.params)}
 
     def __repr__(self):
@@ -3245,8 +3134,7 @@ class Op(object):
             "%s=%r" % kv for kv in sorted(self.params.items())))
 
 
-def _sync_page_geometry(page):
-    # type: (Page) -> None
+def _sync_page_geometry(page: Page) -> None:
     """Recompute point-space page size after a geometry-changing op."""
     w, h = page.pixel_size
     if w and h:
@@ -3255,16 +3143,15 @@ def _sync_page_geometry(page):
         page.height_pt = h * 72.0 / dpi
 
 
-def _map_span_points(page, mapper):
-    # type: (Page, Callable[[float, float], Tuple[float, float]]) -> None
+def _map_span_points(page: Page,
+                     mapper: Callable[[float, float], Tuple[float, float]]) -> None:
     """Apply a point-space coordinate map to every span and region on a page.
 
     Geometric ops use this so that a native text layer survives deskewing
     instead of being silently invalidated -- provenance is unrecoverable once
     dropped, which is the whole reason it is threaded through the IR.
     """
-    def remap(b):
-        # type: (BBox) -> BBox
+    def remap(b: BBox) -> BBox:
         corners = [mapper(b.x0, b.y0), mapper(b.x1, b.y0),
                    mapper(b.x1, b.y1), mapper(b.x0, b.y1)]
         xs = [c[0] for c in corners]
@@ -3276,8 +3163,9 @@ def _map_span_points(page, mapper):
                            for r in page.layout.regions]
 
 
-def register_op(name, geometric=False, needs_raster=True):
-    # type: (str, bool, bool) -> Callable[[Callable[..., Any]], Callable[..., Op]]
+def register_op(name: str, geometric: bool = False,
+                needs_raster: bool = True
+                ) -> Callable[[Callable[..., Any]], Callable[..., Op]]:
     """Decorator turning ``fn(img, page, **params)`` into an :class:`Op` factory.
 
     The resulting factory keeps the decorated function's signature and
@@ -3315,8 +3203,7 @@ def register_op(name, geometric=False, needs_raster=True):
     return decorator
 
 
-def compose(*ops):
-    # type: (*Optional[Op]) -> Op
+def compose(*ops: Optional[Op]) -> Op:
     """Chain ops into one.  ``None`` entries are dropped, so conditional
     policies can be written without branching noise."""
     return CompositeOp([o for o in ops if o is not None])
@@ -3327,29 +3214,25 @@ class CompositeOp(Op):
 
     __slots__ = ("ops",)
 
-    def __init__(self, ops):
-        # type: (Sequence[Op]) -> None
+    def __init__(self, ops: Sequence[Op]) -> None:
         Op.__init__(self, "compose", lambda img, page: img,
                     {"ops": [o.name for o in ops]}, needs_raster=False)
         self.ops = list(ops)
 
-    def __call__(self, page):
-        # type: (Page) -> Page
+    def __call__(self, page: Page) -> Page:
         out = page
         for op in self.ops:
             out = op(out)
         return out
 
-    def to_dict(self):
-        # type: () -> Dict[str, Any]
+    def to_dict(self) -> Dict[str, Any]:
         return {"op": "compose", "ops": [o.to_dict() for o in self.ops]}
 
     def __repr__(self):
         return "compose(%s)" % ", ".join(repr(o) for o in self.ops)
 
 
-def op_from_dict(d):
-    # type: (Mapping[str, Any]) -> Op
+def op_from_dict(d: Mapping[str, Any]) -> Op:
     """Rebuild an op (or a composite) from its serialised form."""
     name = d.get("op")
     if name == "compose":
@@ -3361,8 +3244,7 @@ def op_from_dict(d):
     return factory(**dict(d.get("params") or {}))
 
 
-def apply_ops(page, ops):
-    # type: (Page, Sequence[Op]) -> Page
+def apply_ops(page: Page, ops: Sequence[Op]) -> Page:
     """Apply ops in order, returning a new page."""
     out = page
     for op in ops:
@@ -3443,8 +3325,8 @@ def clahe(img, page, clip=2.0, grid=8):
     return op.apply(gray)
 
 
-def _autocontrast_array(gray, low_pct=1.0, high_pct=99.0):
-    # type: (Any, float, float) -> Any
+def _autocontrast_array(gray: GrayImage, low_pct: float = 1.0,
+                        high_pct: float = 99.0) -> GrayImage:
     np = _np()
     lo = _percentile_np(gray, low_pct)
     hi = _percentile_np(gray, high_pct)
@@ -3644,8 +3526,7 @@ def auto_orient(img, page, use_osd=True, min_confidence=1.0):
     return rotate.fn(img, page, degrees=-rotation)
 
 
-def _osd_rotation(img, min_confidence=1.0):
-    # type: (Any, float) -> Optional[int]
+def _osd_rotation(img: ImageArray, min_confidence: float = 1.0) -> Optional[int]:
     """Ask Tesseract which way is up.  Returns clockwise degrees, or ``None``."""
     pt = _try_import("pytesseract")
     if pt is None:
@@ -3907,8 +3788,9 @@ def morphology(img, page, operation="open", ksize=3, iterations=1):
 
 # -- binarisation ------------------------------------------------------------
 
-def binarize_array(gray, method="sauvola", window=31, k=None, offset=10, min_std=8.0):
-    # type: (Any, str, int, Optional[float], float, float) -> Any
+def binarize_array(gray: GrayImage, method: str = "sauvola", window: int = 31,
+                   k: Optional[float] = None, offset: float = 10,
+                   min_std: float = 8.0) -> GrayImage:
     """Binarise a grayscale array to a 0/255 image.
 
     ``otsu``
@@ -4087,9 +3969,8 @@ def remove_stamps(img, page, saturation_min=70, value_min=40, coverage_max=0.25)
 
 # -- page splitting ----------------------------------------------------------
 
-def split_multi_bill_page(page, axis="auto", min_gap_frac=0.06, max_parts=3,
-                          min_part_frac=0.2):
-    # type: (Page, str, float, int, float) -> List[Page]
+def split_multi_bill_page(page: Page, axis: str = "auto", min_gap_frac: float = 0.06,
+                          max_parts: int = 3, min_part_frac: float = 0.2) -> List[Page]:
     """Split a page carrying several documents into one page per document.
 
     Two bills photocopied side by side onto one A4 is routine, and every
@@ -4143,7 +4024,7 @@ def split_multi_bill_page(page, axis="auto", min_gap_frac=0.06, max_parts=3,
         return [page]
 
     bounds = [0] + sorted(cuts) + [w if use_vertical else h]
-    parts = []  # type: List[Page]
+    parts: List[Page] = []
     dpi = float(page.raster_dpi)
     for i in range(len(bounds) - 1):
         lo, hi = bounds[i], bounds[i + 1]
@@ -4163,8 +4044,7 @@ def split_multi_bill_page(page, axis="auto", min_gap_frac=0.06, max_parts=3,
     return parts
 
 
-def split_document(doc, **kwargs):
-    # type: (Document, Any) -> Document
+def split_document(doc: Document, **kwargs: Any) -> Document:
     """Apply :func:`split_multi_bill_page` across a document, renumbering pages."""
     out = Document(source_uri=doc.source_uri, meta=dict(doc.meta),
                    warnings=list(doc.warnings))
@@ -4182,8 +4062,7 @@ def split_document(doc, **kwargs):
 PolicyFn = Callable[[Page], List[Op]]
 
 
-def default_policy(page, thresholds=None):
-    # type: (Page, Optional[QualityThresholds]) -> List[Op]
+def default_policy(page: Page, thresholds: Optional[QualityThresholds] = None) -> List[Op]:
     """Correct the distortions this page actually has, and nothing else.
 
     Reads only from ``page.quality``, so it is pure, testable, and cheap to
@@ -4193,7 +4072,7 @@ def default_policy(page, thresholds=None):
     """
     th = thresholds or DEFAULT_THRESHOLDS
     q = page.quality
-    ops = []  # type: List[Op]
+    ops: List[Op] = []
 
     if q.ink_coverage > th.ink_saturated:
         ops.append(invert_if_dark())
@@ -4212,8 +4091,8 @@ def default_policy(page, thresholds=None):
     return ops
 
 
-def ocr_policy(page, thresholds=None, binarization="sauvola"):
-    # type: (Page, Optional[QualityThresholds], str) -> List[Op]
+def ocr_policy(page: Page, thresholds: Optional[QualityThresholds] = None,
+               binarization: str = "sauvola") -> List[Op]:
     """Policy for classical OCR engines (Tesseract, Paddle, docTR).
 
     Everything :func:`default_policy` does, plus the steps that only make sense
@@ -4230,8 +4109,8 @@ def ocr_policy(page, thresholds=None, binarization="sauvola"):
     return ops
 
 
-def vlm_policy(page, thresholds=None, max_side=2000):
-    # type: (Page, Optional[QualityThresholds], int) -> List[Op]
+def vlm_policy(page: Page, thresholds: Optional[QualityThresholds] = None,
+               max_side: int = 2000) -> List[Op]:
     """Policy for vision-language models.
 
     Gentler on purpose.  No binarisation (it destroys the greyscale gradient
@@ -4242,7 +4121,7 @@ def vlm_policy(page, thresholds=None, max_side=2000):
     """
     th = thresholds or DEFAULT_THRESHOLDS
     q = page.quality
-    ops = []  # type: List[Op]
+    ops: List[Op] = []
     if q.ink_coverage > th.ink_saturated:
         ops.append(invert_if_dark())
     if q.illumination < th.illumination_floor:
@@ -4257,23 +4136,23 @@ def vlm_policy(page, thresholds=None, max_side=2000):
     return ops
 
 
-def no_policy(page):
-    # type: (Page) -> List[Op]
+def no_policy(page: Page) -> List[Op]:
     """Apply nothing.  Useful as an eval baseline."""
     return []
 
 
-def fixed_policy(*ops):
-    # type: (*Op) -> PolicyFn
+def fixed_policy(*ops: Op) -> PolicyFn:
     """Turn a fixed op list into a policy, for A/B against adaptive ones."""
     def policy(page):
         return list(ops)
     return policy
 
 
-def preprocess(doc, policy=default_policy, ops=None, dpi=None, max_workers=0,
-               measure=True, thresholds=None, in_place=False):
-    # type: (Document, Optional[PolicyFn], Optional[Sequence[Op]], Optional[int], int, bool, Optional[QualityThresholds], bool) -> Document
+def preprocess(doc: Document, policy: Optional[PolicyFn] = default_policy,
+               ops: Optional[Sequence[Op]] = None, dpi: Optional[int] = None,
+               max_workers: int = 0, measure: bool = True,
+               thresholds: Optional[QualityThresholds] = None,
+               in_place: bool = False) -> Document:
     """Measure and correct every page in a document.
 
     :param policy: called per page to choose ops (ignored when ``ops`` is given)
@@ -4286,8 +4165,7 @@ def preprocess(doc, policy=default_policy, ops=None, dpi=None, max_workers=0,
     """
     target = doc if in_place else doc.copy()
 
-    def handle(page):
-        # type: (Page) -> Page
+    def handle(page: Page) -> Page:
         if not page.has_raster():
             return page
         if measure:
@@ -4333,12 +4211,10 @@ class ReadResult(object):
     raw: Optional[Any] = field(default=None, repr=False)
 
     @property
-    def text(self):
-        # type: () -> str
+    def text(self) -> str:
         return " ".join(s.text for s in self.spans if s.text.strip())
 
-    def to_dict(self):
-        # type: () -> Dict[str, Any]
+    def to_dict(self) -> Dict[str, Any]:
         return {"backend": self.backend, "spans": [s.to_dict() for s in self.spans],
                 "cost": self.cost.to_dict(), "latency_ms": round(self.latency_ms, 1),
                 "warnings": list(self.warnings)}
@@ -4349,16 +4225,13 @@ class TextBackend(Protocol):  # pragma: no cover - structural type only
 
     name = ""
 
-    def supports(self, page):
-        # type: (Page) -> bool
+    def supports(self, page: Page) -> bool:
         ...
 
-    def estimate_cost(self, page):
-        # type: (Page) -> Cost
+    def estimate_cost(self, page: Page) -> Cost:
         ...
 
-    def read(self, page):
-        # type: (Page) -> ReadResult
+    def read(self, page: Page) -> ReadResult:
         ...
 
 
@@ -4371,33 +4244,28 @@ class BaseBackend(object):
     #: Preferred input DPI.  The reader upsamples toward this when cheap.
     preferred_dpi = DEFAULT_DPI
 
-    def __init__(self, name=None, **options):
-        # type: (Optional[str], Any) -> None
+    def __init__(self, name: Optional[str] = None, **options: Any) -> None:
         if name:
             self.name = name
         self.options = dict(options)
         self._lock = threading.Lock()
 
     # -- protocol ---------------------------------------------------------
-    def supports(self, page):
-        # type: (Page) -> bool
+    def supports(self, page: Page) -> bool:
         """Whether this backend can read ``page`` at all."""
         if self.needs_raster and not page.has_raster():
             return False
         return self.is_available()
 
-    def is_available(self):
-        # type: () -> bool
+    def is_available(self) -> bool:
         """Whether this backend's dependencies are importable right now."""
         return True
 
-    def estimate_cost(self, page):
-        # type: (Page) -> Cost
+    def estimate_cost(self, page: Page) -> Cost:
         """Predicted cost of reading ``page``.  Free by default (local engines)."""
         return Cost.zero()
 
-    def read(self, page):
-        # type: (Page) -> ReadResult
+    def read(self, page: Page) -> ReadResult:
         """Read ``page``, timing the call and tagging spans with this backend."""
         with Timer() as t:
             result = self._read(page)
@@ -4410,18 +4278,16 @@ class BaseBackend(object):
                 span.script = detect_script(span.text)
         return result
 
-    def _read(self, page):
-        # type: (Page) -> ReadResult
+    def _read(self, page: Page) -> ReadResult:
         raise NotImplementedError
 
     # -- helpers ----------------------------------------------------------
-    def _image_for(self, page):
-        # type: (Page) -> Any
+    def _image_for(self, page: Page) -> ImageArray:
         """The raster this backend should see, at its preferred DPI when free."""
         return page.raster()
 
-    def _bbox(self, page, x0, y0, x1, y1, dpi=None):
-        # type: (Page, float, float, float, float, Optional[float]) -> BBox
+    def _bbox(self, page: Page, x0: float, y0: float, x1: float, y1: float,
+              dpi: Optional[float] = None) -> BBox:
         """Pixel coordinates from an engine -> canonical page points."""
         return BBox.from_pixels(page.index, x0, y0, x1, y1, dpi or page.raster_dpi)
 
@@ -4438,12 +4304,12 @@ class BackendRegistry(object):
     """
 
     def __init__(self):
-        self._factories = {}  # type: Dict[str, Callable[[], Any]]
-        self._instances = {}  # type: Dict[str, Any]
+        self._factories: Dict[str, Callable[[], Any]] = {}
+        self._instances: Dict[str, Any] = {}
         self._lock = threading.Lock()
 
-    def register(self, name, factory, replace=False):
-        # type: (str, Union[Callable[[], Any], Any], bool) -> None
+    def register(self, name: str, factory: Union[Callable[[], Any], Any],
+                 replace: bool = False) -> None:
         """Register a backend under ``name``.
 
         ``factory`` may be a backend instance or a zero-argument callable
@@ -4455,8 +4321,7 @@ class BackendRegistry(object):
             self._factories[name] = factory if callable(factory) else (lambda f=factory: f)
             self._instances.pop(name, None)
 
-    def get(self, name):
-        # type: (str) -> Any
+    def get(self, name: str) -> Any:
         """Instantiate (once) and return the backend registered as ``name``."""
         if name in self._instances:
             return self._instances[name]
@@ -4477,12 +4342,10 @@ class BackendRegistry(object):
     def __getitem__(self, name):
         return self.get(name)
 
-    def names(self):
-        # type: () -> List[str]
+    def names(self) -> List[str]:
         return sorted(self._factories)
 
-    def available(self):
-        # type: () -> List[str]
+    def available(self) -> List[str]:
         """Names whose dependencies are importable, without constructing them."""
         out = []
         for name in self.names():
@@ -4493,8 +4356,7 @@ class BackendRegistry(object):
                 logger.debug("backend %r unavailable: %s", name, exc)
         return out
 
-    def clear_instances(self):
-        # type: () -> None
+    def clear_instances(self) -> None:
         with self._lock:
             self._instances.clear()
 
@@ -4517,12 +4379,10 @@ class PyMuPDFTextLayer(BaseBackend):
     name = "pymupdf"
     needs_raster = False
 
-    def supports(self, page):
-        # type: (Page) -> bool
+    def supports(self, page: Page) -> bool:
         return page.kind in (PageKind.DIGITAL_NATIVE, PageKind.HYBRID) and bool(page.spans)
 
-    def _read(self, page):
-        # type: (Page) -> ReadResult
+    def _read(self, page: Page) -> ReadResult:
         spans = [dataclasses.replace(s, source=self.name)
                  for s in page.spans if s.source in ("pymupdf", "unknown") and s.text.strip()]
         return ReadResult(spans=spans, cost=Cost.zero(), backend=self.name)
@@ -4546,9 +4406,9 @@ class TesseractOCR(BaseBackend):
     name = "tesseract"
     preferred_dpi = 300
 
-    def __init__(self, lang="eng", psm=3, oem=3, config="", min_confidence=0.0,
-                 name=None, **options):
-        # type: (str, int, int, str, float, Optional[str], Any) -> None
+    def __init__(self, lang: str = "eng", psm: int = 3, oem: int = 3, config: str = "",
+                 min_confidence: float = 0.0, name: Optional[str] = None,
+                 **options: Any) -> None:
         BaseBackend.__init__(self, name=name, **options)
         self.lang = lang
         self.psm = psm
@@ -4556,24 +4416,20 @@ class TesseractOCR(BaseBackend):
         self.config = config
         self.min_confidence = min_confidence
 
-    def is_available(self):
-        # type: () -> bool
+    def is_available(self) -> bool:
         return have("pytesseract") or shutil.which("tesseract") is not None
 
-    def _config_string(self):
-        # type: () -> str
+    def _config_string(self) -> str:
         return ("--psm %d --oem %d %s" % (self.psm, self.oem, self.config)).strip()
 
-    def _read(self, page):
-        # type: (Page) -> ReadResult
+    def _read(self, page: Page) -> ReadResult:
         img = self._image_for(page)
         pt = _try_import("pytesseract")
         if pt is not None:
             return self._read_pytesseract(page, img, pt)
         return self._read_cli(page, img)
 
-    def _read_pytesseract(self, page, img, pt):
-        # type: (Page, Any, Any) -> ReadResult
+    def _read_pytesseract(self, page: Page, img: ImageArray, pt: Any) -> ReadResult:
         pil = require("PIL.Image", "Tesseract input conversion")
         data = pt.image_to_data(pil.fromarray(to_rgb(img)), lang=self.lang,
                                 config=self._config_string(),
@@ -4602,8 +4458,7 @@ class TesseractOCR(BaseBackend):
                 block=int(data.get("block_num", [0] * count)[i])))
         return ReadResult(spans=spans, cost=Cost.zero(), backend=self.name)
 
-    def _read_cli(self, page, img):
-        # type: (Page, Any) -> ReadResult
+    def _read_cli(self, page: Page, img: ImageArray) -> ReadResult:
         """Shell out to ``tesseract``, parsing TSV.  Used when pytesseract is absent."""
         binary = shutil.which("tesseract")
         if binary is None:
@@ -4662,19 +4517,17 @@ class PaddleOCRBackend(BaseBackend):
     name = "paddle"
     preferred_dpi = 300
 
-    def __init__(self, lang="en", use_angle_cls=True, name=None, **options):
-        # type: (str, bool, Optional[str], Any) -> None
+    def __init__(self, lang: str = "en", use_angle_cls: bool = True,
+                 name: Optional[str] = None, **options: Any) -> None:
         BaseBackend.__init__(self, name=name, **options)
         self.lang = lang
         self.use_angle_cls = use_angle_cls
         self._engine = None
 
-    def is_available(self):
-        # type: () -> bool
+    def is_available(self) -> bool:
         return have("paddleocr")
 
-    def _get_engine(self):
-        # type: () -> Any
+    def _get_engine(self) -> Any:
         if self._engine is None:
             with self._lock:
                 if self._engine is None:
@@ -4684,8 +4537,7 @@ class PaddleOCRBackend(BaseBackend):
                                                     show_log=False, **self.options)
         return self._engine
 
-    def _read(self, page):
-        # type: (Page) -> ReadResult
+    def _read(self, page: Page) -> ReadResult:
         np = _np()
         engine = self._get_engine()
         img = to_rgb(self._image_for(page))
@@ -4727,12 +4579,10 @@ class RapidOCRBackend(BaseBackend):
         BaseBackend.__init__(self, name=name, **options)
         self._engine = None
 
-    def is_available(self):
-        # type: () -> bool
+    def is_available(self) -> bool:
         return have("rapidocr_onnxruntime") or have("rapidocr")
 
-    def _get_engine(self):
-        # type: () -> Any
+    def _get_engine(self) -> Any:
         if self._engine is None:
             with self._lock:
                 if self._engine is None:
@@ -4743,8 +4593,7 @@ class RapidOCRBackend(BaseBackend):
                     self._engine = module.RapidOCR(**self.options)
         return self._engine
 
-    def _read(self, page):
-        # type: (Page) -> ReadResult
+    def _read(self, page: Page) -> ReadResult:
         np = _np()
         engine = self._get_engine()
         result = engine(np.asarray(to_rgb(self._image_for(page))))
@@ -4775,19 +4624,17 @@ class EasyOCRBackend(BaseBackend):
     name = "easyocr"
     preferred_dpi = 300
 
-    def __init__(self, languages=("en",), gpu=False, name=None, **options):
-        # type: (Sequence[str], bool, Optional[str], Any) -> None
+    def __init__(self, languages: Sequence[str] = ("en",), gpu: bool = False,
+                 name: Optional[str] = None, **options: Any) -> None:
         BaseBackend.__init__(self, name=name, **options)
         self.languages = list(languages)
         self.gpu = gpu
         self._engine = None
 
-    def is_available(self):
-        # type: () -> bool
+    def is_available(self) -> bool:
         return have("easyocr")
 
-    def _get_engine(self):
-        # type: () -> Any
+    def _get_engine(self) -> Any:
         if self._engine is None:
             with self._lock:
                 if self._engine is None:
@@ -4795,8 +4642,7 @@ class EasyOCRBackend(BaseBackend):
                     self._engine = module.Reader(self.languages, gpu=self.gpu, **self.options)
         return self._engine
 
-    def _read(self, page):
-        # type: (Page) -> ReadResult
+    def _read(self, page: Page) -> ReadResult:
         np = _np()
         engine = self._get_engine()
         raw = engine.readtext(np.asarray(to_rgb(self._image_for(page))))
@@ -4832,12 +4678,10 @@ class DocTRBackend(BaseBackend):
         self.pretrained = pretrained
         self._engine = None
 
-    def is_available(self):
-        # type: () -> bool
+    def is_available(self) -> bool:
         return have("doctr")
 
-    def _get_engine(self):
-        # type: () -> Any
+    def _get_engine(self) -> Any:
         if self._engine is None:
             with self._lock:
                 if self._engine is None:
@@ -4847,8 +4691,7 @@ class DocTRBackend(BaseBackend):
                         pretrained=self.pretrained, **self.options)
         return self._engine
 
-    def _read(self, page):
-        # type: (Page) -> ReadResult
+    def _read(self, page: Page) -> ReadResult:
         np = _np()
         engine = self._get_engine()
         img = to_rgb(self._image_for(page))
@@ -4894,12 +4737,10 @@ class SuryaBackend(BaseBackend):
         self.languages = list(languages)
         self._predictors = None
 
-    def is_available(self):
-        # type: () -> bool
+    def is_available(self) -> bool:
         return have("surya")
 
-    def _get_predictors(self):
-        # type: () -> Tuple[Any, Any]
+    def _get_predictors(self) -> Tuple[Any, Any]:
         if self._predictors is not None:
             return self._predictors
         with self._lock:
@@ -4923,19 +4764,16 @@ class SuryaBackend(BaseBackend):
             return self._predictors
 
     @staticmethod
-    def _build_with_manager(cls):
-        # type: (Any) -> Any
+    def _build_with_manager(cls: Any) -> Any:
         inference = require("surya.inference", "Surya backend")
         return cls(inference.SuryaInferenceManager())
 
     @staticmethod
-    def _build_with_foundation(cls):
-        # type: (Any) -> Any
+    def _build_with_foundation(cls: Any) -> Any:
         foundation = require("surya.foundation", "Surya backend")
         return cls(foundation.FoundationPredictor())
 
-    def _read(self, page):
-        # type: (Page) -> ReadResult
+    def _read(self, page: Page) -> ReadResult:
         pil = require("PIL.Image", "Surya input conversion")
         det, rec = self._get_predictors()
         image = pil.fromarray(to_rgb(self._image_for(page)))
@@ -4970,13 +4808,12 @@ class SuryaBackend(BaseBackend):
 # rechecks.  Register the prices your account actually pays.
 
 #: ``model id -> (input USD per million tokens, output USD per million tokens)``
-PRICING = {}  # type: Dict[str, Tuple[float, float]]
+PRICING: Dict[str, Tuple[float, float]] = {}
 
-_UNPRICED_WARNED = set()  # type: Set[str]
+_UNPRICED_WARNED: Set[str] = set()
 
 
-def set_pricing(model, input_per_mtok, output_per_mtok):
-    # type: (str, float, float) -> None
+def set_pricing(model: str, input_per_mtok: float, output_per_mtok: float) -> None:
     """Register token prices (USD per million tokens) for ``model``.
 
     Until a model is priced, :class:`Cost` reports token counts with a zero
@@ -4987,8 +4824,7 @@ def set_pricing(model, input_per_mtok, output_per_mtok):
     _UNPRICED_WARNED.discard(model)
 
 
-def price_tokens(model, input_tokens, output_tokens):
-    # type: (str, int, int) -> Cost
+def price_tokens(model: str, input_tokens: int, output_tokens: int) -> Cost:
     """Convert token counts to a :class:`Cost` using the registered pricing."""
     prices = PRICING.get(model)
     if prices is None:
@@ -5005,8 +4841,7 @@ def price_tokens(model, input_tokens, output_tokens):
                 output_tokens=output_tokens, calls=1)
 
 
-def estimate_image_tokens(img, divisor=750.0):
-    # type: (Any, float) -> int
+def estimate_image_tokens(img: ImageArray, divisor: float = 750.0) -> int:
     """Approximate the token cost of an image for a vision model.
 
     Providers bill images roughly by area; ``width * height / 750`` is the
@@ -5056,17 +4891,16 @@ class VisionBackend(BaseBackend):
     #: Vision models see no benefit above this; the extra pixels are pure cost.
     max_side_px = 2000
 
-    def __init__(self, model="", prompt=DEFAULT_OCR_PROMPT, max_tokens=8192,
-                 temperature=0.0, name=None, **options):
-        # type: (str, str, int, float, Optional[str], Any) -> None
+    def __init__(self, model: str = "", prompt: str = DEFAULT_OCR_PROMPT,
+                 max_tokens: int = 8192, temperature: float = 0.0,
+                 name: Optional[str] = None, **options: Any) -> None:
         BaseBackend.__init__(self, name=name, **options)
         self.model = model
         self.prompt = prompt
         self.max_tokens = max_tokens
         self.temperature = temperature
 
-    def _image_for(self, page):
-        # type: (Page) -> Any
+    def _image_for(self, page: Page) -> ImageArray:
         img = page.raster()
         h, w = image_shape(img)
         longest = max(h, w)
@@ -5075,8 +4909,7 @@ class VisionBackend(BaseBackend):
                                interpolation="area")
         return img
 
-    def estimate_cost(self, page):
-        # type: (Page) -> Cost
+    def estimate_cost(self, page: Page) -> Cost:
         if not page.has_raster():
             return Cost.zero()
         tokens = estimate_image_tokens(self._image_for(page)) + len(self.prompt) // 4
@@ -5084,8 +4917,7 @@ class VisionBackend(BaseBackend):
         output = max(256, page.char_count // 3 or 800)
         return price_tokens(self.model, tokens, output)
 
-    def _spans_from_text(self, page, text):
-        # type: (Page, str) -> List[TextSpan]
+    def _spans_from_text(self, page: Page, text: str) -> List[TextSpan]:
         """Turn a transcription into one span per line, with honest geometry."""
         lines = [l for l in (text or "").splitlines()]
         spans = []
@@ -5103,12 +4935,11 @@ class VisionBackend(BaseBackend):
                 meta={"approximate_bbox": True}))
         return spans
 
-    def _call_model(self, image_bytes, media_type, prompt):
-        # type: (bytes, str, str) -> Tuple[str, Cost]
+    def _call_model(self, image_bytes: bytes, media_type: str,
+                    prompt: str) -> Tuple[str, Cost]:
         raise NotImplementedError
 
-    def _read(self, page):
-        # type: (Page) -> ReadResult
+    def _read(self, page: Page) -> ReadResult:
         img = self._image_for(page)
         data = encode_jpeg(img, quality=90)
         text, cost = self._call_model(data, "image/jpeg", self.prompt)
@@ -5124,20 +4955,18 @@ class AnthropicVisionBackend(VisionBackend):
 
     name = "vlm:claude"
 
-    def __init__(self, model="claude-sonnet-5", api_key=None, client=None, **options):
-        # type: (str, Optional[str], Any, Any) -> None
+    def __init__(self, model: str = "claude-sonnet-5", api_key: Optional[str] = None,
+                 client: Any = None, **options: Any) -> None:
         VisionBackend.__init__(self, model=model, **options)
         self._api_key = api_key
         self._client = client
 
-    def is_available(self):
-        # type: () -> bool
+    def is_available(self) -> bool:
         if self._client is not None:
             return True
         return have("anthropic") and bool(self._api_key or os.environ.get("ANTHROPIC_API_KEY"))
 
-    def _get_client(self):
-        # type: () -> Any
+    def _get_client(self) -> Any:
         if self._client is None:
             with self._lock:
                 if self._client is None:
@@ -5146,8 +4975,8 @@ class AnthropicVisionBackend(VisionBackend):
                         if self._api_key else module.Anthropic()
         return self._client
 
-    def _call_model(self, image_bytes, media_type, prompt):
-        # type: (bytes, str, str) -> Tuple[str, Cost]
+    def _call_model(self, image_bytes: bytes, media_type: str,
+                    prompt: str) -> Tuple[str, Cost]:
         client = self._get_client()
         message = client.messages.create(
             model=self.model, max_tokens=self.max_tokens, temperature=self.temperature,
@@ -5176,14 +5005,12 @@ class OpenAIVisionBackend(VisionBackend):
         self._client = client
         self.detail = detail
 
-    def is_available(self):
-        # type: () -> bool
+    def is_available(self) -> bool:
         if self._client is not None:
             return True
         return have("openai") and bool(self._api_key or os.environ.get("OPENAI_API_KEY"))
 
-    def _get_client(self):
-        # type: () -> Any
+    def _get_client(self) -> Any:
         if self._client is None:
             with self._lock:
                 if self._client is None:
@@ -5192,8 +5019,8 @@ class OpenAIVisionBackend(VisionBackend):
                         if self._api_key else module.OpenAI()
         return self._client
 
-    def _call_model(self, image_bytes, media_type, prompt):
-        # type: (bytes, str, str) -> Tuple[str, Cost]
+    def _call_model(self, image_bytes: bytes, media_type: str,
+                    prompt: str) -> Tuple[str, Cost]:
         client = self._get_client()
         url = "data:%s;base64,%s" % (media_type, base64.b64encode(image_bytes).decode("ascii"))
         response = client.chat.completions.create(
@@ -5221,8 +5048,8 @@ class CachingBackend(BaseBackend):
     cheap enough to do on every commit.
     """
 
-    def __init__(self, inner, cache=None, namespace=""):
-        # type: (Any, Optional["DiskCache"], str) -> None
+    def __init__(self, inner: Any, cache: Optional["DiskCache"] = None,
+                 namespace: str = "") -> None:
         BaseBackend.__init__(self, name="cached:%s" % inner.name)
         self.inner = inner
         self.cache = cache if cache is not None else DiskCache()
@@ -5231,26 +5058,21 @@ class CachingBackend(BaseBackend):
         self.hits = 0
         self.misses = 0
 
-    def is_available(self):
-        # type: () -> bool
+    def is_available(self) -> bool:
         return self.inner.is_available()
 
-    def supports(self, page):
-        # type: (Page) -> bool
+    def supports(self, page: Page) -> bool:
         return self.inner.supports(page)
 
-    def estimate_cost(self, page):
-        # type: (Page) -> Cost
+    def estimate_cost(self, page: Page) -> Cost:
         return Cost.zero() if self._key(page) in self.cache else self.inner.estimate_cost(page)
 
-    def _key(self, page):
-        # type: (Page) -> str
+    def _key(self, page: Page) -> str:
         raster = array_hash(page.raster()) if page.has_raster() else ""
         spans = stable_hash([s.to_dict() for s in page.spans]) if not raster else ""
         return stable_hash(self.namespace, self.inner.name, raster, spans)
 
-    def read(self, page):
-        # type: (Page) -> ReadResult
+    def read(self, page: Page) -> ReadResult:
         key = self._key(page)
         cached = self.cache.get(key)
         if cached is not None:
@@ -5286,22 +5108,18 @@ class RetryingBackend(BaseBackend):
         self.give_up_on = give_up_on
         self.needs_raster = getattr(inner, "needs_raster", True)
 
-    def is_available(self):
-        # type: () -> bool
+    def is_available(self) -> bool:
         return self.inner.is_available()
 
-    def supports(self, page):
-        # type: (Page) -> bool
+    def supports(self, page: Page) -> bool:
         return self.inner.supports(page)
 
-    def estimate_cost(self, page):
-        # type: (Page) -> Cost
+    def estimate_cost(self, page: Page) -> Cost:
         return self.inner.estimate_cost(page)
 
-    def read(self, page):
-        # type: (Page) -> ReadResult
+    def read(self, page: Page) -> ReadResult:
         wasted = [0]
-        failures = []  # type: List[str]
+        failures: List[str] = []
 
         def note(attempt, exc, delay):
             wasted[0] += 1
@@ -5339,20 +5157,16 @@ class EnsembleBackend(BaseBackend):
         self.primary = primary
         self.secondary = secondary
 
-    def is_available(self):
-        # type: () -> bool
+    def is_available(self) -> bool:
         return self.primary.is_available() and self.secondary.is_available()
 
-    def supports(self, page):
-        # type: (Page) -> bool
+    def supports(self, page: Page) -> bool:
         return self.primary.supports(page) and self.secondary.supports(page)
 
-    def estimate_cost(self, page):
-        # type: (Page) -> Cost
+    def estimate_cost(self, page: Page) -> Cost:
         return self.primary.estimate_cost(page) + self.secondary.estimate_cost(page)
 
-    def read(self, page):
-        # type: (Page) -> ReadResult
+    def read(self, page: Page) -> ReadResult:
         first = self.primary.read(page)
         second = self.secondary.read(page)
         agreement = cross_read_agreement(first.spans, second.spans)
@@ -5372,8 +5186,7 @@ class EnsembleBackend(BaseBackend):
 RouterFn = Callable[[Page], Optional[str]]
 
 
-def default_router(page):
-    # type: (Page) -> Optional[str]
+def default_router(page: Page) -> Optional[str]:
     """Choose a backend name for ``page``.
 
     The cost delta between "send every page to a vision model" and "send only
@@ -5434,18 +5247,16 @@ class RuleRouter(object):
     vision model, everything else to Paddle" without subclassing anything.
     """
 
-    def __init__(self, rules=None, fallback=None):
-        # type: (Optional[Sequence[Tuple[Callable[[Page], bool], str]]], Optional[str]) -> None
+    def __init__(self, rules: Optional[Sequence[Tuple[Callable[[Page], bool], str]]] = None,
+                 fallback: Optional[str] = None) -> None:
         self.rules = list(rules or [])
         self.fallback = fallback
 
-    def add(self, predicate, backend_name):
-        # type: (Callable[[Page], bool], str) -> RuleRouter
+    def add(self, predicate: Callable[[Page], bool], backend_name: str) -> RuleRouter:
         self.rules.append((predicate, backend_name))
         return self
 
-    def __call__(self, page):
-        # type: (Page) -> Optional[str]
+    def __call__(self, page: Page) -> Optional[str]:
         for predicate, name in self.rules:
             try:
                 if predicate(page):
@@ -5463,8 +5274,8 @@ class BudgetRouter(object):
     that 297 more are coming.  This makes the ceiling explicit.
     """
 
-    def __init__(self, inner, budget, cheap_backend="tesseract", currency="USD"):
-        # type: (RouterFn, float, str, str) -> None
+    def __init__(self, inner: RouterFn, budget: float, cheap_backend: str = "tesseract",
+                 currency: str = "USD") -> None:
         self.inner = inner
         self.budget = float(budget)
         self.cheap_backend = cheap_backend
@@ -5472,16 +5283,13 @@ class BudgetRouter(object):
         self.spent = 0.0
         self.downgrades = 0
 
-    def record(self, cost):
-        # type: (Cost) -> None
+    def record(self, cost: Cost) -> None:
         self.spent += cost.amount
 
-    def remaining(self):
-        # type: () -> float
+    def remaining(self) -> float:
         return max(0.0, self.budget - self.spent)
 
-    def __call__(self, page):
-        # type: (Page) -> Optional[str]
+    def __call__(self, page: Page) -> Optional[str]:
         name = self.inner(page)
         if name is None:
             return None
@@ -5499,8 +5307,7 @@ class BudgetRouter(object):
         return name
 
 
-def _register_default_backends():
-    # type: () -> None
+def _register_default_backends() -> None:
     """Register the built-in backends as lazy factories."""
     registry.register("pymupdf", PyMuPDFTextLayer, replace=True)
     registry.register("tesseract", TesseractOCR, replace=True)
@@ -5516,8 +5323,9 @@ def _register_default_backends():
 _register_default_backends()
 
 
-def read_page(page, backend=None, router=default_router, replace_spans=True):
-    # type: (Page, Optional[Any], Optional[RouterFn], bool) -> ReadResult
+def read_page(page: Page, backend: Optional[Union[str, TextBackend]] = None,
+              router: Optional[RouterFn] = default_router,
+              replace_spans: bool = True) -> ReadResult:
     """Read one page with an explicit backend, or one chosen by ``router``."""
     if backend is None:
         name = router(page) if router else None
@@ -5539,9 +5347,10 @@ def read_page(page, backend=None, router=default_router, replace_spans=True):
     return result
 
 
-def read(doc, backend=None, router=default_router, max_workers=0, in_place=False,
-         budget=None, on_page=None):
-    # type: (Document, Optional[Any], Optional[RouterFn], int, bool, Optional[float], Optional[Callable[[Page, ReadResult], None]]) -> Document
+def read(doc: Document, backend: Optional[Union[str, TextBackend]] = None,
+         router: Optional[RouterFn] = default_router, max_workers: int = 0,
+         in_place: bool = False, budget: Optional[float] = None,
+         on_page: Optional[Callable[[Page, ReadResult], None]] = None) -> Document:
     """Read every page of ``doc``, choosing a backend per page.
 
     :param backend: force one backend for all pages (name or instance)
@@ -5556,10 +5365,9 @@ def read(doc, backend=None, router=default_router, max_workers=0, in_place=False
     target = doc if in_place else doc.copy()
     total = Cost.zero()
     lock = threading.Lock()
-    choices = {}  # type: Dict[int, str]
+    choices: Dict[int, str] = {}
 
-    def handle(page):
-        # type: (Page) -> None
+    def handle(page: Page) -> None:
         try:
             result = read_page(page, backend=backend, router=router)
         except Exception as exc:
@@ -5625,8 +5433,7 @@ _SCRIPT_RANGES = [
 ]
 
 
-def detect_script(text, minimum=1):
-    # type: (str, int) -> Optional[str]
+def detect_script(text: str, minimum: int = 1) -> Optional[str]:
     """Dominant ISO 15924 script code of ``text``, or ``None``.
 
     Per-span rather than per-document, because a hospital letterhead in
@@ -5635,7 +5442,7 @@ def detect_script(text, minimum=1):
     """
     if not text:
         return None
-    counts = {}  # type: Dict[str, int]
+    counts: Dict[str, int] = {}
     for ch in text:
         code = ord(ch)
         if code < 0x0041 or ch.isspace() or ch.isdigit():
@@ -5667,15 +5474,14 @@ _DIGIT_BLOCKS = [
     0xFF10,  # Fullwidth
 ]
 
-_DIGIT_MAP = {}  # type: Dict[int, str]
+_DIGIT_MAP: Dict[int, str] = {}
 for _base in _DIGIT_BLOCKS:
     for _i in range(10):
         _DIGIT_MAP[_base + _i] = str(_i)
 del _base, _i
 
 
-def normalize_digits(text):
-    # type: (str) -> str
+def normalize_digits(text: str) -> str:
     """Convert every Unicode decimal digit to ASCII ``0-9``.
 
     A Devanagari ``४८२५०`` and an ASCII ``48250`` are the same amount, and every
@@ -5684,8 +5490,7 @@ def normalize_digits(text):
     return text.translate(_DIGIT_MAP) if text else text
 
 
-def normalize_unicode(text, form="NFKC"):
-    # type: (str, str) -> str
+def normalize_unicode(text: str, form: str = "NFKC") -> str:
     """Normalise Unicode form, collapsing ligatures and compatibility variants."""
     return unicodedata.normalize(form, text) if text else text
 
@@ -5693,8 +5498,7 @@ def normalize_unicode(text, form="NFKC"):
 _WHITESPACE_RE = re.compile(r"[ \t  -​]+")
 
 
-def normalize_whitespace(text, collapse_newlines=False):
-    # type: (str, bool) -> str
+def normalize_whitespace(text: str, collapse_newlines: bool = False) -> str:
     """Collapse runs of whitespace, preserving line structure by default."""
     if not text:
         return text
@@ -5707,8 +5511,7 @@ def normalize_whitespace(text, collapse_newlines=False):
     return out.strip()
 
 
-def normalize_text(text):
-    # type: (str) -> str
+def normalize_text(text: str) -> str:
     """The standard cleanup: Unicode form, ASCII digits, tidy whitespace."""
     return normalize_whitespace(normalize_digits(normalize_unicode(text or "")))
 
@@ -5725,8 +5528,7 @@ _NUMERIC_CONFUSIONS = {
 _ALPHA_CONFUSIONS = {"0": "O", "1": "I", "5": "S", "8": "B", "2": "Z", "6": "G"}
 
 
-def fix_ocr_confusions(text, expect="numeric"):
-    # type: (str, str) -> str
+def fix_ocr_confusions(text: str, expect: str = "numeric") -> str:
     """Repair classic OCR character confusions for a *known-type* field.
 
     Never apply this to free text.  ``expect="numeric"`` on a field declared as
@@ -5758,8 +5560,8 @@ _GROUP_SPACES = "\u2009\u202f\u00a0"
 _AMOUNT_RE = re.compile(r"[-+]?\d[\d.,'%s]*\d|[-+]?\d" % _GROUP_SPACES)
 
 
-def parse_amount(text, decimal_separator="auto", allow_negative=True):
-    # type: (str, str, bool) -> Optional[decimal.Decimal]
+def parse_amount(text: str, decimal_separator: str = "auto",
+                 allow_negative: bool = True) -> Optional[decimal.Decimal]:
     """Parse a monetary amount, handling Indian and Western digit grouping.
 
     Indian grouping (``1,23,456.78`` -- two digits per group above the
@@ -5832,8 +5634,7 @@ def parse_amount(text, decimal_separator="auto", allow_negative=True):
     return -value if negative else value
 
 
-def detect_currency(text):
-    # type: (str) -> Optional[str]
+def detect_currency(text: str) -> Optional[str]:
     """ISO currency code implied by ``text``, or ``None``."""
     if not text:
         return None
@@ -5844,7 +5645,7 @@ def detect_currency(text):
     return None
 
 
-_MONTHS = {}  # type: Dict[str, int]
+_MONTHS: Dict[str, int] = {}
 for _i, _names in enumerate([
         ("jan", "january"), ("feb", "february"), ("mar", "march"),
         ("apr", "april"), ("may",), ("jun", "june"), ("jul", "july"),
@@ -5864,8 +5665,7 @@ _DATE_PATTERNS = [
 ]
 
 
-def _expand_year(value):
-    # type: (int) -> int
+def _expand_year(value: int) -> int:
     """Expand a two-digit year.  Documents in scope are recent, not Victorian."""
     if value >= 100:
         return value
@@ -5876,8 +5676,8 @@ def _expand_year(value):
     return candidate - 100 if candidate > current + 5 else candidate
 
 
-def parse_date(text, dayfirst=True, min_year=1900, max_year=2100):
-    # type: (str, bool, int, int) -> Optional[_dt.date]
+def parse_date(text: str, dayfirst: bool = True, min_year: int = 1900,
+               max_year: int = 2100) -> Optional[_dt.date]:
     """Parse a date from noisy OCR text.
 
     ``dayfirst=True`` by default because DD-MM-YYYY is the convention in the
@@ -5935,8 +5735,7 @@ _DATE_SHAPED_RE = re.compile(
     r"|[A-Za-z]{3,9}[\s-]*\d{1,2}[\s,-]*\d{2,4}")
 
 
-def parse_bool(text):
-    # type: (str) -> Optional[bool]
+def parse_bool(text: str) -> Optional[bool]:
     """Parse a checkbox-ish value from a form."""
     if text is None:
         return None
@@ -5948,8 +5747,8 @@ def parse_bool(text):
     return None
 
 
-def normalize_spans(spans, digits=True, unicode_form="NFKC"):
-    # type: (Sequence[TextSpan], bool, Optional[str]) -> List[TextSpan]
+def normalize_spans(spans: Sequence[TextSpan], digits: bool = True,
+                    unicode_form: Optional[str] = "NFKC") -> List[TextSpan]:
     """Return normalised copies of ``spans``, tagging each with its script."""
     out = []
     for span in spans:
@@ -5963,8 +5762,7 @@ def normalize_spans(spans, digits=True, unicode_form="NFKC"):
     return out
 
 
-def normalize_document(doc, in_place=False, **kwargs):
-    # type: (Document, bool, Any) -> Document
+def normalize_document(doc: Document, in_place: bool = False, **kwargs: Any) -> Document:
     """Normalise every span in a document."""
     target = doc if in_place else doc.copy()
     for page in target.pages:
@@ -5986,14 +5784,14 @@ class DiskCache(object):
     migrate.
     """
 
-    def __init__(self, directory=None, enabled=True, max_entries=0):
-        # type: (Optional[str], bool, int) -> None
+    def __init__(self, directory: Optional[str] = None, enabled: bool = True,
+                 max_entries: int = 0) -> None:
         self.directory = directory or os.path.join(
             os.environ.get("DOCPIPE_CACHE_DIR")
             or os.path.join(tempfile.gettempdir(), "docpipe-cache"))
         self.enabled = enabled
         self.max_entries = max_entries
-        self._memory = {}  # type: Dict[str, Any]
+        self._memory: Dict[str, Any] = {}
         if enabled:
             try:
                 os.makedirs(self.directory, exist_ok=True)
@@ -6002,12 +5800,10 @@ class DiskCache(object):
                                self.directory, exc)
                 self.directory = ""
 
-    def _path(self, key):
-        # type: (str) -> str
+    def _path(self, key: str) -> str:
         return os.path.join(self.directory, "%s.json" % key)
 
-    def get(self, key):
-        # type: (str) -> Optional[Any]
+    def get(self, key: str) -> Optional[Any]:
         if not self.enabled:
             return None
         if key in self._memory:
@@ -6022,8 +5818,7 @@ class DiskCache(object):
         self._memory[key] = value
         return value
 
-    def set(self, key, value):
-        # type: (str, Any) -> None
+    def set(self, key: str, value: Any) -> None:
         if not self.enabled:
             return
         self._memory[key] = value
@@ -6040,8 +5835,7 @@ class DiskCache(object):
     def __contains__(self, key):
         return self.get(key) is not None
 
-    def clear(self):
-        # type: () -> None
+    def clear(self) -> None:
         self._memory.clear()
         if self.directory and os.path.isdir(self.directory):
             for name in os.listdir(self.directory):
@@ -6063,12 +5857,10 @@ class TraceSpan(object):
     children: List["TraceSpan"] = field(default_factory=list)
 
     @property
-    def ms(self):
-        # type: () -> float
+    def ms(self) -> float:
         return ((self.end or time.time()) - self.start) * 1000.0
 
-    def to_dict(self):
-        # type: () -> Dict[str, Any]
+    def to_dict(self) -> Dict[str, Any]:
         return {"name": self.name, "ms": round(self.ms, 2),
                 "attributes": _as_jsonable(self.attributes),
                 "children": [c.to_dict() for c in self.children]}
@@ -6103,8 +5895,7 @@ class Tracer(object):
                     self.tracer._stack.pop()
             return False
 
-    def span(self, name, **attributes):
-        # type: (str, Any) -> Any
+    def span(self, name: str, **attributes: Any) -> Any:
         if not self.enabled:
             return _NullContext()
         span = TraceSpan(name, time.time(), attributes=dict(attributes))
@@ -6113,13 +5904,11 @@ class Tracer(object):
             self._stack.append(span)
         return Tracer._Span(self, span)
 
-    def finish(self):
-        # type: () -> TraceSpan
+    def finish(self) -> TraceSpan:
         self.root.end = time.time()
         return self.root
 
-    def to_dict(self):
-        # type: () -> Dict[str, Any]
+    def to_dict(self) -> Dict[str, Any]:
         return self.finish().to_dict()
 
 
@@ -6134,15 +5923,13 @@ class _NullContext(object):
 class CostTracker(object):
     """Accumulate spend, optionally enforcing a hard ceiling."""
 
-    def __init__(self, budget=None, currency="USD"):
-        # type: (Optional[float], str) -> None
+    def __init__(self, budget: Optional[float] = None, currency: str = "USD") -> None:
         self.budget = budget
         self.total = Cost(currency=currency)
         self._lock = threading.Lock()
-        self.by_backend = {}  # type: Dict[str, Cost]
+        self.by_backend: Dict[str, Cost] = {}
 
-    def add(self, cost, backend=""):
-        # type: (Cost, str) -> Cost
+    def add(self, cost: Cost, backend: str = "") -> Cost:
         with self._lock:
             self.total = self.total + cost
             if backend:
@@ -6152,8 +5939,7 @@ class CostTracker(object):
                                      % (self.total.amount, self.total.currency, self.budget))
             return self.total
 
-    def to_dict(self):
-        # type: () -> Dict[str, Any]
+    def to_dict(self) -> Dict[str, Any]:
         return {"total": self.total.to_dict(),
                 "by_backend": dict((k, v.to_dict()) for k, v in self.by_backend.items()),
                 "budget": self.budget}
@@ -6174,15 +5960,13 @@ class CostTracker(object):
 # calibration set is decoration -- which is why Layer 5 exists.
 
 
-def logit(p, eps=1e-6):
-    # type: (float, float) -> float
+def logit(p: float, eps: float = 1e-6) -> float:
     """Log-odds of ``p``, clamped away from the infinities."""
     p = clamp(p, eps, 1.0 - eps)
     return math.log(p / (1.0 - p))
 
 
-def sigmoid(z):
-    # type: (float) -> float
+def sigmoid(z: float) -> float:
     """Inverse of :func:`logit`, numerically safe at both tails."""
     if z >= 0:
         return 1.0 / (1.0 + math.exp(-z))
@@ -6227,8 +6011,9 @@ DEFAULT_CONFIDENCE_WEIGHTS = {
 _SIGNAL_CLAMP = 0.02
 
 
-def fuse_confidence(signals, weights=None, prior=0.5):
-    # type: (Mapping[str, Optional[float]], Optional[Mapping[str, float]], float) -> float
+def fuse_confidence(signals: Mapping[str, Optional[float]],
+                    weights: Optional[Mapping[str, float]] = None,
+                    prior: float = 0.5) -> float:
     """Fuse independent evidence into one calibrated-shaped score in ``[0, 1]``.
 
     Fusion happens in log-odds space (a log-linear opinion pool), not as a
@@ -6265,8 +6050,8 @@ def fuse_confidence(signals, weights=None, prior=0.5):
     return round(float(clamp(sigmoid(accumulated / total_weight), 0.0, 1.0)), 4)
 
 
-def page_quality_prior(quality, bbox=None, page=None):
-    # type: (PageQuality, Optional[BBox], Optional[Page]) -> float
+def page_quality_prior(quality: PageQuality, bbox: Optional[BBox] = None,
+                       page: Optional[Page] = None) -> float:
     """Prior probability of a correct read, from measured page degradation.
 
     When a ``bbox`` and its ``page`` are supplied the measurement is localised
@@ -6297,22 +6082,22 @@ def page_quality_prior(quality, bbox=None, page=None):
         return round(float(clamp(base, 0.02, 0.99)), 4)
 
 
-def _compare_key(text):
-    # type: (str) -> str
+def _compare_key(text: str) -> str:
     """Aggressive normalisation for agreement comparison only."""
     cleaned = normalize_digits(normalize_unicode(text or "")).lower()
     return re.sub(r"[^a-z0-9]+", "", cleaned)
 
 
-def align_spans(a, b, iou_threshold=0.3):
-    # type: (Sequence[TextSpan], Sequence[TextSpan], float) -> List[Tuple[Optional[TextSpan], Optional[TextSpan]]]
+def align_spans(a: Sequence[TextSpan], b: Sequence[TextSpan],
+                iou_threshold: float = 0.3
+                ) -> List[Tuple[Optional[TextSpan], Optional[TextSpan]]]:
     """Pair up spans from two reads of the same page by geometric overlap.
 
     Greedy best-IoU matching.  Unmatched spans are returned paired with
     ``None`` so that a backend which simply *missed* a field is penalised, not
     silently ignored.
     """
-    pairs = []  # type: List[Tuple[Optional[TextSpan], Optional[TextSpan]]]
+    pairs: List[Tuple[Optional[TextSpan], Optional[TextSpan]]] = []
     remaining = list(b)
     for span in a:
         best = None
@@ -6331,8 +6116,9 @@ def align_spans(a, b, iou_threshold=0.3):
     return pairs
 
 
-def cross_read_agreement(a, b, iou_threshold=0.3, min_geometric_fraction=0.2):
-    # type: (Sequence[TextSpan], Sequence[TextSpan], float, float) -> float
+def cross_read_agreement(a: Sequence[TextSpan], b: Sequence[TextSpan],
+                         iou_threshold: float = 0.3,
+                         min_geometric_fraction: float = 0.2) -> float:
     """Agreement in ``[0, 1]`` between two independent reads of one page.
 
     Prefers geometric matching, which is precise.  When too few spans match
@@ -6373,8 +6159,7 @@ def cross_read_agreement(a, b, iou_threshold=0.3, min_geometric_fraction=0.2):
     return round(float(difflib.SequenceMatcher(None, tokens_a, tokens_b).ratio()), 4)
 
 
-def value_agreement(a, b, numeric_tolerance=0.0):
-    # type: (Any, Any, float) -> float
+def value_agreement(a: Any, b: Any, numeric_tolerance: float = 0.0) -> float:
     """Agreement between two *extracted values* rather than two transcriptions.
 
     Numbers compare numerically (``48250`` and ``48,250.00`` agree), dates
@@ -6396,8 +6181,7 @@ def value_agreement(a, b, numeric_tolerance=0.0):
     return round(similarity(_compare_key(str(a)), _compare_key(str(b))), 4)
 
 
-def format_match_score(value, expected_type):
-    # type: (Any, str) -> Optional[float]
+def format_match_score(value: Any, expected_type: str) -> Optional[float]:
     """Does ``value`` look like a well-formed instance of ``expected_type``?
 
     A weak signal on its own, but a genuinely independent one: it catches the
@@ -6434,25 +6218,20 @@ def format_match_score(value, expected_type):
 class Calibrator(object):
     """Base for post-hoc probability calibration."""
 
-    def fit(self, scores, labels):
-        # type: (Sequence[float], Sequence[bool]) -> Calibrator
+    def fit(self, scores: Sequence[float], labels: Sequence[bool]) -> Calibrator:
         raise NotImplementedError
 
-    def predict(self, score):
-        # type: (float) -> float
+    def predict(self, score: float) -> float:
         raise NotImplementedError
 
-    def predict_many(self, scores):
-        # type: (Sequence[float]) -> List[float]
+    def predict_many(self, scores: Sequence[float]) -> List[float]:
         return [self.predict(s) for s in scores]
 
-    def to_dict(self):
-        # type: () -> Dict[str, Any]
+    def to_dict(self) -> Dict[str, Any]:
         raise NotImplementedError
 
     @staticmethod
-    def from_dict(d):
-        # type: (Mapping[str, Any]) -> Calibrator
+    def from_dict(d: Mapping[str, Any]) -> Calibrator:
         kind = d.get("kind")
         if kind == "platt":
             return PlattCalibrator.from_dict(d)
@@ -6469,8 +6248,7 @@ class IdentityCalibrator(Calibrator):
     def fit(self, scores, labels):
         return self
 
-    def predict(self, score):
-        # type: (float) -> float
+    def predict(self, score: float) -> float:
         return float(clamp(score, 0.0, 1.0))
 
     def to_dict(self):
@@ -6491,8 +6269,8 @@ class PlattCalibrator(Calibrator):
         self.b = float(b)
         self.n = 0
 
-    def fit(self, scores, labels, iterations=400, learning_rate=0.25):
-        # type: (Sequence[float], Sequence[bool], int, float) -> PlattCalibrator
+    def fit(self, scores: Sequence[float], labels: Sequence[bool], iterations: int = 400,
+            learning_rate: float = 0.25) -> PlattCalibrator:
         xs = [logit(clamp(float(s), 0.0, 1.0)) for s in scores]
         ys = [1.0 if bool(l) else 0.0 for l in labels]
         if len(xs) != len(ys):
@@ -6521,8 +6299,7 @@ class PlattCalibrator(Calibrator):
         self.a, self.b = a, b
         return self
 
-    def predict(self, score):
-        # type: (float) -> float
+    def predict(self, score: float) -> float:
         return round(float(sigmoid(self.a * logit(clamp(score, 0.0, 1.0)) + self.b)), 4)
 
     def to_dict(self):
@@ -6553,8 +6330,8 @@ class IsotonicCalibrator(Calibrator):
         self.values = list(values or [])
         self.n = 0
 
-    def fit(self, scores, labels, min_samples=50):
-        # type: (Sequence[float], Sequence[bool], int) -> IsotonicCalibrator
+    def fit(self, scores: Sequence[float], labels: Sequence[bool],
+            min_samples: int = 50) -> IsotonicCalibrator:
         points = sorted(zip([clamp(float(s), 0.0, 1.0) for s in scores],
                             [1.0 if bool(l) else 0.0 for l in labels]))
         if len(points) < min_samples:
@@ -6580,8 +6357,7 @@ class IsotonicCalibrator(Calibrator):
         self.values = [b[1] for b in blocks]
         return self
 
-    def predict(self, score):
-        # type: (float) -> float
+    def predict(self, score: float) -> float:
         if not self.thresholds:
             return float(clamp(score, 0.0, 1.0))
         x = clamp(float(score), 0.0, 1.0)
@@ -6605,8 +6381,8 @@ class IsotonicCalibrator(Calibrator):
         return "IsotonicCalibrator(blocks=%d, n=%d)" % (len(self.values), self.n)
 
 
-def reliability_curve(scores, labels, bins=10):
-    # type: (Sequence[float], Sequence[bool], int) -> List[Dict[str, float]]
+def reliability_curve(scores: Sequence[float], labels: Sequence[bool],
+                      bins: int = 10) -> List[Dict[str, float]]:
     """Bin predictions and report empirical accuracy per bin.
 
     This is the plot that answers "is a 0.9 right 90% of the time?".  Until it
@@ -6614,7 +6390,7 @@ def reliability_curve(scores, labels, bins=10):
     """
     if len(scores) != len(labels):
         raise ConfigError("scores and labels differ in length")
-    buckets = [[] for _ in range(max(1, bins))]  # type: List[List[Tuple[float, bool]]]
+    buckets: List[List[Tuple[float, bool]]] = [[] for _ in range(max(1, bins))]
     for score, label in zip(scores, labels):
         index = int(clamp(float(score), 0.0, 0.999999) * bins)
         buckets[index].append((float(score), bool(label)))
@@ -6632,8 +6408,8 @@ def reliability_curve(scores, labels, bins=10):
     return out
 
 
-def expected_calibration_error(scores, labels, bins=10):
-    # type: (Sequence[float], Sequence[bool], int) -> float
+def expected_calibration_error(scores: Sequence[float], labels: Sequence[bool],
+                               bins: int = 10) -> float:
     """Expected calibration error: the bin-count-weighted mean |accuracy - confidence|.
 
     The single number to track per release.  Under 0.05 is a defensible target
@@ -6646,8 +6422,7 @@ def expected_calibration_error(scores, labels, bins=10):
     return round(sum(b["count"] * abs(b["gap"]) for b in curve) / float(total), 4)
 
 
-def brier_score(scores, labels):
-    # type: (Sequence[float], Sequence[bool]) -> float
+def brier_score(scores: Sequence[float], labels: Sequence[bool]) -> float:
     """Mean squared error of the probabilities.  Rewards sharpness *and*
     calibration, unlike ECE, which a constant predictor can game."""
     if not scores:
@@ -6680,8 +6455,7 @@ class FieldSpec(object):
         if not self.path:
             self.path = self.name
 
-    def to_dict(self):
-        # type: () -> Dict[str, Any]
+    def to_dict(self) -> Dict[str, Any]:
         return {"name": self.name, "type": self.type_name, "required": self.required,
                 "description": self.description, "path": self.path}
 
@@ -6693,8 +6467,7 @@ _PY_TO_JSON = {
 }
 
 
-def _json_type_for(annotation):
-    # type: (Any) -> Tuple[str, bool, Optional[str]]
+def _json_type_for(annotation: Any) -> Tuple[str, bool, Optional[str]]:
     """``(json_type, required, item_type)`` for a Python annotation."""
     try:
         import typing as _typing
@@ -6742,8 +6515,8 @@ class SchemaAdapter(object):
     substrate.
     """
 
-    def __init__(self, schema, json_schema, fields, name="Extraction"):
-        # type: (Any, Dict[str, Any], List[FieldSpec], str) -> None
+    def __init__(self, schema: SchemaLike, json_schema: Dict[str, Any],
+                 fields: List[FieldSpec], name: str = "Extraction") -> None:
         self.schema = schema
         self.json_schema = json_schema
         self.fields = fields
@@ -6751,8 +6524,7 @@ class SchemaAdapter(object):
 
     # -- construction -----------------------------------------------------
     @classmethod
-    def from_schema(cls, schema):
-        # type: (Any) -> SchemaAdapter
+    def from_schema(cls, schema: SchemaLike) -> SchemaAdapter:
         if isinstance(schema, SchemaAdapter):
             return schema
         if isinstance(schema, dict):
@@ -6770,8 +6542,8 @@ class SchemaAdapter(object):
             "of {field: type}" % schema)
 
     @classmethod
-    def _from_json_schema(cls, schema, json_schema, name):
-        # type: (Any, Dict[str, Any], str) -> SchemaAdapter
+    def _from_json_schema(cls, schema: SchemaLike, json_schema: Dict[str, Any],
+                          name: str) -> SchemaAdapter:
         properties = json_schema.get("properties") or {}
         required = set(json_schema.get("required") or [])
         fields = []
@@ -6793,8 +6565,7 @@ class SchemaAdapter(object):
         return cls(schema, json_schema, fields, name)
 
     @classmethod
-    def _from_dataclass(cls, schema):
-        # type: (Any) -> SchemaAdapter
+    def _from_dataclass(cls, schema: SchemaLike) -> SchemaAdapter:
         try:
             import typing as _typing
             hints = _typing.get_type_hints(schema)
@@ -6809,7 +6580,7 @@ class SchemaAdapter(object):
             has_default = (f.default is not dataclasses.MISSING
                            or f.default_factory is not dataclasses.MISSING)  # type: ignore
             is_required = is_required and not has_default
-            entry = {"type": type_name}  # type: Dict[str, Any]
+            entry: Dict[str, Any] = {"type": type_name}
             if item_type:
                 entry["items"] = {"type": item_type}
             if annotation in (_dt.date, _dt.datetime):
@@ -6825,8 +6596,7 @@ class SchemaAdapter(object):
         return cls(schema, json_schema, fields, schema.__name__)
 
     @classmethod
-    def _from_dict_spec(cls, spec):
-        # type: (Dict[str, Any]) -> SchemaAdapter
+    def _from_dict_spec(cls, spec: Dict[str, Any]) -> SchemaAdapter:
         """``{"total": "number", "patient": {"type": "string", "description": ...}}``"""
         properties = {}
         required = []
@@ -6857,15 +6627,13 @@ class SchemaAdapter(object):
                    fields, "Extraction")
 
     # -- use --------------------------------------------------------------
-    def field(self, name):
-        # type: (str) -> Optional[FieldSpec]
+    def field(self, name: str) -> Optional[FieldSpec]:
         for spec in self.fields:
             if spec.name == name:
                 return spec
         return None
 
-    def build(self, data):
-        # type: (Mapping[str, Any]) -> Any
+    def build(self, data: Mapping[str, Any]) -> Any:
         """Instantiate the project's schema from raw extracted data.
 
         Falls back to returning the coerced dict when the schema cannot be
@@ -6887,16 +6655,14 @@ class SchemaAdapter(object):
             raise ExtractionError("schema validation failed: %s" % exc)
         return dict(data)
 
-    def coerce(self, name, value):
-        # type: (str, Any) -> Any
+    def coerce(self, name: str, value: Any) -> Any:
         """Convert a raw JSON value to the declared type, tolerantly."""
         spec = self.field(name)
         return coerce_value(value, spec.type_name if spec else "string",
                             spec.item_type if spec else None)
 
 
-def coerce_value(value, type_name, item_type=None):
-    # type: (Any, str, Optional[str]) -> Any
+def coerce_value(value: Any, type_name: str, item_type: Optional[str] = None) -> Any:
     """Coerce a model's JSON output into the declared type.
 
     Tolerant on purpose: a model asked for a number will sometimes answer
@@ -6958,8 +6724,8 @@ DEFAULT_EXTRACTION_SYSTEM = (
 )
 
 
-def format_document_text(doc, include_page_markers=True, max_chars=0):
-    # type: (Document, bool, int) -> str
+def format_document_text(doc: Document, include_page_markers: bool = True,
+                         max_chars: int = 0) -> str:
     """Render a document's text for a prompt, with page markers.
 
     Page markers are not decoration: they are what lets an extracted value be
@@ -6984,8 +6750,8 @@ def format_document_text(doc, include_page_markers=True, max_chars=0):
     return "\n\n".join(parts)
 
 
-def build_extraction_prompt(adapter, document_text, context="", extra_instructions=""):
-    # type: (SchemaAdapter, str, str, str) -> str
+def build_extraction_prompt(adapter: SchemaAdapter, document_text: str, context: str = "",
+                            extra_instructions: str = "") -> str:
     """Assemble the user prompt: schema, domain context, then document text."""
     sections = [
         "Extract the following fields from the document below.",
@@ -7002,8 +6768,8 @@ def build_extraction_prompt(adapter, document_text, context="", extra_instructio
     return "\n".join(sections)
 
 
-def chunk_pages(doc, max_chars=60000, overlap_pages=1):
-    # type: (Document, int, int) -> List[Document]
+def chunk_pages(doc: Document, max_chars: int = 60000,
+                overlap_pages: int = 1) -> List[Document]:
     """Split a document into page-aligned chunks that fit a context window.
 
     Splitting on page boundaries rather than character counts keeps tables and
@@ -7012,8 +6778,8 @@ def chunk_pages(doc, max_chars=60000, overlap_pages=1):
     """
     if max_chars <= 0:
         return [doc]
-    chunks = []  # type: List[Document]
-    current = []  # type: List[Page]
+    chunks: List[Document] = []
+    current: List[Page] = []
     size = 0
     for page in doc.pages:
         length = len(page.text()) + 32
@@ -7037,8 +6803,8 @@ class LLMClient(Protocol):  # pragma: no cover - structural type
 
     name = ""
 
-    def complete(self, prompt, system=None, images=None):
-        # type: (str, Optional[str], Optional[Sequence[bytes]]) -> Tuple[str, Cost]
+    def complete(self, prompt: str, system: Optional[str] = None,
+                 images: Optional[Sequence[bytes]] = None) -> Tuple[str, Cost]:
         ...
 
 
@@ -7054,12 +6820,11 @@ class BaseLLMClient(object):
         self.options = dict(options)
         self._lock = threading.Lock()
 
-    def is_available(self):
-        # type: () -> bool
+    def is_available(self) -> bool:
         return True
 
-    def complete(self, prompt, system=None, images=None):
-        # type: (str, Optional[str], Optional[Sequence[bytes]]) -> Tuple[str, Cost]
+    def complete(self, prompt: str, system: Optional[str] = None,
+                 images: Optional[Sequence[bytes]] = None) -> Tuple[str, Cost]:
         raise NotImplementedError
 
 
@@ -7074,16 +6839,16 @@ class EchoClient(BaseLLMClient):
 
     name = "echo"
 
-    def __init__(self, response="{}", cost=None, record=True, **options):
-        # type: (Union[str, Mapping[str, Any], Callable[[str], Any]], Optional[Cost], bool, Any) -> None
+    def __init__(self, response: Union[str, Mapping[str, Any], Callable[[str], Any]] = "{}",
+                 cost: Optional[Cost] = None, record: bool = True, **options: Any) -> None:
         BaseLLMClient.__init__(self, model="echo", **options)
         self.response = response
         self.cost = cost or Cost(calls=1)
         self.record = record
-        self.prompts = []  # type: List[str]
+        self.prompts: List[str] = []
 
-    def complete(self, prompt, system=None, images=None):
-        # type: (str, Optional[str], Optional[Sequence[bytes]]) -> Tuple[str, Cost]
+    def complete(self, prompt: str, system: Optional[str] = None,
+                 images: Optional[Sequence[bytes]] = None) -> Tuple[str, Cost]:
         if self.record:
             self.prompts.append(prompt)
         response = self.response(prompt) if callable(self.response) else self.response
@@ -7102,14 +6867,12 @@ class AnthropicClient(BaseLLMClient):
         self._api_key = api_key
         self._client = client
 
-    def is_available(self):
-        # type: () -> bool
+    def is_available(self) -> bool:
         if self._client is not None:
             return True
         return have("anthropic") and bool(self._api_key or os.environ.get("ANTHROPIC_API_KEY"))
 
-    def _get_client(self):
-        # type: () -> Any
+    def _get_client(self) -> Any:
         if self._client is None:
             with self._lock:
                 if self._client is None:
@@ -7118,9 +6881,9 @@ class AnthropicClient(BaseLLMClient):
                                     if self._api_key else module.Anthropic())
         return self._client
 
-    def complete(self, prompt, system=None, images=None):
-        # type: (str, Optional[str], Optional[Sequence[bytes]]) -> Tuple[str, Cost]
-        content = []  # type: List[Dict[str, Any]]
+    def complete(self, prompt: str, system: Optional[str] = None,
+                 images: Optional[Sequence[bytes]] = None) -> Tuple[str, Cost]:
+        content: List[Dict[str, Any]] = []
         for blob in (images or []):
             content.append({"type": "image", "source": {
                 "type": "base64", "media_type": "image/jpeg",
@@ -7149,14 +6912,12 @@ class OpenAIClient(BaseLLMClient):
         self._api_key = api_key
         self._client = client
 
-    def is_available(self):
-        # type: () -> bool
+    def is_available(self) -> bool:
         if self._client is not None:
             return True
         return have("openai") and bool(self._api_key or os.environ.get("OPENAI_API_KEY"))
 
-    def _get_client(self):
-        # type: () -> Any
+    def _get_client(self) -> Any:
         if self._client is None:
             with self._lock:
                 if self._client is None:
@@ -7165,9 +6926,9 @@ class OpenAIClient(BaseLLMClient):
                                     if self._api_key else module.OpenAI())
         return self._client
 
-    def complete(self, prompt, system=None, images=None):
-        # type: (str, Optional[str], Optional[Sequence[bytes]]) -> Tuple[str, Cost]
-        content = [{"type": "text", "text": prompt}]  # type: List[Dict[str, Any]]
+    def complete(self, prompt: str, system: Optional[str] = None,
+                 images: Optional[Sequence[bytes]] = None) -> Tuple[str, Cost]:
+        content: List[Dict[str, Any]] = [{"type": "text", "text": prompt}]
         for blob in (images or []):
             url = "data:image/jpeg;base64,%s" % base64.b64encode(blob).decode("ascii")
             content.append({"type": "image_url", "image_url": {"url": url, "detail": "high"}})
@@ -7188,8 +6949,7 @@ class OpenAIClient(BaseLLMClient):
 _FENCE_RE = re.compile(r"```(?:json)?\s*(.*?)```", re.DOTALL)
 
 
-def parse_json_lenient(text):
-    # type: (str) -> Any
+def parse_json_lenient(text: str) -> Any:
     """Recover a JSON object from a model's reply.
 
     Models wrap JSON in fences, prefix it with "Here is the extracted data:",
@@ -7224,8 +6984,7 @@ def parse_json_lenient(text):
                           % (raw[:300] + ("..." if len(raw) > 300 else "")))
 
 
-def _drop_non_finite(value):
-    # type: (Any) -> Any
+def _drop_non_finite(value: Any) -> Any:
     """Replace NaN and +/-Infinity with ``None``, recursively.
 
     Python's ``json`` accepts these as float literals, so they survive parsing
@@ -7242,8 +7001,7 @@ def _drop_non_finite(value):
     return value
 
 
-def _first_balanced_json(text):
-    # type: (str) -> Optional[str]
+def _first_balanced_json(text: str) -> Optional[str]:
     """Slice out the first balanced ``{...}`` or ``[...]``, ignoring braces in strings."""
     start = None
     opener = closer = ""
@@ -7278,8 +7036,7 @@ def _first_balanced_json(text):
     return None
 
 
-def _repair_json(text):
-    # type: (str) -> str
+def _repair_json(text: str) -> str:
     """Fix the small syntax errors models actually make."""
     if not text:
         return text
@@ -7301,8 +7058,7 @@ class Evidence(object):
     text: str = ""
     source: str = ""
 
-    def to_dict(self):
-        # type: () -> Dict[str, Any]
+    def to_dict(self) -> Dict[str, Any]:
         return {"bbox": self.bbox.to_dict(), "score": round(self.score, 4),
                 "text": self.text, "source": self.source}
 
@@ -7313,8 +7069,7 @@ _DATE_RENDERINGS = ("%d-%m-%Y", "%Y-%m-%d", "%m-%d-%Y", "%d-%b-%Y", "%b-%d-%Y",
                     "%d-%B-%Y", "%d-%m-%y")
 
 
-def _comparison_keys(value):
-    # type: (Any) -> List[str]
+def _comparison_keys(value: Any) -> List[str]:
     """Every form ``value`` might plausibly take on the page.
 
     A value's extracted representation legitimately differs from its printed
@@ -7356,8 +7111,9 @@ def _comparison_keys(value):
     return keys
 
 
-def locate_value(doc, value, min_score=0.72, max_span_window=8, pages=None):
-    # type: (Document, Any, float, int, Optional[Sequence[int]]) -> List[Evidence]
+def locate_value(doc: Document, value: Any, min_score: float = 0.72,
+                 max_span_window: int = 8,
+                 pages: Optional[Sequence[int]] = None) -> List[Evidence]:
     """Find where on which page a value appears, returning bounding boxes.
 
     Every extracted fact came from a specific rectangle on a specific page.  If
@@ -7380,11 +7136,11 @@ def locate_value(doc, value, min_score=0.72, max_span_window=8, pages=None):
         return []
     target = targets[0]
 
-    results = []  # type: List[Evidence]
+    results: List[Evidence] = []
     for page in doc.pages:
         if pages is not None and page.index not in pages:
             continue
-        best = None  # type: Optional[Evidence]
+        best: Optional[Evidence] = None
         for line_spans in _group_spans_into_lines(page):
             for start in range(len(line_spans)):
                 accumulated = ""
@@ -7409,8 +7165,8 @@ def locate_value(doc, value, min_score=0.72, max_span_window=8, pages=None):
     return results
 
 
-def _group_spans_into_lines(page, y_tolerance=None):
-    # type: (Page, Optional[float]) -> List[List[TextSpan]]
+def _group_spans_into_lines(page: Page,
+                            y_tolerance: Optional[float] = None) -> List[List[TextSpan]]:
     """Spans grouped into visual lines, left to right, top to bottom.
 
     Backend-reported line ids are used when available, but keyed on
@@ -7429,7 +7185,7 @@ def _group_spans_into_lines(page, y_tolerance=None):
         y_tolerance = (heights[len(heights) // 2] or 10.0) * 0.6
 
     if all(s.line is not None for s in spans):
-        groups = {}  # type: Dict[Tuple[int, int], List[TextSpan]]
+        groups: Dict[Tuple[int, int], List[TextSpan]] = {}
         for s in spans:
             groups.setdefault((int(s.block or 0), int(s.line)), []).append(s)
         ordered = sorted(groups.values(),
@@ -7449,14 +7205,13 @@ def _group_spans_into_lines(page, y_tolerance=None):
     return ordered
 
 
-def backend_confidence_for(doc, evidence):
-    # type: (Document, Sequence[Evidence]) -> Optional[float]
+def backend_confidence_for(doc: Document, evidence: Sequence[Evidence]) -> Optional[float]:
     """Mean backend-reported confidence over the spans supporting a value.
 
     Returns ``None`` when no supporting span carries a confidence, which keeps
     "the engine declined to say" distinct from "the engine said zero".
     """
-    values = []  # type: List[float]
+    values: List[float] = []
     for item in evidence:
         try:
             page = doc.page(item.bbox.page)
@@ -7480,8 +7235,7 @@ class ValidationIssue(object):
     fields: List[str] = field(default_factory=list)
     severity: str = "error"  #: "error" or "warning"
 
-    def to_dict(self):
-        # type: () -> Dict[str, Any]
+    def to_dict(self) -> Dict[str, Any]:
         return {"message": self.message, "fields": list(self.fields),
                 "severity": self.severity}
 
@@ -7492,8 +7246,7 @@ class ValidationIssue(object):
 Validator = Callable[[Any], Any]
 
 
-def run_validators(model, validators):
-    # type: (Any, Sequence[Validator]) -> List[ValidationIssue]
+def run_validators(model: Any, validators: Sequence[Validator]) -> List[ValidationIssue]:
     """Run business rules, collecting issues.
 
     A validator may return ``None``, a string, a :class:`ValidationIssue`, or a
@@ -7501,7 +7254,7 @@ def run_validators(model, validators):
     rather than aborting extraction: a buggy rule must not cost you the
     document.
     """
-    issues = []  # type: List[ValidationIssue]
+    issues: List[ValidationIssue] = []
     for validator in validators or []:
         name = getattr(validator, "__name__", repr(validator))
         try:
@@ -7521,10 +7274,10 @@ def run_validators(model, validators):
     return issues
 
 
-def line_items_sum_to_total(items_field="line_items", amount_field="amount",
-                            total_field="total", tolerance=decimal.Decimal("0.02"),
-                            relative_tolerance=0.0):
-    # type: (str, str, str, decimal.Decimal, float) -> Validator
+def line_items_sum_to_total(items_field: str = "line_items", amount_field: str = "amount",
+                            total_field: str = "total",
+                            tolerance: decimal.Decimal = decimal.Decimal("0.02"),
+                            relative_tolerance: float = 0.0) -> Validator:
     """Validator factory: line items must add up to the stated total.
 
     The single most valuable check on a bill, because it is *independent* of
@@ -7552,8 +7305,7 @@ def line_items_sum_to_total(items_field="line_items", amount_field="amount",
     return validate
 
 
-def date_order(earlier_field, later_field, allow_equal=True):
-    # type: (str, str, bool) -> Validator
+def date_order(earlier_field: str, later_field: str, allow_equal: bool = True) -> Validator:
     """Validator factory: one date must not precede another."""
     def validate(model):
         a = _get_attr(model, earlier_field)
@@ -7569,8 +7321,8 @@ def date_order(earlier_field, later_field, allow_equal=True):
     return validate
 
 
-def field_matches(field_name, pattern, message=None):
-    # type: (str, str, Optional[str]) -> Validator
+def field_matches(field_name: str, pattern: str,
+                  message: Optional[str] = None) -> Validator:
     """Validator factory: a field must match a regular expression."""
     compiled = re.compile(pattern)
 
@@ -7586,8 +7338,7 @@ def field_matches(field_name, pattern, message=None):
     return validate
 
 
-def required_fields(*names):
-    # type: (*str) -> Validator
+def required_fields(*names: str) -> Validator:
     """Validator factory: these fields must be present and non-empty."""
     def validate(model):
         issues = []
@@ -7600,8 +7351,7 @@ def required_fields(*names):
     return validate
 
 
-def _get_attr(obj, name):
-    # type: (Any, str) -> Any
+def _get_attr(obj: Any, name: str) -> Any:
     """Attribute or key access, whichever the object supports."""
     if obj is None:
         return None
@@ -7626,12 +7376,10 @@ class FieldResult(Generic[T]):
     warnings: List[str] = field(default_factory=list)
 
     @property
-    def pages(self):
-        # type: () -> List[int]
+    def pages(self) -> List[int]:
         return sorted(set(b.page for b in self.evidence))
 
-    def to_dict(self):
-        # type: () -> Dict[str, Any]
+    def to_dict(self) -> Dict[str, Any]:
         return {"name": self.name, "value": _as_jsonable(self.value),
                 "confidence": round(self.confidence, 4),
                 "evidence": [b.to_dict() for b in self.evidence],
@@ -7658,39 +7406,32 @@ class Extraction(Generic[T]):
     raw_response: str = ""
     latency_ms: float = 0.0
 
-    def __getitem__(self, name):
-        # type: (str) -> FieldResult
+    def __getitem__(self, name: str) -> FieldResult:
         return self.fields[name]
 
-    def value(self, name, default=None):
-        # type: (str, Any) -> Any
+    def value(self, name: str, default: Any = None) -> Any:
         result = self.fields.get(name)
         return default if result is None or result.value is None else result.value
 
-    def confidence(self, name):
-        # type: (str) -> float
+    def confidence(self, name: str) -> float:
         result = self.fields.get(name)
         return result.confidence if result else 0.0
 
     @property
-    def mean_confidence(self):
-        # type: () -> float
+    def mean_confidence(self) -> float:
         values = [f.confidence for f in self.fields.values() if f.value is not None]
         return round(sum(values) / len(values), 4) if values else 0.0
 
-    def low_confidence(self, threshold=0.7):
-        # type: (float) -> List[FieldResult]
+    def low_confidence(self, threshold: float = 0.7) -> List[FieldResult]:
         """Fields a human should look at.  The point of the whole exercise."""
         return sorted([f for f in self.fields.values() if f.confidence < threshold],
                       key=lambda f: f.confidence)
 
     @property
-    def is_valid(self):
-        # type: () -> bool
+    def is_valid(self) -> bool:
         return not any(i.severity == "error" for i in self.issues)
 
-    def to_dict(self):
-        # type: () -> Dict[str, Any]
+    def to_dict(self) -> Dict[str, Any]:
         return {
             "model": _as_jsonable(self.model),
             "fields": dict((k, v.to_dict()) for k, v in self.fields.items()),
@@ -7708,15 +7449,14 @@ class Extraction(Generic[T]):
             len(self.fields), self.mean_confidence, self.is_valid, self.cost)
 
 
-def merge_extracted_data(chunks):
-    # type: (Sequence[Mapping[str, Any]]) -> Dict[str, Any]
+def merge_extracted_data(chunks: Sequence[Mapping[str, Any]]) -> Dict[str, Any]:
     """Merge per-chunk extractions into one.
 
     First non-null wins for scalars (earlier pages hold headers and identifiers);
     lists are concatenated with duplicates dropped, because line items are
     spread across pages and each chunk sees only its own.
     """
-    merged = {}  # type: Dict[str, Any]
+    merged: Dict[str, Any] = {}
     for chunk in chunks:
         for key, value in (chunk or {}).items():
             if value is None:
@@ -7735,12 +7475,14 @@ def merge_extracted_data(chunks):
     return merged
 
 
-def extract(doc, schema, context="", client=None, validators=None,
-            system=DEFAULT_EXTRACTION_SYSTEM, extra_instructions="",
-            max_chars=60000, overlap_pages=1, include_images=False,
-            weights=None, calibrator=None, locate_evidence=True,
-            min_evidence_score=0.72, retries=2):
-    # type: (Document, Any, str, Optional[Any], Optional[Sequence[Validator]], str, str, int, int, bool, Optional[Mapping[str, float]], Optional[Calibrator], bool, float, int) -> Extraction
+def extract(doc: Document, schema: SchemaLike, context: str = "",
+            client: Optional[LLMClient] = None,
+            validators: Optional[Sequence[Validator]] = None,
+            system: str = DEFAULT_EXTRACTION_SYSTEM, extra_instructions: str = "",
+            max_chars: int = 60000, overlap_pages: int = 1, include_images: bool = False,
+            weights: Optional[Mapping[str, float]] = None,
+            calibrator: Optional[Calibrator] = None, locate_evidence: bool = True,
+            min_evidence_score: float = 0.72, retries: int = 2) -> Extraction:
     """Extract ``schema`` from ``doc``, with per-field confidence and provenance.
 
     This is the whole domain-side integration surface.  A project supplies its
@@ -7774,7 +7516,7 @@ def extract(doc, schema, context="", client=None, validators=None,
             result.warnings.append(
                 "document split into %d chunks of <=%d characters" % (len(chunks), max_chars))
 
-        payloads = []  # type: List[Dict[str, Any]]
+        payloads: List[Dict[str, Any]] = []
         for chunk in chunks:
             text = format_document_text(chunk)
             prompt = build_extraction_prompt(adapter, text, context, extra_instructions)
@@ -7810,7 +7552,7 @@ def extract(doc, schema, context="", client=None, validators=None,
 
         # Coerce to declared types before validating, so a business rule sees
         # Decimals and dates rather than whatever the model happened to emit.
-        coerced = {}  # type: Dict[str, Any]
+        coerced: Dict[str, Any] = {}
         for spec in adapter.fields:
             coerced[spec.name] = adapter.coerce(spec.name, data.get(spec.name))
         for key, value in data.items():
@@ -7824,7 +7566,7 @@ def extract(doc, schema, context="", client=None, validators=None,
             result.model = coerced  # type: ignore[assignment]
 
         result.issues = run_validators(result.model, validators or [])
-        failed_fields = set()  # type: Set[str]
+        failed_fields: Set[str] = set()
         for issue in result.issues:
             if issue.severity == "error":
                 failed_fields.update(issue.fields)
@@ -7842,9 +7584,11 @@ def extract(doc, schema, context="", client=None, validators=None,
     return result
 
 
-def _build_field_result(spec, value, raw, doc, client_name, locate,
-                        min_evidence_score, failed, any_error, weights, calibrator):
-    # type: (FieldSpec, Any, Any, Document, str, bool, float, bool, bool, Optional[Mapping[str, float]], Optional[Calibrator]) -> FieldResult
+def _build_field_result(spec: FieldSpec, value: Any, raw: Any, doc: Document,
+                        client_name: str, locate: bool, min_evidence_score: float,
+                        failed: bool, any_error: bool,
+                        weights: Optional[Mapping[str, float]],
+                        calibrator: Optional[Calibrator]) -> FieldResult:
     """Assemble one field's value, evidence, signals and fused confidence."""
     result = FieldResult(name=spec.name, value=value, raw=raw, method=client_name)
 
@@ -7855,7 +7599,7 @@ def _build_field_result(spec, value, raw, doc, client_name, locate,
         result.confidence = 0.0
         return result
 
-    evidence = []  # type: List[Evidence]
+    evidence: List[Evidence] = []
     if locate and not isinstance(value, (list, dict)):
         evidence = locate_value(doc, value, min_score=min_evidence_score)
         result.evidence = merge_bboxes([e.bbox for e in evidence[:3]])
@@ -7864,7 +7608,7 @@ def _build_field_result(spec, value, raw, doc, client_name, locate,
                 "value not found in the document text; it may be hallucinated, "
                 "or read from a page image rather than the text layer")
 
-    page_prior = None  # type: Optional[float]
+    page_prior: Optional[float] = None
     if evidence:
         try:
             page = doc.page(evidence[0].bbox.page)
@@ -7875,9 +7619,9 @@ def _build_field_result(spec, value, raw, doc, client_name, locate,
         page_prior = round(sum(p.quality.score for p in doc.pages) / len(doc.pages), 4)
 
     # Cross-read agreement, when a page was read twice (see EnsembleBackend).
-    cross = None  # type: Optional[float]
+    cross: Optional[float] = None
     if evidence:
-        values = []  # type: List[float]
+        values: List[float] = []
         for item in evidence[:3]:
             try:
                 page = doc.page(item.bbox.page)
@@ -7898,7 +7642,7 @@ def _build_field_result(spec, value, raw, doc, client_name, locate,
     else:
         text_support = 0.05          # looked for and not found: likely invented
 
-    signals = {
+    signals: Dict[str, Optional[float]] = {
         "cross_read_agree": cross,
         "text_support": text_support,
         "backend_conf": backend_confidence_for(doc, evidence) if evidence else None,
@@ -7911,7 +7655,7 @@ def _build_field_result(spec, value, raw, doc, client_name, locate,
         # wrong numbers, and most fields are not covered by any check at all.
         "validation": 0.02 if failed else (0.65 if not any_error else 0.5),
         "logprob": None,
-    }  # type: Dict[str, Optional[float]]
+    }
 
     result.signals = signals
     fused = fuse_confidence(signals, weights)
@@ -7953,17 +7697,15 @@ class FieldRule(object):
         return re.compile(self.value_pattern, re.IGNORECASE)
 
 
-def extract_with_rules(doc, rules):
-    # type: (Document, Sequence[FieldRule]) -> Dict[str, FieldResult]
+def extract_with_rules(doc: Document, rules: Sequence[FieldRule]) -> Dict[str, FieldResult]:
     """Extract fields by anchoring on printed labels.  No model, no network."""
-    out = {}  # type: Dict[str, FieldResult]
+    out: Dict[str, FieldResult] = {}
     for rule in rules:
         out[rule.name] = _apply_rule(doc, rule)
     return out
 
 
-def _apply_rule(doc, rule):
-    # type: (Document, FieldRule) -> FieldResult
+def _apply_rule(doc: Document, rule: FieldRule) -> FieldResult:
     label_re = rule.compiled_label()
     value_re = rule.compiled_value()
     result = FieldResult(name=rule.name, method="rules")
@@ -7977,7 +7719,7 @@ def _apply_rule(doc, rule):
             if not match:
                 continue
 
-            candidates = []  # type: List[Tuple[str, List[TextSpan]]]
+            candidates: List[Tuple[str, List[TextSpan]]] = []
             if rule.direction in ("right", "same_line"):
                 tail = line_text[match.end():].strip(" :\t-")
                 if tail:
@@ -8006,7 +7748,7 @@ def _apply_rule(doc, rule):
                     continue
                 boxes = merge_bboxes([s.bbox for s in spans])
                 confidences = [s.confidence for s in spans if s.confidence is not None]
-                signals = {
+                signals: Dict[str, Optional[float]] = {
                     "backend_conf": (sum(confidences) / len(confidences)
                                      if confidences else None),
                     "page_quality": page_quality_prior(page.quality,
@@ -8018,7 +7760,7 @@ def _apply_rule(doc, rule):
                     "text_support": 0.9,
                     "cross_read_agree": None,
                     "validation": None,
-                }  # type: Dict[str, Optional[float]]
+                }
                 result.value = value
                 result.raw = raw
                 result.evidence = boxes
@@ -8030,8 +7772,7 @@ def _apply_rule(doc, rule):
     return result
 
 
-def _approx_x_for_offset(line_spans, offset):
-    # type: (Sequence[TextSpan], int) -> float
+def _approx_x_for_offset(line_spans: Sequence[TextSpan], offset: int) -> float:
     """Approximate the x coordinate of a character offset within a joined line."""
     position = 0
     for span in line_spans:
@@ -8070,8 +7811,7 @@ class EvalCase(object):
     tags: List[str] = field(default_factory=list)
     meta: Dict[str, Any] = field(default_factory=dict)
 
-    def to_dict(self):
-        # type: () -> Dict[str, Any]
+    def to_dict(self) -> Dict[str, Any]:
         return {"case_id": self.case_id, "path": self.path,
                 "truth": _as_jsonable(self.truth), "tags": list(self.tags)}
 
@@ -8094,13 +7834,11 @@ class FieldOutcome(object):
     type_name: str = "string"
 
     @property
-    def correct(self):
-        # type: () -> bool
+    def correct(self) -> bool:
         """Exact match, or numerically/date equal within tolerance."""
         return bool(self.exact or self.within_tolerance)
 
-    def to_dict(self):
-        # type: () -> Dict[str, Any]
+    def to_dict(self) -> Dict[str, Any]:
         return {"case_id": self.case_id, "pipeline": self.pipeline, "field": self.field,
                 "expected": _as_jsonable(self.expected),
                 "predicted": _as_jsonable(self.predicted),
@@ -8125,8 +7863,7 @@ class CaseResult(object):
     error: str = ""
     page_verdict: str = "unknown"
 
-    def to_dict(self):
-        # type: () -> Dict[str, Any]
+    def to_dict(self) -> Dict[str, Any]:
         return {"case_id": self.case_id, "pipeline": self.pipeline,
                 "outcomes": [o.to_dict() for o in self.outcomes],
                 "cost": self.cost.to_dict(),
@@ -8137,9 +7874,9 @@ class CaseResult(object):
                 "error": self.error, "page_verdict": self.page_verdict}
 
 
-def compare_values(expected, predicted, type_name="string", numeric_tolerance=0.005,
-                   fuzzy_threshold=0.92):
-    # type: (Any, Any, str, float, float) -> Tuple[bool, float, bool]
+def compare_values(expected: Any, predicted: Any, type_name: str = "string",
+                   numeric_tolerance: float = 0.005,
+                   fuzzy_threshold: float = 0.92) -> Tuple[bool, float, bool]:
     """Score a prediction against ground truth.
 
     Returns ``(exact, fuzzy_similarity, within_tolerance)``.
@@ -8210,15 +7947,15 @@ class EvalSuite(object):
         report.regression_vs("reports/release-2026-08.json")
     """
 
-    def __init__(self, cases=None, name="", field_types=None):
-        # type: (Optional[Sequence[EvalCase]], str, Optional[Mapping[str, str]]) -> None
+    def __init__(self, cases: Optional[Sequence[EvalCase]] = None, name: str = "",
+                 field_types: Optional[Mapping[str, str]] = None) -> None:
         self.cases = list(cases or [])
         self.name = name
         self.field_types = dict(field_types or {})
 
     @classmethod
-    def from_dir(cls, directory, truth_suffix=".json", name=""):
-        # type: (str, str, str) -> EvalSuite
+    def from_dir(cls, directory: str, truth_suffix: str = ".json",
+                 name: str = "") -> EvalSuite:
         """Load a dataset laid out as ``<stem>.pdf`` beside ``<stem>.json``.
 
         The JSON may be the truth mapping directly, or ``{"truth": {...},
@@ -8251,21 +7988,20 @@ class EvalSuite(object):
             raise ConfigError("no labelled cases found in %s" % directory)
         return cls(cases, name=name or os.path.basename(os.path.abspath(directory)))
 
-    def add(self, case):
-        # type: (EvalCase) -> EvalSuite
+    def add(self, case: EvalCase) -> EvalSuite:
         self.cases.append(case)
         return self
 
-    def filter(self, predicate):
-        # type: (Callable[[EvalCase], bool]) -> EvalSuite
+    def filter(self, predicate: Callable[[EvalCase], bool]) -> EvalSuite:
         return EvalSuite([c for c in self.cases if predicate(c)], self.name, self.field_types)
 
     def __len__(self):
         return len(self.cases)
 
-    def run(self, pipelines, metrics=None, max_workers=0, numeric_tolerance=0.005,
-            on_case=None):
-        # type: (Mapping[str, PipelineFn], Optional[Sequence[str]], int, float, Optional[Callable[[str, str], None]]) -> EvalReport
+    def run(self, pipelines: Mapping[str, PipelineFn],
+            metrics: Optional[Sequence[str]] = None, max_workers: int = 0,
+            numeric_tolerance: float = 0.005,
+            on_case: Optional[Callable[[str, str], None]] = None) -> EvalReport:
         """Run each pipeline over every case and score the results.
 
         A pipeline that raises on one document is recorded as an error for that
@@ -8281,8 +8017,8 @@ class EvalSuite(object):
                             created_at=_utcnow(), case_count=len(self.cases))
 
         for pipeline_name, pipeline in pipelines.items():
-            def run_case(case, _pipeline=pipeline, _name=pipeline_name):
-                # type: (EvalCase, Any, str) -> CaseResult
+            def run_case(case: EvalCase, _pipeline: Any = pipeline,
+                         _name: str = pipeline_name) -> CaseResult:
                 return self._run_case(case, _pipeline, _name, numeric_tolerance)
 
             results = _map_maybe_parallel(run_case, self.cases, max_workers, "eval")
@@ -8292,8 +8028,8 @@ class EvalSuite(object):
                     on_case(pipeline_name, case.case_id)
         return report
 
-    def _run_case(self, case, pipeline, pipeline_name, numeric_tolerance):
-        # type: (EvalCase, PipelineFn, str, float) -> CaseResult
+    def _run_case(self, case: EvalCase, pipeline: PipelineFn, pipeline_name: str,
+                  numeric_tolerance: float) -> CaseResult:
         result = CaseResult(case_id=case.case_id, pipeline=pipeline_name)
         with Timer() as timer:
             try:
@@ -8329,8 +8065,7 @@ class EvalSuite(object):
         return result
 
 
-def _infer_type_name(value):
-    # type: (Any) -> str
+def _infer_type_name(value: Any) -> str:
     """Guess a field's type from its ground-truth value."""
     if isinstance(value, bool):
         return "boolean"
@@ -8356,20 +8091,17 @@ class EvalReport(object):
     results: Dict[str, List[CaseResult]] = field(default_factory=dict)
 
     # -- access -----------------------------------------------------------
-    def pipelines(self):
-        # type: () -> List[str]
+    def pipelines(self) -> List[str]:
         return sorted(self.results)
 
-    def outcomes(self, pipeline):
-        # type: (str) -> List[FieldOutcome]
-        out = []  # type: List[FieldOutcome]
+    def outcomes(self, pipeline: str) -> List[FieldOutcome]:
+        out: List[FieldOutcome] = []
         for case in self.results.get(pipeline, []):
             out.extend(case.outcomes)
         return out
 
     # -- metrics ----------------------------------------------------------
-    def compute(self, pipeline):
-        # type: (str) -> Dict[str, float]
+    def compute(self, pipeline: str) -> Dict[str, float]:
         """All requested metrics for one pipeline."""
         cases = self.results.get(pipeline, [])
         outcomes = self.outcomes(pipeline)
@@ -8397,8 +8129,7 @@ class EvalReport(object):
         }
         return dict((m, round(values[m], 4)) for m in self.metrics if m in values)
 
-    def by_field(self, pipeline=None):
-        # type: (Optional[str]) -> Dict[str, Dict[str, Any]]
+    def by_field(self, pipeline: Optional[str] = None) -> Dict[str, Dict[str, Any]]:
         """Per-field accuracy -- which fields degraded, not just the average.
 
         The aggregate hides everything that matters.  A pipeline can gain two
@@ -8406,7 +8137,7 @@ class EvalReport(object):
         only field anyone downstream actually cares about.
         """
         pipeline = pipeline or (self.pipelines()[0] if self.pipelines() else "")
-        grouped = {}  # type: Dict[str, List[FieldOutcome]]
+        grouped: Dict[str, List[FieldOutcome]] = {}
         for outcome in self.outcomes(pipeline):
             grouped.setdefault(outcome.field, []).append(outcome)
         out = {}
@@ -8422,8 +8153,7 @@ class EvalReport(object):
             }
         return out
 
-    def by_page_quality(self, pipeline=None):
-        # type: (Optional[str]) -> Dict[str, Dict[str, Any]]
+    def by_page_quality(self, pipeline: Optional[str] = None) -> Dict[str, Dict[str, Any]]:
         """Accuracy split by page condition -- did we only improve on clean pages?
 
         A change that lifts the average by improving pages that were already
@@ -8431,7 +8161,7 @@ class EvalReport(object):
         problem it was meant to solve.  This is the split that catches that.
         """
         pipeline = pipeline or (self.pipelines()[0] if self.pipelines() else "")
-        grouped = {}  # type: Dict[str, List[FieldOutcome]]
+        grouped: Dict[str, List[FieldOutcome]] = {}
         for outcome in self.outcomes(pipeline):
             grouped.setdefault(outcome.page_verdict, []).append(outcome)
         out = {}
@@ -8444,16 +8174,16 @@ class EvalReport(object):
             }
         return out
 
-    def confidence_curve(self, pipeline=None, bins=10):
-        # type: (Optional[str], int) -> List[Dict[str, float]]
+    def confidence_curve(self, pipeline: Optional[str] = None,
+                         bins: int = 10) -> List[Dict[str, float]]:
         """Is a 0.9 right 90% of the time?  This is the answer."""
         pipeline = pipeline or (self.pipelines()[0] if self.pipelines() else "")
         outcomes = self.outcomes(pipeline)
         return reliability_curve([o.confidence for o in outcomes],
                                  [o.correct for o in outcomes], bins)
 
-    def fit_calibrator(self, pipeline=None, kind="platt"):
-        # type: (Optional[str], str) -> Calibrator
+    def fit_calibrator(self, pipeline: Optional[str] = None,
+                       kind: str = "platt") -> Calibrator:
         """Fit a calibrator on this report, ready to pass to :func:`extract`.
 
         This closes the loop: measure, calibrate, ship the calibrator, and the
@@ -8469,14 +8199,13 @@ class EvalReport(object):
             return IsotonicCalibrator().fit(scores, labels)
         raise ConfigError("unknown calibrator kind %r" % kind)
 
-    def errors(self, pipeline=None):
-        # type: (Optional[str]) -> List[Tuple[str, str]]
+    def errors(self, pipeline: Optional[str] = None) -> List[Tuple[str, str]]:
         """``(case_id, error)`` for every case the pipeline failed on."""
         pipeline = pipeline or (self.pipelines()[0] if self.pipelines() else "")
         return [(c.case_id, c.error) for c in self.results.get(pipeline, []) if c.error]
 
-    def worst_cases(self, pipeline=None, limit=10):
-        # type: (Optional[str], int) -> List[Tuple[str, float]]
+    def worst_cases(self, pipeline: Optional[str] = None,
+                    limit: int = 10) -> List[Tuple[str, float]]:
         """Cases with the lowest field accuracy -- where to look first."""
         pipeline = pipeline or (self.pipelines()[0] if self.pipelines() else "")
         scored = []
@@ -8490,8 +8219,7 @@ class EvalReport(object):
         return scored[:limit]
 
     # -- comparison -------------------------------------------------------
-    def compare(self, baseline_pipeline, candidate_pipeline):
-        # type: (str, str) -> Dict[str, Any]
+    def compare(self, baseline_pipeline: str, candidate_pipeline: str) -> Dict[str, Any]:
         """Metric deltas and per-field regressions between two pipelines."""
         base = self.compute(baseline_pipeline)
         candidate = self.compute(candidate_pipeline)
@@ -8529,8 +8257,9 @@ class EvalReport(object):
     #: for a latency -- 0.05 ms of scheduler noise would fail every build.
     RELATIVE_METRICS = frozenset(["cost_per_doc", "latency_p50", "latency_p95"])
 
-    def regression_vs(self, baseline, pipeline=None, tolerance=0.0, metrics=None):
-        # type: (Union[str, EvalReport], Optional[str], float, Optional[Sequence[str]]) -> Dict[str, Any]
+    def regression_vs(self, baseline: Union[str, EvalReport],
+                      pipeline: Optional[str] = None, tolerance: float = 0.0,
+                      metrics: Optional[Sequence[str]] = None) -> Dict[str, Any]:
         """Compare against a saved report -- the CI gate.
 
         ``baseline`` is a path to a report saved by :meth:`save`, or a report
@@ -8577,8 +8306,7 @@ class EvalReport(object):
                 "regressions": regressions, "regressed": bool(regressions)}
 
     # -- output -----------------------------------------------------------
-    def summary(self):
-        # type: () -> str
+    def summary(self) -> str:
         """A human-readable table, for a terminal or a CI log."""
         lines = ["eval suite: %s   cases: %d   %s"
                  % (self.suite or "(unnamed)", self.case_count, self.created_at)]
@@ -8606,16 +8334,14 @@ class EvalReport(object):
                              % (name, len(failures), failures[0][0], failures[0][1][:80]))
         return "\n".join(lines)
 
-    def to_dict(self):
-        # type: () -> Dict[str, Any]
+    def to_dict(self) -> Dict[str, Any]:
         return {"suite": self.suite, "metrics": list(self.metrics),
                 "created_at": self.created_at, "case_count": self.case_count,
                 "computed": dict((n, self.compute(n)) for n in self.pipelines()),
                 "results": dict((n, [c.to_dict() for c in cases])
                                 for n, cases in self.results.items())}
 
-    def save(self, path):
-        # type: (str) -> str
+    def save(self, path: str) -> str:
         directory = os.path.dirname(os.path.abspath(path))
         if directory:
             os.makedirs(directory, exist_ok=True)
@@ -8624,8 +8350,7 @@ class EvalReport(object):
         return path
 
     @classmethod
-    def load(cls, path):
-        # type: (str) -> EvalReport
+    def load(cls, path: str) -> EvalReport:
         with open(path, "r", encoding="utf-8") as fh:
             payload = json.load(fh)
         report = cls(suite=payload.get("suite", ""),
@@ -8665,8 +8390,7 @@ class EvalReport(object):
             self.suite, self.pipelines(), self.case_count)
 
 
-def _mean(values):
-    # type: (Sequence[float]) -> float
+def _mean(values: Sequence[float]) -> float:
     return float(sum(values)) / len(values) if values else 0.0
 
 
@@ -8687,10 +8411,10 @@ class Pipeline(object):
 
     policy: Optional[PolicyFn] = default_policy
     router: Optional[RouterFn] = default_router
-    backend: Optional[Any] = None
-    schema: Optional[Any] = None
+    backend: Optional[Union[str, TextBackend]] = None
+    schema: Optional[SchemaLike] = None
     context: str = ""
-    client: Optional[Any] = None
+    client: Optional[LLMClient] = None
     validators: List[Validator] = field(default_factory=list)
     calibrator: Optional[Calibrator] = None
     render_dpi: int = DEFAULT_DPI
@@ -8701,13 +8425,11 @@ class Pipeline(object):
     budget: Optional[float] = None
     name: str = "pipeline"
 
-    def ingest(self, source, **kwargs):
-        # type: (Any, Any) -> Document
+    def ingest(self, source: Source, **kwargs: Any) -> Document:
         return ingest(source, render_dpi=self.render_dpi, max_pages=self.max_pages,
                       **kwargs)
 
-    def run_document(self, doc):
-        # type: (Document) -> Document
+    def run_document(self, doc: Document) -> Document:
         """Preprocess, read and normalise an already-ingested document."""
         if self.split_pages:
             doc = split_document(doc)
@@ -8719,8 +8441,7 @@ class Pipeline(object):
             doc = normalize_document(doc, in_place=True)
         return doc
 
-    def run(self, source, **kwargs):
-        # type: (Any, Any) -> Extraction
+    def run(self, source: Source, **kwargs: Any) -> Extraction:
         """Run end to end and return an :class:`Extraction`.
 
         With no ``schema`` configured the result still carries the document,
@@ -8732,12 +8453,10 @@ class Pipeline(object):
         return extract(doc, self.schema, context=self.context, client=self.client,
                        validators=self.validators, calibrator=self.calibrator)
 
-    def __call__(self, source, **kwargs):
-        # type: (Any, Any) -> Extraction
+    def __call__(self, source: Source, **kwargs: Any) -> Extraction:
         return self.run(source, **kwargs)
 
-    def to_dict(self):
-        # type: () -> Dict[str, Any]
+    def to_dict(self) -> Dict[str, Any]:
         return {
             "name": self.name,
             "policy": getattr(self.policy, "__name__", str(self.policy)),
@@ -8753,9 +8472,12 @@ class Pipeline(object):
         }
 
 
-def process(source, schema=None, context="", client=None, policy=default_policy,
-            router=default_router, backend=None, validators=None, **kwargs):
-    # type: (Any, Optional[Any], str, Optional[Any], Optional[PolicyFn], Optional[RouterFn], Optional[Any], Optional[Sequence[Validator]], Any) -> Extraction
+def process(source: Source, schema: Optional[SchemaLike] = None, context: str = "",
+            client: Optional[LLMClient] = None, policy: Optional[PolicyFn] = default_policy,
+            router: Optional[RouterFn] = default_router,
+            backend: Optional[Union[str, TextBackend]] = None,
+            validators: Optional[Sequence[Validator]] = None,
+            **kwargs: Any) -> Extraction:
     """One-call convenience wrapper around :class:`Pipeline`."""
     pipeline = Pipeline(policy=policy, router=router, backend=backend, schema=schema,
                         context=context, client=client,
@@ -8776,8 +8498,7 @@ def process(source, schema=None, context="", client=None, policy=default_policy,
 #   python -m docpipe eval datasets/bills --report reports/run.json
 
 
-def _cli_caps(args):
-    # type: (Any) -> int
+def _cli_caps(args: Any) -> int:
     caps = capabilities()
     print("docpipe %s on Python %s" % (__version__, sys.version.split()[0]))
     for name in sorted(caps):
@@ -8788,8 +8509,7 @@ def _cli_caps(args):
     return 0
 
 
-def _cli_info(args):
-    # type: (Any) -> int
+def _cli_info(args: Any) -> int:
     doc = ingest(args.path, max_pages=args.max_pages, render_dpi=args.dpi)
     print("source:  %s" % doc.source_uri)
     print("pages:   %d" % len(doc.pages))
@@ -8803,8 +8523,7 @@ def _cli_info(args):
     return 0
 
 
-def _cli_quality(args):
-    # type: (Any) -> int
+def _cli_quality(args: Any) -> int:
     doc = ingest(args.path, max_pages=args.max_pages, render_dpi=args.dpi)
     measure_document(doc, max_workers=args.workers)
     for page in doc.pages:
@@ -8814,8 +8533,7 @@ def _cli_quality(args):
     return 0
 
 
-def _cli_preprocess(args):
-    # type: (Any) -> int
+def _cli_preprocess(args: Any) -> int:
     policies = {"default": default_policy, "ocr": ocr_policy, "vlm": vlm_policy,
                 "none": no_policy}
     doc = ingest(args.path, max_pages=args.max_pages, render_dpi=args.dpi)
@@ -8831,8 +8549,7 @@ def _cli_preprocess(args):
     return 0
 
 
-def _cli_read(args):
-    # type: (Any) -> int
+def _cli_read(args: Any) -> int:
     doc = ingest(args.path, max_pages=args.max_pages, render_dpi=args.dpi)
     if args.policy != "none":
         policies = {"default": default_policy, "ocr": ocr_policy, "vlm": vlm_policy}
@@ -8847,8 +8564,7 @@ def _cli_read(args):
     return 0
 
 
-def _cli_extract(args):
-    # type: (Any) -> int
+def _cli_extract(args: Any) -> int:
     with open(args.schema, "r", encoding="utf-8") as fh:
         schema = json.load(fh)
     clients = {
@@ -8865,8 +8581,7 @@ def _cli_extract(args):
     return 0 if result.is_valid else 2
 
 
-def _cli_eval(args):
-    # type: (Any) -> int
+def _cli_eval(args: Any) -> int:
     suite = EvalSuite.from_dir(args.dataset)
     with open(args.schema, "r", encoding="utf-8") as fh:
         schema = json.load(fh)
@@ -8887,8 +8602,7 @@ def _cli_eval(args):
     return 0
 
 
-def main(argv=None):
-    # type: (Optional[Sequence[str]]) -> int
+def main(argv: Optional[Sequence[str]] = None) -> int:
     """Entry point for ``python -m docpipe``."""
     import argparse
 
