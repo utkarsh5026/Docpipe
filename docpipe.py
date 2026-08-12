@@ -3464,6 +3464,9 @@ class Op(object):
         :param name: the registered name, used for history and serialisation
         :param fn: ``fn(img, page, **params) -> Optional[ImageArray]``; returning
             ``None`` means "declined, leave the raster alone"
+        :param params: keyword arguments bound now and passed to ``fn`` at every
+            application, e.g. ``{"max_angle": 10.0}``.  Copied, so the caller's
+            dict cannot change the op afterwards.
         :param geometric: True when the op changes the page's pixel dimensions, so
             that point-space geometry is recomputed afterwards
         :param needs_raster: when True the op is skipped (and says so in the
@@ -3481,6 +3484,11 @@ class Op(object):
         Timing and parameters land in the returned page's history whether or not
         the op actually changed anything, so a pipeline is reconstructable from
         its output alone.
+
+        :param page: the page to transform; it is copied, never mutated
+        :returns: a new :class:`Page`.  Identical in pixels to the input when the
+            op declined (returned ``None``) or was skipped for want of a raster --
+            but its ``history`` records the attempt either way.
         """
         out = page.copy()
         if self.needs_raster and not out.has_raster():
@@ -3499,7 +3507,12 @@ class Op(object):
         return out
 
     def then(self, other: Op) -> Op:
-        """``a.then(b)`` -- a composite that runs this op, then ``other``."""
+        """``a.then(b)`` -- a composite that runs this op, then ``other``.
+
+        :param other: the op to run second
+        :returns: a :class:`CompositeOp` of the two, equivalent to
+            ``compose(self, other)`` and chainable further
+        """
         return compose(self, other)
 
     def to_dict(self) -> Dict[str, Any]:
@@ -3552,6 +3565,24 @@ def register_op(name: str, geometric: bool = False,
     The resulting factory keeps the decorated function's signature and
     defaults, so ``deskew(max_angle=10)`` reads naturally and ``help(deskew)``
     shows the real documentation.
+
+    This is the extension point: an op registered from your own module works
+    everywhere a built-in does, including :func:`op_from_dict` round-trips, with
+    no edit to this file.
+
+    :param name: registry key, and the label recorded in ``page.history``.  Must
+        be unique -- registering an existing name replaces it, which is how you
+        override a built-in, deliberately or by accident.
+    :param geometric: ``True`` when the op moves pixels, so span and region
+        coordinates must be remapped with it.  Getting this wrong is the classic
+        silent provenance bug: the raster rotates, the boxes do not, and every
+        bbox points at the wrong place.  See :func:`Ops.deskew` for the mapping
+        pattern.
+    :param needs_raster: ``True`` (default) skips the op, recording why, on a
+        page with no raster.  Set ``False`` only for ops that work on spans or
+        metadata alone and so never touch pixels.
+    :returns: a decorator that registers the raster function and returns
+        its :class:`Op` factory
     """
     def decorator(fn: OpFn) -> OpFactory:
         """Register ``fn`` under ``name`` and return its Op factory."""
@@ -3610,13 +3641,22 @@ class CompositeOp(Op):
     __slots__ = ("ops",)
 
     def __init__(self, ops: Sequence[Op]) -> None:
-        """Wrap an ordered sequence of ops as a single op."""
+        """Wrap an ordered sequence of ops as a single op.
+
+        :param ops: the member ops, applied in this order.  Kept on ``.ops`` so
+            they stay reachable for inspection and serialisation.
+        """
         Op.__init__(self, "compose", lambda img, page: img,
                     {"ops": [o.name for o in ops]}, needs_raster=False)
         self.ops = list(ops)
 
     def __call__(self, page: Page) -> Page:
-        """Run every op in order, threading the page through."""
+        """Run every op in order, threading the page through.
+
+        :param page: the starting page; it is not mutated
+        :returns: the page after every member op, carrying one ``history`` entry
+            per op rather than a single entry for the composite
+        """
         out = page
         for op in self.ops:
             out = op(out)
@@ -3632,7 +3672,18 @@ class CompositeOp(Op):
 
 
 def op_from_dict(d: Mapping[str, Any]) -> Op:
-    """Rebuild an op (or a composite) from its serialised form."""
+    """Rebuild an op (or a composite) from its serialised form.
+
+    The inverse of :meth:`Op.to_dict`, which is what lets a policy be recorded in
+    an eval report and replayed later against a new build.
+
+    :param d: ``{"op": name, "params": {...}}``, or ``{"op": "compose", "ops":
+        [...]}`` for a composite.  Rebuilt recursively.
+    :returns: an :class:`Op`, or a :class:`CompositeOp` for a ``"compose"`` entry
+    :raises ConfigError: the name is not in :data:`OP_FACTORIES`; the message
+        lists what is registered, since the usual cause is a custom op whose
+        module has not been imported yet
+    """
     name = d.get("op")
     if name == "compose":
         return CompositeOp([op_from_dict(o) for o in d.get("ops", [])])
@@ -3644,7 +3695,13 @@ def op_from_dict(d: Mapping[str, Any]) -> Op:
 
 
 def apply_ops(page: Page, ops: Sequence[Op]) -> Page:
-    """Apply ops in order, returning a new page."""
+    """Apply ops in order, returning a new page.
+
+    :param page: the starting page; it is not mutated
+    :param ops: ops to run in sequence, as built by the :class:`Ops` factories.
+        An empty sequence returns the page unchanged.
+    :returns: the page after every op, with one ``history`` entry per op
+    """
     out = page
     for op in ops:
         out = op(out)
@@ -3663,6 +3720,19 @@ class Ops(object):
 
     Registering a new op does not require editing this class:
     :func:`register_op` adds to :data:`OP_FACTORIES` from anywhere.
+
+    **Reading these signatures.**  Each is shown as ``fn(img, page, **knobs)``,
+    which is how the raster function is written -- but :func:`register_op` strips
+    the first two, so what you call is the knobs alone.  ``img`` and ``page`` are
+    supplied by the machinery when the op runs::
+
+        op = deskew(min_angle=0.5)   # build: only the knobs
+        page = op(page)              # apply: img and page threaded in for you
+
+    Every ``:param:`` documented below is therefore a keyword you may pass at
+    build time.  Ops apply lazily in this sense: nothing is rasterised until the
+    op runs, and an op that returns ``None`` leaves the page's pixels untouched
+    while still recording the decision in ``page.history``.
     """
 
     @staticmethod
@@ -3684,6 +3754,14 @@ class Ops(object):
         Every downstream measurement assumes dark ink on light paper; a negative
         page reports 90% ink coverage and gets classified unreadable, when in fact
         it just needs one subtraction.
+
+        :param ink_threshold: inked fraction above which the page is judged to be
+            a negative, in ``0.0..1.0``.  The default ``0.55`` sits well above any
+            real document -- dense Devanagari body text reaches about ``0.25``, a
+            solid-black form header about ``0.4`` -- so this fires on true
+            negatives and not on merely heavy pages.  Lower it towards ``0.45``
+            only if you have genuinely ink-saturated scans; below that you will
+            start inverting healthy pages.
         """
         np = _np()
         gray = to_gray(img)
@@ -3700,6 +3778,17 @@ class Ops(object):
 
         Percentile-based so that a punch hole or a black scan border does not eat
         the entire dynamic range, which is what naive min/max stretching does.
+
+        :param low_pct: percentile mapped to black, in ``0.0..100.0``.  ``1.0``
+            discards the darkest 1% of pixels -- enough to absorb punch holes,
+            staple shadows and a thin scan border.  ``0.0`` is exact min/max
+            stretching and is what you want only on synthetic images.
+        :param high_pct: percentile mapped to white, in ``0.0..100.0``.  ``99.0``
+            pairs with the default ``low_pct``; widen to ``0.5``/``99.5`` for a
+            gentler stretch on pages that are already close to full range.
+        :returns: ``None`` when the two percentiles are within one grey level of
+            each other -- a blank or already-saturated page, where stretching
+            would only amplify noise.
         """
         np = _np()
         gray = to_gray(img)
@@ -3714,7 +3803,18 @@ class Ops(object):
     @staticmethod
     @register_op("gamma")
     def gamma(img: ImageArray, page: Page, value: float = 1.0) -> Optional[ImageArray]:
-        """Apply gamma correction.  ``value < 1`` brightens, ``> 1`` darkens."""
+        """Apply gamma correction.  ``value < 1`` brightens, ``> 1`` darkens.
+
+        Non-linear, unlike :func:`Ops.autocontrast`: it moves the midtones while
+        leaving true black and true white fixed, which is what recovers faint
+        pencil or carbon-copy strokes without blowing out the paper.
+
+        :param value: gamma exponent, practically ``0.4..2.5``.  ``0.6`` lifts
+            faint grey strokes on an underexposed phone photo; ``1.4`` deepens
+            washed-out thermal-printer output; ``1.0`` is identity and returns
+            ``None`` so a no-op costs nothing.
+        :returns: ``None`` when ``value`` is 1.0 within tolerance
+        """
         np = _np()
         if abs(value - 1.0) < 1e-6:
             return None
@@ -3730,6 +3830,16 @@ class Ops(object):
         The right tool for a page that is faded in one corner and fine elsewhere --
         a global stretch cannot fix that by construction.  Falls back to
         :func:`Ops.autocontrast` without OpenCV.
+
+        :param clip: contrast ceiling per tile.  ``2.0`` is the usual document
+            setting; ``1.0`` is nearly a no-op, and above ``4.0`` the noise in
+            blank paper is amplified into visible grain that OCR reads as specks.
+        :param grid: tile count along each axis, so ``8`` means an 8x8 grid.
+            Fewer, larger tiles (``4``) approach a global stretch; more, smaller
+            tiles (``16``) track tighter lighting gradients but start equalising
+            *within* a glyph, which thins strokes.
+        :returns: the equalised greyscale page; never ``None``, since the caller
+            has already decided the page needs it
         """
         cv = _cv2()
         gray = to_gray(img)
@@ -3748,6 +3858,18 @@ class Ops(object):
         This is the fix for phone photos and book scans with a shadow gradient.
         Doing it *before* binarisation is what lets a global threshold work at all;
         skipping it is why so many pipelines lose the shadowed third of a page.
+
+        :param radius: background-estimation window in pixels; ``None`` derives one
+            from the page size, which is right unless your text is unusually large.
+            The window must be comfortably wider than a glyph -- set it near a
+            character width and the estimator treats the text itself as background
+            and erases it.
+        :param strength: how far to move towards the flattened result, in
+            ``0.0..1.0``.  ``1.0`` applies it fully, whereas the gentler
+            vlm policy uses ``0.7`` -- vision models read the greyscale
+            gradient, and a fully flattened page discards the very cue that
+            distinguishes a faint stroke from paper.  See the
+            gentler :func:`Policies.vlm_policy`.
         """
         np = _np()
         gray = to_gray(img)
@@ -3766,6 +3888,15 @@ class Ops(object):
         The classic recipe: dilating with a mid-sized kernel removes text, the
         median then removes residual structure, and the difference is the page
         without its shadow.
+
+        Overlaps with :func:`Ops.normalize_illumination`; prefer that one for a
+        smooth lighting gradient and this one for a hard-edged cast shadow, such
+        as the photographer's hand or the spine shadow of an open book.
+
+        :param radius: dilation and median kernel in pixels, forced odd.  It must
+            exceed the thickest stroke on the page or the text survives dilation
+            and is subtracted away with the shadow.  ``21`` suits 300 DPI body
+            text; raise towards ``41`` at 600 DPI or for large print.
         """
         np = _np()
         gray = to_gray(img)
@@ -3787,6 +3918,15 @@ class Ops(object):
 
         Point-space coordinates are unaffected because DPI scales with the pixels;
         that invariant is what keeps every previously-extracted bbox valid.
+
+        :param factor: linear scale.  ``2.0`` doubles each side and quadruples the
+            pixel count; ``0.5`` halves it.  ``1.0`` returns ``None``.
+        :param interpolation: ``"auto"`` picks by direction -- cubic when
+            enlarging, area when shrinking, which is the pairing that avoids
+            both softness and aliasing.  Override with ``"nearest"`` (preserves
+            hard edges on already-binarised pages), ``"linear"``, ``"cubic"``,
+            or ``"area"``.
+        :returns: ``None`` when ``factor`` is 1.0 within tolerance
         """
         if abs(factor - 1.0) < 1e-6:
             return None
@@ -3806,6 +3946,20 @@ class Ops(object):
         on smaller input, so the resample buys real recall even though it buys no
         new signal.  The cap exists because beyond ~400 DPI you pay quadratically
         in pixels for nothing.
+
+        Measures against ``page.quality.effective_dpi`` -- the resolution the text
+        *actually* carries -- not the nominal raster DPI, so a 600 DPI upscan of a
+        150 DPI fax is correctly seen as still needing help.
+
+        :param min_dpi: floor to reach.  ``300`` is where Tesseract and PaddleOCR
+            are trained; ``400`` measurably helps on small print and Indic scripts.
+        :param max_dpi: ceiling that overrides ``min_dpi`` when honouring it would
+            produce an unreasonably large raster.  ``600`` is already past the
+            point of accuracy returns.
+        :param interpolation: as :func:`Ops.rescale`; ``"auto"`` resolves to cubic
+            here, since this op only ever enlarges.
+        :returns: ``None`` when the page is already at or above ``min_dpi``, or
+            when the cap leaves no room to scale
         """
         current = page.quality.effective_dpi or page.raster_dpi or DEFAULT_IMAGE_DPI
         if current >= min_dpi:
@@ -3827,7 +3981,21 @@ class Ops(object):
                         interpolation: str = "area") -> Optional[ImageArray]:
         """Cap the longest side.  Vision-model cost is ~linear in pixels, and most
         providers downscale above ~1500px anyway -- paying to upload pixels the
-        provider will discard is pure waste."""
+        provider will discard is pure waste.
+
+        The counterpart to :func:`Ops.ensure_dpi`: that one raises resolution for
+        classical OCR, this one caps it for a VLM.  Running both is normal --
+        they clamp opposite ends.
+
+        :param max_px: ceiling for the longer side, in pixels.  ``2000`` is what
+            the vlm policy uses, comfortably above every major provider's
+            internal downscale; ``1500`` matches it more tightly and costs less;
+            below ~1000 small print stops being legible to the model.
+        :param interpolation: ``"area"`` by default, which is the correct filter
+            for downscaling -- it averages the discarded pixels instead of point
+            sampling, so thin strokes fade rather than disappear.
+        :returns: ``None`` when the page is already within ``max_px``
+        """
         h, w = image_shape(img)
         longest = max(h, w)
         if longest <= max_px:
@@ -3850,6 +4018,25 @@ class Ops(object):
         problem, handled by :func:`Ops.auto_orient`.
 
         Existing span coordinates are rotated with the image rather than discarded.
+
+        :param max_angle: refuse to correct beyond this many degrees.  A larger
+            reading almost always means the detector locked onto a table rule or
+            a page edge rather than the text baselines, and acting on it would
+            wreck a page that was fine.
+        :param min_angle: skip below this many degrees, since resampling costs
+            sharpness that 0.2 degrees of skew does not.  ``0.4`` is the default;
+            drop to ``0.2`` only if downstream is a classical OCR engine, which
+            is far more skew-sensitive than a VLM.
+        :param method: skew estimator -- ``"auto"`` (projection profile, then Hough
+            if OpenCV is present), ``"projection"``, or ``"hough"``.  Projection is
+            more robust on dense text; Hough does better on sparse forms with
+            strong rules.
+        :param angle: bypass detection and rotate by exactly this many degrees.
+            Use when you already know the skew, e.g. from a calibration target or
+            a previous page of the same batch.  Still subject to ``min_angle`` and
+            ``max_angle``.
+        :returns: ``None`` when the measured skew falls outside
+            ``[min_angle, max_angle]`` -- the page is left untouched
         """
         detected = float(angle) if angle is not None else page.quality.skew_deg
         if angle is None and abs(detected) < 1e-9:
@@ -3882,7 +4069,17 @@ class Ops(object):
     @staticmethod
     @register_op("rotate", geometric=True)
     def rotate(img: ImageArray, page: Page, degrees: int = 0) -> Optional[ImageArray]:
-        """Rotate by an exact multiple of 90 degrees (lossless)."""
+        """Rotate by an exact multiple of 90 degrees (lossless).
+
+        Quarter-turns resample nothing, so unlike :func:`Ops.deskew` this costs no
+        sharpness and needs no threshold.  Span coordinates turn with the page.
+
+        :param degrees: clockwise rotation, rounded to the nearest multiple of 90
+            and taken modulo 360.  ``90``, ``180``, ``270`` are the useful values;
+            ``-90`` is accepted and means the same as ``270``.  ``0`` returns
+            ``None``.
+        :returns: ``None`` when the rotation is a whole number of full turns
+        """
         np = _np()
         turns = int(round(degrees / 90.0)) % 4
         if turns == 0:
@@ -3915,6 +4112,18 @@ class Ops(object):
         text.  Without it we fall back to a projection-profile test, which reliably
         distinguishes portrait from landscape text but **cannot** detect a 180-degree
         flip -- that limitation is reported in the page history rather than hidden.
+
+        :param use_osd: allow the Tesseract OSD path when the binary or
+            ``pytesseract`` is importable.  Set ``False`` to force the projection
+            fallback -- worth doing when OSD is present but unreliable, which it
+            is on sparse forms and on scripts it was not trained for.
+        :param min_confidence: least OSD confidence to act on.  Tesseract reports
+            roughly ``0.5..5.0`` here, and its low-confidence guesses on sparse
+            pages are close to coin flips; ``1.0`` rejects those.  Raise to
+            ``2.0`` if you would rather leave a page unrotated than risk a wrong
+            quarter-turn.
+        :returns: ``None`` when the page is already upright, or when the page has
+            too little ink to judge
         """
         np = _np()
         rotation = None
@@ -3946,6 +4155,19 @@ class Ops(object):
         Guarded by ``min_keep``: if the detected content occupies less than that
         fraction of the page, the detection is more likely to have locked onto a
         speck of dust than onto the content, and the crop is refused.
+
+        :param margin_pt: whitespace to keep around the content, in typographic
+            points (1/72 inch), so it means the same thing at any DPI.  ``6.0``
+            is roughly a line of leading.  Do not drop to ``0`` -- OCR layout
+            analysis degrades when glyphs touch the edge, which is precisely
+            what :func:`Ops.pad` exists to prevent.
+        :param min_keep: least fraction of the original area the crop may keep,
+            in ``0.0..1.0``.  At ``0.25`` a crop discarding more than three
+            quarters of the page is refused and the reason recorded in
+            ``page.meta["crop_refused"]``.  Lower it only for documents that
+            genuinely are a receipt on a big scan bed.
+        :returns: ``None`` when the page is blank, when the crop would be a no-op,
+            or when ``min_keep`` refuses it
         """
         np = _np()
         gray = to_gray(img)
@@ -3979,6 +4201,18 @@ class Ops(object):
 
         Those frames wreck contrast measurement and ink coverage, and Tesseract
         frequently reads them as a column of punctuation.
+
+        Trims only inward from the four edges, so unlike :func:`Ops.crop_to_content`
+        it cannot cut into the page when content reaches the margin.
+
+        :param max_frac: most of each dimension the trim may eat, in ``0.0..1.0``.
+            ``0.08`` allows an 8% frame, which covers the usual lid-open border
+            while making it impossible to consume a dark but legitimate header.
+        :param dark_threshold: mean grey level, ``0..255``, below which a row or
+            column counts as frame.  ``90`` clears true scanner black (near ``0``)
+            with margin to spare; raise towards ``120`` for a grey plastic lid,
+            but not so far that a dense text row qualifies.
+        :returns: ``None`` when no edge rows or columns are dark enough to trim
         """
         np = _np()
         gray = to_gray(img)
@@ -4011,7 +4245,20 @@ class Ops(object):
     def pad(img: ImageArray, page: Page, margin_px: int = 16,
             value: int = 255) -> Optional[ImageArray]:
         """Add a quiet margin.  Tesseract's layout analysis degrades noticeably
-        when glyphs touch the image edge."""
+        when glyphs touch the image edge.
+
+        The usual last step of an OCR policy, after cropping and binarisation have
+        both had the chance to leave text flush against the border.
+
+        :param margin_px: border width in pixels, applied to all four sides.
+            ``16`` is enough for Tesseract at 300 DPI; scale it with your DPI if
+            you render higher.  ``0`` or negative returns ``None``.
+        :param value: fill level, ``0..255``.  ``255`` (white) is right for a
+            normal page; use ``0`` after :func:`Ops.invert_if_dark` has left you
+            with light ink on dark paper, so the margin matches the paper rather
+            than framing it.
+        :returns: ``None`` when ``margin_px`` is not positive
+        """
         np = _np()
         m = int(margin_px)
         if m <= 0:
@@ -4031,6 +4278,19 @@ class Ops(object):
         Only fires when a convincing four-sided contour covering most of the frame
         is found, because warping on a bad quad is far worse than not warping:
         it shears the text irrecoverably.  Requires OpenCV.
+
+        :param min_area_ratio: least fraction of the frame the detected quad must
+            cover, in ``0.0..1.0``.  ``0.35`` rejects the small quadrilaterals that
+            table borders and photo frames produce.  Raise towards ``0.6`` when
+            every photo is known to be page-filling; lowering it is how you get
+            a page warped to the shape of a table.
+        :param epsilon_frac: contour simplification tolerance as a fraction of the
+            perimeter.  ``0.02`` is the standard value that collapses a slightly
+            wavy page outline to four corners; too small and the contour keeps
+            more than four vertices and is rejected, too large and unrelated
+            shapes collapse into plausible-looking quads.
+        :returns: ``None`` when OpenCV is missing, or when no quad passes both
+            guards -- an unwarped page beats a sheared one
         """
         np = _np()
         cv = _cv2()
@@ -4082,6 +4342,19 @@ class Ops(object):
         preserving stroke edges -- ordinary Gaussian blur removes noise and glyph
         detail in equal measure, which is why "denoise then OCR" so often scores
         *worse* than doing nothing.
+
+        :param strength: one of ``"light"``, ``"medium"``, ``"aggressive"``.
+            ``"light"`` is the only safe default: each step up also erodes
+            diacritics, Devanagari matras and thin CJK strokes, so
+            ``"aggressive"`` is for genuinely filthy fax output and nothing else.
+        :param method: ``"auto"`` (bilateral with OpenCV, median without),
+            ``"bilateral"``, ``"nlmeans"``, ``"median"``, or ``"gaussian"``.
+            ``"nlmeans"`` is the highest quality and by far the slowest;
+            ``"gaussian"`` is the one to avoid, since it blurs strokes and noise
+            alike.  ``"bilateral"`` and ``"nlmeans"`` fall through to a
+            non-OpenCV path when OpenCV is missing.
+        :raises ConfigError: ``strength`` or ``method`` is not one of the above --
+            a typo here silently disabling denoising would be worse
         """
         np = _np()
         levels = {"light": 1, "medium": 2, "aggressive": 3}
@@ -4111,6 +4384,15 @@ class Ops(object):
 
         Dust, fax speckle and JPEG mosquito noise become spurious punctuation
         otherwise -- which then poisons amount parsing (``1.234`` vs ``1,234``).
+
+        :param min_area_px: connected ink components smaller than this many pixels
+            are painted back to the local paper colour.  ``6`` is tuned for 300
+            DPI, where a full stop covers roughly 12-20 pixels -- so the default
+            leaves real punctuation alone.  Scale it with the square of your DPI
+            (about ``24`` at 600 DPI); leave it low if the script carries small
+            marks, since Devanagari matras and Arabic dots are legitimately tiny.
+        :returns: ``None`` when the page has no ink, or nothing is small enough
+            to remove
         """
         np = _np()
         gray = to_gray(img)
@@ -4146,6 +4428,20 @@ class Ops(object):
         The one operation that genuinely recovers readability on soft scans.
         ``threshold`` suppresses sharpening of low-contrast areas so that paper
         grain is not amplified along with the strokes.
+
+        :param amount: how much of the high-frequency difference to add back.
+            ``1.0`` is a normal correction, and ``1.2`` is what the default
+            policy applies to a page measured as blurred.  Past about ``2.0``
+            strokes gain white halos that OCR segments as extra characters --
+            oversharpening reads worse than the soft original.
+        :param radius: Gaussian radius in pixels defining "detail".  ``2.0`` suits
+            300 DPI body text; raise it for large print, lower it towards ``1.0``
+            for dense small type, where a wide radius sharpens the gaps between
+            glyphs rather than the glyphs.
+        :param threshold: least absolute difference, ``0..255``, that gets
+            sharpened at all.  ``0`` sharpens everything including paper grain;
+            ``5``-``10`` leaves flat paper alone and is worth setting on any noisy
+            scan.
         """
         np = _np()
         base = to_gray(img) if not is_color(img) else np.asarray(img)
@@ -4160,7 +4456,28 @@ class Ops(object):
     def morphology(img: ImageArray, page: Page, operation: str = "open", ksize: int = 3,
                    iterations: int = 1) -> Optional[ImageArray]:
         """Grayscale morphology.  ``close`` fills broken strokes in faded thermal
-        print; ``open`` thins bleed-through from the reverse side."""
+        print; ``open`` thins bleed-through from the reverse side.
+
+        Named from the point of view of the *ink*, not the pixel values.  Because
+        ink is dark, an OCR-sense "dilate the text" is a greyscale erosion, and
+        this op flips the operation for you -- so ``"dilate"`` thickens strokes,
+        as the name suggests.
+
+        :param operation: one of ``"open"``, ``"close"``, ``"erode"``,
+            ``"dilate"``, ``"tophat"``, ``"blackhat"``.  Use ``"close"`` for
+            broken strokes, ``"open"`` for speckle and show-through,
+            ``"dilate"`` to thicken hairline print before OCR, and ``"tophat"``
+            to pull small bright detail off an uneven background.  Without
+            OpenCV only the first four are meaningful, as the fallback runs on a
+            binary ink mask.
+        :param ksize: structuring element side in pixels, forced odd.  ``3`` is a
+            one-pixel nudge; ``5`` and ``7`` act fast, and anything larger tends
+            to merge adjacent glyphs into blobs.
+        :param iterations: how many times to apply it.  Two passes of ``3`` are
+            gentler and more controllable than one pass of ``5``.
+        :raises ConfigError: ``operation`` is not one of the six listed (OpenCV
+            path only)
+        """
         np = _np()
         gray = to_gray(img)
         cv = _cv2()
@@ -4224,6 +4541,27 @@ class Ops(object):
         methods need no such guard: Sauvola's ``(s/R - 1)`` term, Wolf's
         normalisation and NICK's ``sqrt(var + m^2)`` all drive the threshold well
         below the mean when deviation vanishes.
+
+        :param gray: the page as a greyscale array; colour input is converted
+        :param method: one of ``"otsu"``, ``"adaptive"``, ``"sauvola"``,
+            ``"niblack"``, ``"wolf"``, ``"nick"``, ``"bradley"``, each described
+            above.  ``"sauvola"`` is the default because it degrades most
+            gracefully across the widest range of real scans.
+        :param window: local window side in pixels, forced odd, minimum ``3``.
+            ``31`` suits 300 DPI body text; use ``51``-``61`` at 600 DPI.  Ignored
+            by ``"otsu"``, which is global.
+        :param k: method-specific sensitivity; ``None`` selects the published
+            default for the chosen method -- ``0.2`` for Sauvola, ``-0.2`` for
+            Niblack, ``0.5`` for Wolf, ``-0.14`` for NICK, ``0.15`` for Bradley.
+            Raising Sauvola's ``k`` keeps less faint ink; lowering it keeps more
+            background.  Ignored by ``"otsu"`` and ``"adaptive"``.
+        :param offset: grey levels subtracted from the local mean.  Used only by
+            ``"adaptive"``, where ``10`` is a mild bias towards keeping ink.
+        :param min_std: local deviation below which ``"niblack"`` falls back to
+            the global Otsu threshold.  Guards Niblack, and only Niblack, against
+            turning blank paper black.
+        :returns: an array of the same shape holding only ``0`` and ``255``
+        :raises ConfigError: ``method`` is not one of the seven listed
         """
         np = _np()
         g = to_gray(gray).astype(np.float64)
@@ -4274,6 +4612,17 @@ class Ops(object):
         accuracy, because VLMs use greyscale gradient to disambiguate faint strokes
         that a threshold has already destroyed.  Apply it in an OCR-bound branch
         only -- see :func:`Policies.ocr_policy` versus :func:`Policies.vlm_policy`.
+
+        The op wrapper around :func:`Ops.binarize_array`; every parameter has the
+        same meaning and defaults there, where each method is described in full.
+
+        :param method: ``"sauvola"`` (default), ``"otsu"``, ``"adaptive"``,
+            ``"niblack"``, ``"wolf"``, ``"nick"``, or ``"bradley"``
+        :param window: local window side in pixels, forced odd; ``31`` at 300 DPI
+        :param k: method sensitivity; ``None`` takes each method's published default
+        :param offset: grey levels below the local mean, ``"adaptive"`` only
+        :param min_std: flat-region guard for ``"niblack"`` only
+        :raises ConfigError: ``method`` is not one of the seven listed
         """
         return binarize_array(img, method=method, window=window, k=k, offset=offset,
                               min_std=min_std)
@@ -4290,6 +4639,24 @@ class Ops(object):
         and buys a lot on the ruled tables that dominate hospital bills.
         ``keep_text`` restores pixels where a line crossed a glyph, so struck-through
         or underlined text is not punched full of holes.
+
+        :param direction: ``"both"``, ``"horizontal"``, or ``"vertical"``.  Use
+            ``"horizontal"`` alone on statements ruled only between rows, which
+            avoids mistaking a tall bracket or a devanagari shirorekha stem for a
+            vertical rule.
+        :param min_len_ratio: least run length for a line to count, as a fraction
+            of the page dimension, in ``0.0..1.0``.  ``0.4`` means a horizontal
+            rule must span 40% of the width.  Lower it towards ``0.25`` for
+            narrow-column tables; raising it protects underlines from removal.
+        :param thickness: dilation in pixels applied to the detected run, so that
+            the anti-aliased edges of a rule are erased along with its core.
+            ``2`` suits 300 DPI; ``3``-``4`` for heavier print or higher DPI.
+        :param keep_text: restore pixels that also look like glyph, so a rule
+            crossing a digit does not punch a hole in it.  Leave this ``True``
+            unless you are removing rules from a page with no text on them.
+        :returns: ``None`` when the page has no ink, or no run is long enough to
+            count as a rule
+        :raises ConfigError: ``direction`` is not one of the three listed
         """
         np = _np()
         if direction not in ("both", "horizontal", "vertical"):
@@ -4334,6 +4701,24 @@ class Ops(object):
         coloured is an overlay.  ``coverage_max`` aborts the removal on genuinely
         colourful documents (a colour brochure) where the premise does not hold.
         Requires a colour raster; on grayscale input this is a no-op.
+
+        Order matters: run this *before* :func:`Ops.to_grayscale`, which throws
+        away the hue this op detects with.
+
+        :param saturation_min: least HSV saturation, ``0..255``, for a pixel to
+            count as coloured.  ``70`` clears black and grey toner, which sit near
+            ``0``, while catching blue and purple ink.  Lower it towards ``50``
+            for faded stamps, at the risk of eating colour-tinted paper.
+        :param value_min: least HSV value (brightness), ``0..255``.  ``40``
+            excludes near-black pixels whose hue is meaningless noise -- without
+            it, dark toner gets classified by whatever hue the sensor guessed.
+        :param coverage_max: abort if more than this fraction of the page is
+            coloured, in ``0.0..1.0``.  At ``0.25`` a colour brochure or a
+            coloured-paper form is left alone, because there the premise "colour
+            means overlay" is simply false.  The reason lands in
+            ``page.meta["remove_stamps"]``.
+        :returns: ``None`` on greyscale input, when nothing is coloured, or when
+            ``coverage_max`` aborts the removal
         """
         np = _np()
         if not is_color(img):
@@ -4379,6 +4764,31 @@ class Ops(object):
         Returns ``[page]`` unchanged when no confident split is found -- a false
         split is much more damaging than a missed one, so the thresholds are
         deliberately conservative.
+
+        Not an :class:`Op`: ops map one page to one page, and this changes the
+        page count.  Reach for it through ``Pipeline(split_pages=True)``, or apply
+        it document-wide with :func:`Ops.split_document`.
+
+        :param page: a page with a raster; a page without one is returned as-is
+        :param axis: ``"auto"``, ``"vertical"``, or ``"horizontal"``.  ``"auto"``
+            prefers whichever axis yields more gutters, which handles both
+            side-by-side and stacked layouts.  Name the axis when you know it --
+            forcing ``"vertical"`` on side-by-side bills stops a wide gap between
+            table sections being read as a horizontal split.
+        :param min_gap_frac: least whitespace-gutter width for a split, as a
+            fraction of the page dimension, in ``0.0..1.0``.  ``0.06`` is about
+            half an inch on A4.  Raise it if inter-column spacing is being read
+            as a document boundary.
+        :param max_parts: refuse the split entirely if it would produce more than
+            this many pages.  ``3`` reflects what fits on a sheet; a result of
+            eight parts means the detector found text columns, not documents.
+        :param min_part_frac: least fraction of the page each part must occupy,
+            in ``0.0..1.0``.  At ``0.2`` a cut near the edge -- a margin note, a
+            punch-hole strip -- cannot become its own document.
+        :returns: one page per detected document, each with ``split_from`` and
+            ``split_part`` in ``page.meta`` and spans remapped into its own
+            coordinate space; or ``[page]`` when no confident split was found
+        :raises ConfigError: ``axis`` is not one of the three listed
         """
         np = _np()
         if not page.has_raster():
@@ -4449,7 +4859,18 @@ class Ops(object):
 
     @staticmethod
     def split_document(doc: Document, **kwargs: Any) -> Document:
-        """Apply :func:`Ops.split_multi_bill_page` across a document, renumbering pages."""
+        """Apply :func:`Ops.split_multi_bill_page` across a document, renumbering pages.
+
+        Renumbering matters: every span's ``bbox.page`` and every provenance
+        reference is keyed by page index, so the new pages are reindexed
+        contiguously rather than inheriting the index they were split from.
+
+        :param doc: the document to split; it is not mutated
+        :param kwargs: forwarded per page to :func:`Ops.split_multi_bill_page` --
+            ``axis``, ``min_gap_frac``, ``max_parts``, ``min_part_frac``
+        :returns: a new :class:`Document` whose pages are numbered from ``0``;
+            pages that did not split carry through unchanged
+        """
         out = Document(source_uri=doc.source_uri, meta=dict(doc.meta),
                        warnings=list(doc.warnings))
         index = 0
@@ -4558,6 +4979,21 @@ class Policies(object):
         audit.  Every branch here corresponds to a measured degradation; there is
         no unconditional step, because a clean 400 DPI native render needs nothing
         done to it and every op applied to it can only remove signal.
+
+        Reader-agnostic by design, which is why it omits binarisation -- that
+        helps classical OCR and hurts VLMs, so it belongs in
+        :func:`Policies.ocr_policy`, not here.
+
+        :param page: a page whose quality :func:`Quality.measure_page` has
+            already filled in.  On an unmeasured page every reading is zero and
+            this returns an empty list.
+        :param thresholds: the cut-offs each branch compares against; ``None``
+            uses :data:`DEFAULT_THRESHOLDS`.  Pass a
+            modified :class:`QualityThresholds` to retune the whole policy
+            without rewriting it -- e.g. ``dataclasses.replace(
+            DEFAULT_THRESHOLDS, min_dpi=400)`` to upsample more eagerly.
+        :returns: the ops this page warrants, in application order; empty for a
+            page that needs nothing
         """
         th = thresholds or DEFAULT_THRESHOLDS
         q = page.quality
@@ -4587,6 +5023,21 @@ class Policies(object):
         Everything :func:`Policies.default_policy` does, plus the steps that only make sense
         when a threshold-based recogniser is downstream: line removal, ruled-form
         cleanup, and binarisation.
+
+        Line removal is conditional on the page looking tabular, but greyscale
+        conversion, binarisation, despeckling and padding are unconditional --
+        every classical engine wants them, so there is no measurement to gate on.
+
+        :param page: a page whose quality has been measured
+        :param thresholds: as :func:`Policies.default_policy`; ``None``
+            uses :data:`DEFAULT_THRESHOLDS`
+        :param binarization: method passed to :func:`Ops.binarize` -- ``"sauvola"``
+            (default), ``"otsu"``, ``"adaptive"``, ``"niblack"``, ``"wolf"``,
+            ``"nick"``, or ``"bradley"``.  Try ``"otsu"`` on evenly-lit laser
+            print, where it is faster and marginally cleaner; stay on
+            ``"sauvola"`` for anything photographed or faded.
+        :returns: the ops for this page, ending with the binarise-despeckle-pad
+            sequence that classical OCR expects
         """
         ops = default_policy(page, thresholds)
         ops.append(to_grayscale())
@@ -4607,6 +5058,21 @@ class Policies(object):
         diacritics and thin Devanagari strokes), and a hard pixel cap because cost
         scales with image size while accuracy stops improving well before the
         provider's limit.
+
+        Its skew tolerance is also twice :func:`Policies.default_policy`'s, since
+        vision models read moderately tilted text without help and the resampling
+        would cost more sharpness than the tilt costs accuracy.
+
+        :param page: a page whose quality has been measured
+        :param thresholds: as :func:`Policies.default_policy`; ``None``
+            uses :data:`DEFAULT_THRESHOLDS`.  Note the skew branch here
+            compares against *twice* ``skew_correct_deg``.
+        :param max_side: pixel cap for the longer side, handed
+            to :func:`Ops.resize_max_side`.  ``2000`` is comfortably above every
+            major provider's internal downscale; ``1500`` cuts cost with no
+            measurable accuracy loss on ordinary print.
+        :returns: a short op list -- often empty for a clean page, which is the
+            intended behaviour
         """
         th = thresholds or DEFAULT_THRESHOLDS
         q = page.quality
@@ -4626,12 +5092,31 @@ class Policies(object):
 
     @staticmethod
     def no_policy(page: Page) -> List[Op]:
-        """Apply nothing.  Useful as an eval baseline."""
+        """Apply nothing.  Useful as an eval baseline.
+
+        Distinct from ``policy=None`` in intent only -- both skip preprocessing.
+        Use this one when you want a *named* policy in the eval report, so the
+        baseline row reads ``no_policy`` rather than ``None``.
+
+        :param page: ignored; the signature exists to satisfy ``PolicyFn``
+        :returns: always an empty list
+        """
         return []
 
     @staticmethod
     def fixed_policy(*ops: Op) -> PolicyFn:
-        """Turn a fixed op list into a policy, for A/B against adaptive ones."""
+        """Turn a fixed op list into a policy, for A/B against adaptive ones.
+
+        The honest way to test the library's central claim.  Pit a fixed sequence
+        against :func:`Policies.default_policy` in an :class:`EvalSuite` and see
+        whether adapting to measured quality actually wins on your documents::
+
+            fixed = fixed_policy(deskew(), binarize(), despeckle())
+
+        :param ops: the ops to apply to every page, in order.  A fresh copy of
+            the list is returned per page, so callers cannot mutate it.
+        :returns: a ``PolicyFn`` ignoring page quality entirely
+        """
         def policy(page: Page) -> List[Op]:
             """Return the same op list for every page."""
             return list(ops)
@@ -4656,13 +5141,42 @@ def preprocess(doc: Document, policy: Optional[PolicyFn] = default_policy,
                in_place: bool = False) -> Document:
     """Measure and correct every page in a document.
 
-    :param policy: called per page to choose ops (ignored when ``ops`` is given)
-    :param ops: a fixed op list applied to every page
-    :param measure: measure quality first -- required for an adaptive policy
-    :param in_place: mutate ``doc`` instead of returning a processed copy
+    Layer 2 in one call: measure each page, ask the policy what that page needs,
+    apply it, then re-measure so downstream routing and the confidence prior see
+    the page as it will actually be read.
 
-    Returns a Document.  Pages that carry no raster (an email body, a
-    native-text page that never rendered) pass through untouched.
+    :param doc: an ingested document.  Rasters are pulled lazily per page, so a
+        300-page bundle is not materialised all at once.
+    :param policy: called per page to choose ops.  Defaults
+        to :func:`default_policy`; also :func:`Policies.ocr_policy`, or
+        else :func:`Policies.vlm_policy`, or any ``Callable[[Page], List[Op]]``.
+        Ignored when ``ops`` is given, and ``None`` means apply nothing.
+    :param ops: a fixed op list applied to every page, bypassing the policy
+        entirely.  For debugging and ablations -- ``ops=[deskew(), binarize()]``
+        -- not for production, where a fixed sequence destroys signal on the
+        pages that did not need it.
+    :param dpi: override the DPI assumed when measuring, for images whose
+        metadata lies or is missing.  ``None`` trusts ``page.raster_dpi``.
+    :param max_workers: threads for per-page work.  ``0`` runs serially, which is
+        what you want while debugging, since op errors then surface in order.
+        The ops are IO- and NumPy-bound, so threads do help despite the GIL.
+    :param measure: measure quality before choosing ops.  Required for any
+        adaptive policy -- with ``False`` every reading stays zero, and
+        so :func:`default_policy` sees a perfect page and picks nothing.  Set
+        it ``False`` only alongside an explicit ``ops`` list.
+    :param thresholds: cut-offs for measurement and policy; ``None``
+        uses :data:`DEFAULT_THRESHOLDS`.
+    :param in_place: mutate ``doc`` rather than working on a copy.  The copy is
+        the safe default; ``True`` saves memory on large bundles, at the cost of
+        being unable to compare against the original.
+    :returns: the processed :class:`Document`.  Pages carrying no raster -- an
+        email body, a native-text page that never rendered -- pass through
+        untouched, and every op applied is recorded in ``page.history``.
+
+    Measure the no-preprocessing baseline, then the adaptive one::
+
+        base = preprocess(doc, policy=None)
+        tuned = preprocess(doc, policy=Policies.ocr_policy, max_workers=4)
     """
     target = doc if in_place else doc.copy()
 
@@ -4730,7 +5244,17 @@ class TextBackend(Protocol):  # pragma: no cover - structural type only
     name: str
 
     def supports(self, page: Page) -> bool:
-        """Whether this backend can read ``page`` at all."""
+        """Whether this backend can read ``page`` at all.
+
+        Asked per page, so the answer may legitimately differ across a document:
+        a text-layer backend supports the digital pages of a mixed PDF and not
+        the scanned ones.
+
+        :param page: the page in question
+        :returns: ``False`` when this backend needs a raster the page lacks, when
+            its dependencies are missing, or when the page is otherwise outside
+            what it handles
+        """
         ...
 
     def is_available(self) -> bool:
@@ -4743,11 +5267,27 @@ class TextBackend(Protocol):  # pragma: no cover - structural type only
         ...
 
     def estimate_cost(self, page: Page) -> Cost:
-        """Predicted cost of reading ``page``, before doing it."""
+        """Predicted cost of reading ``page``, before doing it.
+
+        Consulted by :class:`BudgetRouter` to decide whether a page can afford
+        this backend, so it must not read the page or call the provider.
+
+        :param page: the page that would be read
+        :returns: a :class:`Cost`; ``Cost.zero()`` for local engines.  Money is
+            ``0.00`` until :func:`Pricing.set_pricing` is called, though token
+            counts are always real.
+        """
         ...
 
     def read(self, page: Page) -> ReadResult:
-        """Read ``page`` and return its spans, cost and timing."""
+        """Read ``page`` and return its spans, cost and timing.
+
+        :param page: the page to read; implementations must not mutate it
+        :returns: a :class:`ReadResult` whose spans carry text, geometry and
+            per-span confidence.  A page the backend could not read yields an
+            empty span list and a warning, not an exception -- one bad page must
+            not cost the document.
+        """
         ...
 
 
@@ -4774,7 +5314,13 @@ class BaseBackend(object):
 
     # -- protocol ---------------------------------------------------------
     def supports(self, page: Page) -> bool:
-        """Whether this backend can read ``page`` at all."""
+        """Whether this backend can read ``page`` at all.
+
+        :param page: the page in question
+        :returns: ``True`` unless the page lacks a raster this backend needs,
+            or :meth:`is_available` is ``False``.  Override to add
+            engine-specific limits, such as a script or a page-size ceiling.
+        """
         if self.needs_raster and not page.has_raster():
             return False
         return self.is_available()
@@ -4784,11 +5330,26 @@ class BaseBackend(object):
         return True
 
     def estimate_cost(self, page: Page) -> Cost:
-        """Predicted cost of reading ``page``.  Free by default (local engines)."""
+        """Predicted cost of reading ``page``.  Free by default (local engines).
+
+        :param page: the page that would be read
+        :returns: ``Cost.zero()``.  Vision backends override this; see the
+            per-token estimate in :meth:`VisionBackend.estimate_cost`.
+        """
         return Cost.zero()
 
     def read(self, page: Page) -> ReadResult:
-        """Read ``page``, timing the call and tagging spans with this backend."""
+        """Read ``page``, timing the call and tagging spans with this backend.
+
+        Do not override this; implement :meth:`_read` instead.  This wrapper is
+        what fills in latency, stamps ``span.source`` with the backend name, and
+        detects the script of each span -- three things every backend would
+        otherwise have to remember.
+
+        :param page: the page to read
+        :returns: the :class:`ReadResult` from :meth:`_read`, with ``latency_ms``,
+            ``backend``, and each span's ``source`` and ``script`` filled in
+        """
         with Timer() as t:
             result = self._read(page)
         result.latency_ms = t.ms
@@ -4841,8 +5402,21 @@ class BackendRegistry(object):
                  replace: bool = False) -> None:
         """Register a backend under ``name``.
 
-        ``factory`` may be a backend instance or a zero-argument callable
-        returning one.
+        Prefer a callable: instantiating PaddleOCR or Surya loads hundreds of
+        megabytes of weights, and a document that never routes there must not
+        pay for it.  Passing an instance is supported for cheap backends and
+        test doubles, and constructs eagerly by definition::
+
+            registry.register("myocr", lambda: MyOCRBackend(lang="hi"))
+
+        :param name: the routing key, as used by ``backend="myocr"`` and by
+            any :class:`RuleRouter` rule
+        :param factory: a zero-argument callable returning a backend, or a
+            backend instance (wrapped in a callable for you)
+        :param replace: allow overwriting an existing registration.  Off by
+            default so a name collision is an error rather than a backend that
+            silently stops being used; any cached instance is dropped.
+        :raises ConfigError: ``name`` is taken and ``replace`` is ``False``
         """
         if name in self._factories and not replace:
             raise ConfigError("backend %r is already registered (pass replace=True)" % name)
@@ -4851,7 +5425,16 @@ class BackendRegistry(object):
             self._instances.pop(name, None)
 
     def get(self, name: str) -> Any:
-        """Instantiate (once) and return the backend registered as ``name``."""
+        """Instantiate (once) and return the backend registered as ``name``.
+
+        The instance is cached under the lock, so the weights load once even if
+        several pages race for the same backend.
+
+        :param name: a registered name, e.g. ``"tesseract"`` or ``"anthropic"``
+        :returns: the shared backend instance
+        :raises ConfigError: nothing is registered under ``name``; the message
+            lists what is
+        """
         if name in self._instances:
             return self._instances[name]
         with self._lock:
@@ -4866,11 +5449,23 @@ class BackendRegistry(object):
             return instance
 
     def __contains__(self, name: str) -> bool:
-        """``"tesseract" in registry`` -- true if registered, available or not."""
+        """``"tesseract" in registry`` -- true if registered, available or not.
+
+        Registered is not the same as usable: use :meth:`available` to ask
+        whether the engine's dependencies are actually importable.
+
+        :param name: the name to look for
+        :returns: whether a factory exists under that name
+        """
         return name in self._factories
 
     def __getitem__(self, name: str) -> Any:
-        """``registry["tesseract"]`` -- alias for :meth:`get`."""
+        """``registry["tesseract"]`` -- alias for :meth:`get`.
+
+        :param name: a registered name
+        :returns: the shared backend instance
+        :raises ConfigError: nothing is registered under ``name``
+        """
         return self.get(name)
 
     def names(self) -> List[str]:
@@ -9606,29 +10201,77 @@ class Pipeline(object):
     baseline.
     """
 
+    #: Chooses preprocessing ops per page from its measured quality.  Also
+    #: :func:`Policies.ocr_policy`, :func:`Policies.vlm_policy`, or your own
+    #: ``Callable[[Page], List[Op]]``.  ``None`` skips preprocessing -- the
+    #: baseline to measure against.
     policy: Optional[PolicyFn] = default_policy
+    #: Picks a backend per page.  Also :class:`RuleRouter`, :class:`BudgetRouter`,
+    #: or your own ``Callable[[Page], Optional[str]]``.  ``None`` sends every page
+    #: to :attr:`backend`.
     router: Optional[RouterFn] = default_router
+    #: Force one reader for all pages: a registered name (``"pymupdf"``,
+    #: ``"tesseract"``, ``"paddle"``, ``"anthropic"``) or a :class:`TextBackend`.
+    #: Takes precedence over :attr:`router`.
     backend: Optional[Union[str, TextBackend]] = None
+    #: What to extract -- pydantic model, dataclass, or ``{field: type}`` dict.
+    #: ``None`` means text only: no model call, no cost.
     schema: Optional[SchemaLike] = None
+    #: Domain hints for the prompt, e.g. ``"Indian private hospital bill, INR"``.
     context: str = ""
+    #: The :class:`LLMClient` that does the extracting.  Required when
+    #: :attr:`schema` is set.
     client: Optional[LLMClient] = None
+    #: Business rules run over the extracted object; each outcome feeds the
+    #: confidence of the fields it touched.
     validators: List[Validator] = field(default_factory=list)
+    #: Maps fused confidence onto calibrated probabilities.  Without one, scores
+    #: rank correctly but are not probabilities -- see :class:`PlattCalibrator`.
     calibrator: Optional[Calibrator] = None
+    #: Render resolution for PDF pages.  300 is the floor for reliable OCR; 400
+    #: helps on small print; above 600 costs memory without accuracy.
     render_dpi: int = DEFAULT_DPI
+    #: Stop after this many pages.  ``0`` means no limit.
     max_pages: int = 0
+    #: Thread count for per-page preprocessing and reading.  ``0`` runs serially,
+    #: which is what you want while debugging.
     max_workers: int = 0
+    #: Split pages that hold two physical documents before reading -- see
+    #: :func:`Ops.split_multi_bill_page`.
     split_pages: bool = False
+    #: Apply script, digit, date and amount normalisation to spans after reading.
     normalize: bool = True
+    #: Currency ceiling for the read stage; exceeding it raises
+    #: :class:`BudgetExceeded`.  ``None`` means unbounded.  Meaningless until
+    #: :func:`Pricing.set_pricing` is called -- unpriced models cost ``0.00``.
     budget: Optional[float] = None
+    #: Label carried into eval reports so runs can be told apart.
     name: str = "pipeline"
 
     def ingest(self, source: Source, **kwargs: Any) -> Document:
-        """Ingest ``source`` using this pipeline's DPI and page limit."""
+        """Ingest ``source`` using this pipeline's DPI and page limit.
+
+        :param source: path, path-like, directory, raw ``bytes``, or open binary
+            file -- anything :func:`ingest` accepts
+        :param kwargs: forwarded to :func:`ingest` (``password``, ``kind_hint``,
+            ...); ``render_dpi`` and ``max_pages`` come from this pipeline
+        :returns: a :class:`Document` whose rasters are still lazy -- nothing has
+            been rendered yet
+        """
         return ingest(source, render_dpi=self.render_dpi, max_pages=self.max_pages,
                       **kwargs)
 
     def run_document(self, doc: Document) -> Document:
-        """Preprocess, read and normalise an already-ingested document."""
+        """Preprocess, read and normalise an already-ingested document.
+
+        The middle of :meth:`run`, exposed separately for when you ingested the
+        document yourself -- to filter its pages, attach metadata, or feed pages
+        assembled from somewhere other than a file.
+
+        :param doc: an ingested document; it is read in place and also returned
+        :returns: the same document, with ``page.spans`` populated, ``page.history``
+            recording every op applied, and text normalised if ``normalize`` is set
+        """
         if self.split_pages:
             doc = split_document(doc)
         if self.policy is not None:
@@ -9644,6 +10287,15 @@ class Pipeline(object):
 
         With no ``schema`` configured the result still carries the document,
         so a text-only pipeline is just this with the extraction step empty.
+
+        :param source: path, path-like, directory, raw ``bytes``, or open binary
+            file -- anything :func:`ingest` accepts
+        :param kwargs: forwarded to :meth:`ingest`, e.g. ``password="secret"``
+            for an encrypted PDF
+        :returns: an :class:`Extraction`; when ``schema`` is ``None`` its
+            ``model`` is ``None`` and only ``document`` and ``cost`` are filled in
+        :raises IngestError: ``source`` could not be read as a document
+        :raises BudgetExceeded: this pipeline has a ``budget`` and reading exceeded it
         """
         doc = self.run_document(self.ingest(source, **kwargs))
         if self.schema is None:
@@ -9652,7 +10304,15 @@ class Pipeline(object):
                        validators=self.validators, calibrator=self.calibrator)
 
     def __call__(self, source: Source, **kwargs: Any) -> Extraction:
-        """``pipeline(source)`` -- alias for :meth:`run`, so it is a ``PipelineFn``."""
+        """``pipeline(source)`` -- alias for :meth:`run`, so it is a ``PipelineFn``.
+
+        Being callable is what lets a configured pipeline be handed straight to
+        :meth:`EvalSuite.run`, which expects a ``Callable[[str], Extraction]``.
+
+        :param source: as :meth:`run`
+        :param kwargs: as :meth:`run`
+        :returns: an :class:`Extraction`
+        """
         return self.run(source, **kwargs)
 
     def to_dict(self) -> Dict[str, Any]:
@@ -9682,7 +10342,78 @@ def process(source: Source, schema: Optional[SchemaLike] = None, context: str = 
             backend: Optional[Union[str, TextBackend]] = None,
             validators: Optional[Sequence[Validator]] = None,
             **kwargs: Any) -> Extraction:
-    """One-call convenience wrapper around :class:`Pipeline`."""
+    """One-call convenience wrapper around :class:`Pipeline` -- ingest to extraction.
+
+    Equivalent to building a :class:`Pipeline` with these arguments and calling
+    it once.  Use this for a single document; build a :class:`Pipeline` when you
+    want to reuse one configuration across many documents, record it in an eval
+    report, or run it through :class:`EvalSuite`.
+
+    :param source: what to read.  A path or path-like (``"scan.pdf"``,
+        ``Path("bill.png")``), a directory of pages, raw ``bytes`` of a PDF or
+        image, or an open binary file object.  Format is sniffed from content,
+        not from the extension.
+    :param schema: what to pull out -- a pydantic model, a dataclass, or a plain
+        ``{field: type}`` dict such as ``{"invoice_no": str, "total": float}``.
+        Leave it ``None`` for a text-only run: the read :class:`Document` still
+        comes back on ``Extraction.document``, with no model call made.
+    :param context: domain hints pasted into the prompt, e.g.
+        ``"Indian private hospital bill, amounts in INR"``.  Cheap and effective
+        -- it is what tells the model that ``1,20,000`` is one-lakh-twenty.
+    :param client: the :class:`LLMClient` doing the extracting -- one
+        of :class:`AnthropicClient`, :class:`OpenAIClient`, or the
+        deterministic :class:`EchoClient` in tests.  Required whenever
+        ``schema`` is given.
+    :param policy: chooses preprocessing ops per page from its measured quality.
+        Defaults to :func:`default_policy`.  Pass :func:`Policies.ocr_policy` or
+        else :func:`Policies.vlm_policy` to bias for one reader, a callable of
+        your own for full control, or ``None`` to skip preprocessing entirely --
+        the honest baseline when measuring whether preprocessing earns its keep.
+    :param router: picks a backend per page, e.g. native text layer for digital
+        pages and a VLM for photographed ones.  Defaults to the
+        rule-based :func:`default_router`; see also :class:`RuleRouter`
+        and :class:`BudgetRouter`.  ``None`` sends every page to ``backend``.
+    :param backend: force one reader for every page, as a registered name
+        (``"pymupdf"``, ``"tesseract"``, ``"paddle"``, ``"anthropic"``) or an
+        instance of :class:`TextBackend`.  Overrides ``router`` when both given.
+    :param validators: business rules run over the extracted object; each
+        outcome feeds the confidence of the fields it touched.  The
+        namespace :class:`Validators` holds the ready-made ones.
+    :param kwargs: forwarded to :class:`Pipeline` -- ``render_dpi``,
+        ``max_pages``, ``max_workers``, ``split_pages``, ``normalize``,
+        ``budget``, ``calibrator``, ``name``.
+    :returns: an :class:`Extraction` carrying the parsed object, per-field
+        confidence and provenance, the read document, the
+        accumulated :class:`Cost`, and any warnings.  A failure that costs one
+        page rather than the whole document arrives as a warning, not an
+        exception.
+    :raises ConfigError: a ``schema`` was given without a ``client``
+    :raises IngestError: ``source`` could not be read as a document
+    :raises BudgetExceeded: a ``budget`` was set and reading would exceed it
+
+    Text only, no model call::
+
+        doc = docpipe.process("scan.pdf").document
+        print(doc.text())
+
+    A schema, with domain context and a validator::
+
+        result = docpipe.process(
+            "bill.pdf",
+            schema={"patient": str, "total": float, "bill_date": str},
+            context="Indian private hospital bill, INR",
+            client=docpipe.AnthropicClient(),
+            validators=[docpipe.Validators.line_items_sum_to_total],
+        )
+        print(result.value("total"), result.confidence("total"))
+        for field in result.low_confidence(threshold=0.7):
+            print("review by hand:", field.name, field.confidence)
+
+    Cheap OCR, no VLM, capped at the first 20 pages::
+
+        result = docpipe.process("bundle.pdf", backend="tesseract", router=None,
+                                 policy=docpipe.Policies.ocr_policy, max_pages=20)
+    """
     pipeline = Pipeline(policy=policy, router=router, backend=backend, schema=schema,
                         context=context, client=client,
                         validators=list(validators or []), **kwargs)
