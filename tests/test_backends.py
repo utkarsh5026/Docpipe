@@ -7,6 +7,9 @@ account honestly for calls a provider already billed, and that routing sends
 native-text pages to the free exact path rather than to a model.
 """
 
+import math
+from types import SimpleNamespace
+
 import pytest
 
 import docpipe as dp
@@ -29,7 +32,8 @@ class FlakyBackend(dp.BaseBackend):
     name = "flaky"
     needs_raster = False
 
-    def __init__(self, failures=2, exc=RuntimeError("provider timeout")):
+    def __init__(self, failures: int = 2,
+                 exc: BaseException = RuntimeError("provider timeout")):
         dp.BaseBackend.__init__(self)
         self.failures = failures
         self.attempts = 0
@@ -495,3 +499,182 @@ class TestVisionBackendPlumbing:
     def test_cost_is_reported_from_the_call(self, bill_image):
         result = self.Fake("x").read(dp.page_from_image(bill_image, dpi=150))
         assert result.cost.input_tokens == 900
+
+
+def gemini_response(text=None, prompt_tokens=0, candidate_tokens=0,
+                    thought_tokens=0, finish_reason="STOP", block_reason=None):
+    """A stand-in for the SDK's ``GenerateContentResponse``."""
+    return SimpleNamespace(
+        text=text,
+        candidates=[SimpleNamespace(finish_reason=finish_reason)],
+        prompt_feedback=SimpleNamespace(block_reason=block_reason),
+        usage_metadata=SimpleNamespace(prompt_token_count=prompt_tokens,
+                                       candidates_token_count=candidate_tokens,
+                                       thoughts_token_count=thought_tokens))
+
+
+class FakeGeminiClient:
+    """Stands in for ``genai.Client``, recording what the backend sent."""
+
+    def __init__(self, response):
+        self.response = response
+        self.calls = []
+        self.models = SimpleNamespace(generate_content=self._generate_content)
+
+    def _generate_content(self, **kwargs):
+        self.calls.append(kwargs)
+        return self.response
+
+
+class TestGeminiVisionBackend:
+    def _backend(self, response, **kw):
+        """A backend wired to a fake client, so no test can reach the network."""
+        client = FakeGeminiClient(response)
+        return dp.GeminiVisionBackend(client=client, **kw), client
+
+    # -- availability -----------------------------------------------------
+    def test_an_injected_client_needs_no_sdk_or_key(self, monkeypatch):
+        monkeypatch.setattr(dp, "have", lambda name: False)
+        monkeypatch.delenv("GOOGLE_API_KEY", raising=False)
+        monkeypatch.delenv("GEMINI_API_KEY", raising=False)
+        backend, _ = self._backend(gemini_response("x"))
+        assert backend.is_available() is True
+
+    def test_the_sdk_without_a_key_is_not_available(self, monkeypatch):
+        monkeypatch.setattr(dp, "have", lambda name: True)
+        monkeypatch.delenv("GOOGLE_API_KEY", raising=False)
+        monkeypatch.delenv("GEMINI_API_KEY", raising=False)
+        assert dp.GeminiVisionBackend().is_available() is False
+
+    @pytest.mark.parametrize("var", ["GOOGLE_API_KEY", "GEMINI_API_KEY"])
+    def test_either_google_env_var_satisfies_it(self, monkeypatch, var):
+        monkeypatch.setattr(dp, "have", lambda name: True)
+        monkeypatch.delenv("GOOGLE_API_KEY", raising=False)
+        monkeypatch.delenv("GEMINI_API_KEY", raising=False)
+        monkeypatch.setenv(var, "key")
+        assert dp.GeminiVisionBackend().is_available() is True
+
+    def test_availability_probes_the_dotted_name(self, monkeypatch):
+        """`google` alone is a namespace package half of Google's libraries
+        populate, so probing it would report an SDK that is not installed."""
+        asked = []
+        monkeypatch.setattr(dp, "have", lambda name: asked.append(name) or True)
+        monkeypatch.setenv("GOOGLE_API_KEY", "key")
+        dp.GeminiVisionBackend().is_available()
+        assert asked == ["google.genai"]
+
+    def test_a_missing_sdk_names_the_pip_package(self):
+        if dp.have("google.genai"):
+            pytest.skip("google-genai is installed in this environment")
+        with pytest.raises(dp.MissingDependency) as excinfo:
+            dp.GeminiVisionBackend(api_key="key")._get_client()
+        assert "pip install google-genai" in str(excinfo.value)
+
+    # -- the call ---------------------------------------------------------
+    def test_transcription_becomes_approximate_spans(self, bill_image):
+        backend, _ = self._backend(gemini_response("line one\nline two"))
+        result = backend.read(dp.page_from_image(bill_image, dpi=150))
+        assert [s.text for s in result.spans] == ["line one", "line two"]
+        assert all(s.meta["approximate_bbox"] is True for s in result.spans)
+        assert all(s.source == "vlm:gemini" for s in result.spans)
+
+    def test_the_image_is_sent_inline_with_the_prompt(self, bill_image):
+        backend, client = self._backend(gemini_response("x"))
+        backend.read(dp.page_from_image(bill_image, dpi=150))
+        parts = client.calls[0]["contents"][0]["parts"]
+        assert parts[0]["inline_data"]["mime_type"] == "image/jpeg"
+        assert isinstance(parts[0]["inline_data"]["data"], bytes)
+        assert parts[1]["text"] == dp.DEFAULT_OCR_PROMPT
+
+    def test_thinking_is_disabled_by_default(self, bill_image):
+        """Transcription is recall, not reasoning, and thinking tokens bill at
+        the output rate for output the page never needed."""
+        backend, client = self._backend(gemini_response("x"))
+        backend.read(dp.page_from_image(bill_image, dpi=150))
+        assert client.calls[0]["config"]["thinking_config"]["thinking_budget"] == 0
+
+    def test_a_none_budget_omits_the_setting_entirely(self, bill_image):
+        """Models outside the thinking family reject the field outright."""
+        backend, client = self._backend(gemini_response("x"), thinking_budget=None)
+        backend.read(dp.page_from_image(bill_image, dpi=150))
+        assert "thinking_config" not in client.calls[0]["config"]
+
+    def test_options_reach_the_generation_config(self, bill_image):
+        backend, client = self._backend(gemini_response("x"), top_p=0.2)
+        backend.read(dp.page_from_image(bill_image, dpi=150))
+        assert client.calls[0]["config"]["top_p"] == 0.2
+
+    # -- cost -------------------------------------------------------------
+    def test_thinking_tokens_are_billed_as_output(self, bill_image):
+        """They bill at the output rate but are counted separately from the
+        candidate, so charging candidates_token_count alone understates it."""
+        backend, _ = self._backend(gemini_response(
+            "x", prompt_tokens=900, candidate_tokens=100, thought_tokens=400))
+        result = backend.read(dp.page_from_image(bill_image, dpi=150))
+        assert result.cost.input_tokens == 900
+        assert result.cost.output_tokens == 500
+
+    def test_cost_estimate_follows_the_tiling_rule(self, bill_image):
+        backend = dp.GeminiVisionBackend()
+        page = dp.page_from_image(bill_image, dpi=150)
+        h, w = dp.image_shape(backend._image_for(page))
+        tiles = math.ceil(w / 768.0) * math.ceil(h / 768.0)
+        assert tiles > 1
+        estimate = backend.estimate_cost(page)
+        assert estimate.input_tokens == 258 * tiles + len(backend.prompt) // 4
+
+    def test_a_small_image_costs_one_tile(self):
+        backend = dp.GeminiVisionBackend()
+        page = dp.page_from_image(np.full((200, 300), 255, dtype=np.uint8), dpi=150)
+        assert backend.estimate_cost(page).input_tokens == \
+            258 + len(backend.prompt) // 4
+
+    def test_a_page_with_no_raster_costs_nothing(self):
+        assert dp.GeminiVisionBackend().estimate_cost(dp.Page(index=0)).input_tokens == 0
+
+    # -- failure ----------------------------------------------------------
+    def test_a_blocked_page_raises_rather_than_reading_as_blank(self, bill_image):
+        """A silently empty page is the one failure nobody catches in review."""
+        backend, _ = self._backend(gemini_response(None, block_reason="SAFETY"))
+        with pytest.raises(dp.BackendError) as excinfo:
+            backend.read(dp.page_from_image(bill_image, dpi=150))
+        assert "SAFETY" in str(excinfo.value)
+
+    def test_a_non_stop_finish_reason_also_raises(self, bill_image):
+        backend, _ = self._backend(gemini_response(None, finish_reason="RECITATION"))
+        with pytest.raises(dp.BackendError):
+            backend.read(dp.page_from_image(bill_image, dpi=150))
+
+    def test_an_empty_response_with_no_reason_is_not_an_error(self, bill_image):
+        """A genuinely blank page is a legitimate answer; inventing a failure
+        for it would be as wrong as swallowing a refusal."""
+        backend, _ = self._backend(gemini_response(""))
+        assert backend.read(dp.page_from_image(bill_image, dpi=150)).spans == []
+
+    def test_truncation_is_warned_about_not_hidden(self, bill_image, caplog):
+        backend, _ = self._backend(gemini_response("half a bill",
+                                                   finish_reason="MAX_TOKENS"))
+        with caplog.at_level("WARNING"):
+            result = backend.read(dp.page_from_image(bill_image, dpi=150))
+        assert result.spans[0].text == "half a bill"
+        assert any("truncated" in r.message for r in caplog.records)
+
+    def test_one_refused_page_does_not_cost_the_document(self, bill_image):
+        """`read` records the failure against the page and carries on -- the
+        other pages of a bundle are still worth having."""
+        backend, _ = self._backend(gemini_response(None, block_reason="SAFETY"))
+        doc = dp.document_from_images([bill_image] * 2, dpi=150)
+        out = dp.read(doc, backend=backend)
+        assert len(out.warnings) == 2
+        assert all("read failed" in w for w in out.warnings)
+
+    # -- registration -----------------------------------------------------
+    def test_registered_as_a_lazy_factory(self):
+        assert "vlm:gemini" in dp.registry
+        assert isinstance(dp.registry.get("vlm:gemini"), dp.GeminiVisionBackend)
+
+    def test_the_router_can_reach_it(self, monkeypatch):
+        monkeypatch.setattr(dp.registry, "available", lambda: ["vlm:gemini"])
+        page = dp.Page(index=0, kind=dp.PageKind.SCANNED)
+        page.quality = dp.PageQuality(verdict=dp.Verdict.UNREADABLE, ink_coverage=0.1)
+        assert dp.default_router(page) == "vlm:gemini"

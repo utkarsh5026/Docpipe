@@ -129,7 +129,9 @@ class TestParseAmount:
     def test_returns_decimal_not_float(self):
         """Money and binary floating point should not meet."""
         assert isinstance(dp.parse_amount("0.1"), decimal.Decimal)
-        assert dp.parse_amount("0.1") + dp.parse_amount("0.2") == decimal.Decimal("0.3")
+        tenth, fifth = dp.parse_amount("0.1"), dp.parse_amount("0.2")
+        assert tenth is not None and fifth is not None
+        assert tenth + fifth == decimal.Decimal("0.3")
 
     def test_explicit_separator_overrides_inference(self):
         assert dp.parse_amount("1.234", decimal_separator="comma") == decimal.Decimal("1234")
@@ -183,6 +185,7 @@ class TestParseDate:
 
     def test_two_digit_years_expand_to_the_recent_past(self):
         parsed = dp.parse_date("12-04-24")
+        assert parsed is not None
         assert parsed.year == 2024 and parsed.month == 4 and parsed.day == 12
 
     def test_devanagari_digits(self):

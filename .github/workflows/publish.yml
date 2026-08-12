@@ -1,0 +1,123 @@
+name: publish
+
+# Releases are cut by pushing a tag:
+#
+#     git tag v0.1.0 && git push origin v0.1.0
+#
+# The tag is the trigger, but it is not the authority: the version in
+# pyproject.toml and docpipe.__version__ must agree with it, and the full test
+# gate must pass on that exact commit, before anything reaches PyPI.
+#
+# Upload uses PyPI Trusted Publishing (OIDC), so there is no API token in the
+# repository secrets.  One-time setup on PyPI, under the project's Publishing
+# settings -- or as a "pending publisher" if the name is not yet registered:
+#
+#     PyPI project name:  docpipe-core
+#     Owner:              utkarsh5026
+#     Repository:         Docpipe
+#     Workflow:           publish.yml
+#     Environment:        pypi
+on:
+  push:
+    tags: ["v*"]
+
+# Nothing here writes to the repository; the upload job asks for `id-token`
+# separately, so the token minted for OIDC is the narrowest thing that works.
+permissions:
+  contents: read
+
+jobs:
+  # The same gate main runs -- 3.8 parse, zero-dependency import, alias
+  # coverage, tests, and the OpenCV-disabled pass -- against the tagged commit.
+  gate:
+    uses: ./.github/workflows/ci.yml
+
+  build:
+    needs: gate
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: The tag, pyproject and __version__ all name the same version
+        # ci.yml already proved the last two agree.  This adds the tag, which is
+        # the one input a human types by hand at the moment it matters most.
+        run: |
+          python - <<'PY'
+          import io, os, re, sys
+
+          tag = os.environ["GITHUB_REF_NAME"]
+          version = re.search(
+              r'(?m)^version\s*=\s*"([^"]+)"',
+              io.open("pyproject.toml", encoding="utf-8").read()).group(1)
+
+          if tag != "v" + version:
+              sys.exit("tag %s does not match version %s -- expected tag v%s"
+                       % (tag, version, version))
+          print("releasing %s from tag %s" % (version, tag))
+          PY
+
+      - name: Build the sdist and wheel
+        run: |
+          python -m pip install --upgrade pip build twine
+          python -m build
+
+      - name: Check the rendered metadata
+        # Catches a README that renders on GitHub but not on PyPI, which is
+        # otherwise only discoverable after an upload that cannot be undone.
+        run: python -m twine check --strict dist/*
+
+      - name: The wheel is what it claims to be
+        # Installs the built artefact into a clean environment with no extras,
+        # then exercises the promise the packaging makes: one module, importable
+        # with nothing else present, plus a working console script.
+        #
+        # Runs from outside the checkout on purpose.  Python puts the working
+        # directory on sys.path, so a smoke test run at the repository root
+        # imports ./docpipe.py and passes no matter what the wheel contains.
+        working-directory: /tmp
+        run: |
+          python -m venv /tmp/smoke
+          /tmp/smoke/bin/pip install --quiet "$GITHUB_WORKSPACE"/dist/*.whl
+          /tmp/smoke/bin/python - <<'PY'
+          import os, docpipe
+
+          # Prove we are exercising the installed copy, not a stray source tree.
+          assert "site-packages" in docpipe.__file__, docpipe.__file__
+
+          # A pure-stdlib path through the core, with no optional dependency
+          # installed in this environment at all.
+          assert docpipe.parse_amount("1,23,456.78") is not None
+          assert docpipe.fuse_confidence({"validation": 0.9}) > 0.5
+          print("wheel imports clean at version %s from %s"
+                % (docpipe.__version__, docpipe.__file__))
+          PY
+          /tmp/smoke/bin/docpipe caps
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dist
+          path: dist/
+
+  publish:
+    needs: build
+    runs-on: ubuntu-latest
+    # The environment is half of what PyPI matches the OIDC claim against, and
+    # it is where a required reviewer would be configured to gate an upload.
+    environment:
+      name: pypi
+      url: https://pypi.org/project/docpipe-core/
+    permissions:
+      # Mints the short-lived OIDC token Trusted Publishing exchanges for an
+      # upload token.  No long-lived PyPI credential exists to leak.
+      id-token: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: dist
+          path: dist/
+
+      - uses: pypa/gh-action-pypi-publish@release/v1

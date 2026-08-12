@@ -77,7 +77,9 @@ def render_text_page(lines, width=1240, height=1754, font_size=26, margin=70,
             try:
                 box = draw.textbbox((x, y), word, font=font)
             except AttributeError:  # very old Pillow
-                w, h = draw.textsize(word, font=font)
+                # textsize() was removed in Pillow 10, which is why this is the
+                # fallback and not the primary path.
+                w, h = draw.textsize(word, font=font)  # type: ignore[attr-defined]
                 box = (x, y, x + w, y + h)
             spans.append(dp.TextSpan(
                 text=word,

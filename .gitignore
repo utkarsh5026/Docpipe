@@ -216,3 +216,6 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# Local test documents — scanned PDFs used for manual pipeline runs
+pdfs/

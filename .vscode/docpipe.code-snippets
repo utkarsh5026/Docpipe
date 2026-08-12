@@ -1,0 +1,138 @@
+// Snippets for the conventions docpipe.py enforces -- the ones that are easy
+// to half-remember: decorator order, the load-bearing module-level alias, the
+// bbox that has to be threaded through, the fixture that covers both image
+// backends.  Type the prefix in any Python file in this workspace.
+{
+  "Preprocessing op": {
+    "prefix": "dpop",
+    "scope": "python",
+    "description": "A preprocessing op as a staticmethod on Ops, with @staticmethod outermost",
+    "body": [
+      "    @staticmethod",
+      "    @register_op(\"${1:my_op}\", geometric=${2|False,True|}, needs_raster=True)",
+      "    def ${1:my_op}(img: ImageArray, page: Page, ${3:strength: float = 1.0}) -> Optional[ImageArray]:",
+      "        \"\"\"${4:One line on what measured distortion this corrects.}",
+      "",
+      "        ${5:Why the threshold is where it is, and what makes it safe to skip.}",
+      "",
+      "        :param ${3/([a-z_]+).*/$1/}: ${6:what it controls}",
+      "        \"\"\"",
+      "        ${7:# Measure first: an op that fires on a clean page destroys signal.}",
+      "        return ${8:out}  # or None -- nothing to correct, page left untouched",
+      "$0"
+    ]
+  },
+
+  "Module-level alias": {
+    "prefix": "dpalias",
+    "scope": "python",
+    "description": "The alias below a namespace class -- load-bearing, not back-compat cruft",
+    "body": ["${1:my_op} = ${2|Caps,Util,Image,Quality,Ingest,Ops,Policies,Pricing,Text,Confidence,Validators|}.${1:my_op}$0"]
+  },
+
+  "Namespace staticmethod": {
+    "prefix": "dpstatic",
+    "scope": "python",
+    "description": "A staticmethod on a namespace class (remember the alias below the class)",
+    "body": [
+      "    @staticmethod",
+      "    def ${1:name}(${2:arg}: ${3:str}) -> ${4:str}:",
+      "        \"\"\"${5:What is not obvious from the body.}",
+      "",
+      "        :param ${2:arg}: ${6:description}",
+      "        \"\"\"",
+      "        $0"
+    ]
+  },
+
+  "Reading backend": {
+    "prefix": "dpbackend",
+    "scope": "python",
+    "description": "A BaseBackend subclass: implement _read and is_available, register a factory",
+    "body": [
+      "class ${1:MyOCR}Backend(BaseBackend):",
+      "    \"\"\"${2:Which engine this wraps, and what it is good at.}\"\"\"",
+      "",
+      "    def __init__(self, name: str = \"${3:myocr}\", **options: Any) -> None:",
+      "        \"\"\"${4:Configuration, and why these defaults.}\"\"\"",
+      "        BaseBackend.__init__(self, name=name, **options)",
+      "",
+      "    def is_available(self) -> bool:",
+      "        \"\"\"True when ${5:the dependency} is importable.\"\"\"",
+      "        return have(\"${6:mypackage}\")",
+      "",
+      "    def _read(self, page: Page) -> ReadResult:",
+      "        \"\"\"${7:How the engine's output maps onto spans.}",
+      "",
+      "        The base class handles timing, span sourcing and script detection,",
+      "        so this returns spans and cost only.",
+      "        \"\"\"",
+      "        engine = require(\"${6:mypackage}\", \"${3:myocr} reading\")",
+      "        img = self._image_for(page)",
+      "        spans: List[TextSpan] = []",
+      "        $0",
+      "        return ReadResult(spans=spans, backend=self.name)",
+      "",
+      "",
+      "# Register a *factory*, never an instance: constructing the engine loads",
+      "# hundreds of megabytes of weights, and a document that never routes here",
+      "# must not pay for it.",
+      "registry.register(\"${3:myocr}\", lambda: ${1:MyOCR}Backend())"
+    ]
+  },
+
+  "Optional dependency at point of use": {
+    "prefix": "dprequire",
+    "scope": "python",
+    "description": "Caps.require -- fails where the user called, with a pip hint",
+    "body": ["${1:mod} = require(\"${2:numpy}\", \"${3:what needs it}\")$0"]
+  },
+
+  "Optional dependency probe": {
+    "prefix": "dphave",
+    "scope": "python",
+    "description": "Caps.have -- branch on an optional dependency without importing it",
+    "body": [
+      "if have(\"${1:cv2}\"):",
+      "    ${2:# OpenCV path}",
+      "else:",
+      "    ${3:# pure-NumPy fallback -- OpenCV is optional by promise}",
+      "$0"
+    ]
+  },
+
+  "Test across both image backends": {
+    "prefix": "dptest",
+    "scope": "python",
+    "description": "A test parametrised over the OpenCV and pure-NumPy paths",
+    "body": [
+      "def test_${1:name}(both_image_backends, ${2:bill_image}):",
+      "    \"\"\"${3:What behaviour this pins down.}\"\"\"",
+      "    $0"
+    ]
+  },
+
+  "Section banner": {
+    "prefix": "dpsection",
+    "scope": "python",
+    "description": "A numbered section banner; the prose under it becomes the section intro in the reference",
+    "body": [
+      "# =============================================================================",
+      "# ${1:N}. ${2:Title}",
+      "# =============================================================================",
+      "#",
+      "# ${3:What this layer owns, and the reasoning a reader needs before the code.}",
+      "$0"
+    ]
+  },
+
+  "Documented constant": {
+    "prefix": "dpconst",
+    "scope": "python",
+    "description": "A module constant with the #: comment the reference renders",
+    "body": [
+      "#: ${1:What this threshold means and why it is set here.}",
+      "${2:MY_THRESHOLD} = ${3:0.5}$0"
+    ]
+  }
+}

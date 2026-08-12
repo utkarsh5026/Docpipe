@@ -9,6 +9,7 @@ all three without any of them needing to reach inside it.
 
 import decimal
 import json
+from typing import Any, Dict
 
 import pytest
 
@@ -57,6 +58,7 @@ class TestScannedBillPipeline:
         assert result.value("total") == decimal.Decimal("118250.00")
         assert result.is_valid
         assert result["patient_name"].evidence
+        assert result.document is not None
         page = result.document.pages[0]
         assert "deskew" in [h.op for h in page.history]
         assert abs(page.quality.skew_deg) < 0.5
@@ -84,6 +86,7 @@ class TestNativePdfPipeline:
     def test_native_text_is_read_free_and_exactly(self, native_pdf):
         pipeline = dp.Pipeline(schema=SCHEMA, client=dp.EchoClient(RESPONSE))
         result = pipeline.run(native_pdf)
+        assert result.document is not None
         assert result.document.meta["read_backends"] == {0: "pymupdf"}
         assert result.document.meta["read_cost"]["amount"] == 0.0
         assert result.value("patient_name") == "RAMESH KUMAR SHARMA"
@@ -186,7 +189,7 @@ class TestCrossReadAndConfidence:
 
     def test_a_failed_arithmetic_check_surfaces_the_field_for_review(self,
                                                                      bill_document):
-        schema = dict(SCHEMA)
+        schema: Dict[str, Any] = dict(SCHEMA)
         schema["line_items"] = {"type": "array", "items": {"type": "object"}}
         response = json.loads(RESPONSE)
         response["line_items"] = [{"description": "Room", "amount": 1.0}]
@@ -231,6 +234,7 @@ class TestPipelineObject:
     def test_without_a_schema_it_is_a_text_pipeline(self, native_pdf):
         result = dp.Pipeline(schema=None).run(native_pdf)
         assert result.model is None
+        assert result.document is not None
         assert "SUNRISE" in result.document.text()
 
     def test_process_is_a_one_call_wrapper(self, native_pdf):
@@ -247,7 +251,7 @@ class TestLargeBundleBehaviour:
     def test_a_long_bundle_is_not_rasterised_eagerly(self, tmp_path, bill_image):
         """A 300-page bundle rendered eagerly at 400 DPI is tens of gigabytes;
         laziness has to live in the type."""
-        fitz = dp._fitz()
+        fitz: Any = dp._fitz()
         pdf = fitz.open()
         for _ in range(40):
             page = pdf.new_page(width=595, height=842)
@@ -321,6 +325,7 @@ class TestDeterminism:
             return pipeline.run(path)
 
         first, second = once(), once()
+        assert first.document is not None and second.document is not None
         assert first.to_dict()["fields"] == second.to_dict()["fields"]
         assert [h.op for h in first.document.pages[0].history] == \
                [h.op for h in second.document.pages[0].history]

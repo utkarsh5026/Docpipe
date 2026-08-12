@@ -1,0 +1,232 @@
+// The CI gates, runnable from the editor: Ctrl/Cmd-Shift-P -> "Run Task".
+//
+// Every gate here is the one `.github/workflows/ci.yml` and `docs.yml` run, in
+// the same order, so a push cannot fail on something reproducible locally.
+// "CI: all gates" chains them and stops at the first failure.
+//
+// Tasks call `${command:python.interpreterPath}`, the interpreter selected in
+// the status bar, so a venv is honoured without repeating its path here.
+{
+  "version": "2.0.0",
+  "presentation": {
+    "panel": "dedicated",
+    "clear": true,
+    "showReuseMessage": false
+  },
+  "tasks": [
+    // -----------------------------------------------------------------
+    // Setup
+    // -----------------------------------------------------------------
+    {
+      "label": "install: dev dependencies",
+      "detail": "pip install -e '.[dev]'  -- core + schema extras, pytest, build, twine",
+      "type": "process",
+      "command": "${command:python.interpreterPath}",
+      "args": ["-m", "pip", "install", "-e", ".[dev]"],
+      "problemMatcher": []
+    },
+
+    // -----------------------------------------------------------------
+    // Gate 1 -- the Python 3.8 promise
+    // -----------------------------------------------------------------
+    {
+      "label": "gate: parses as Python 3.8",
+      "detail": "Fails on 'X | Y' annotations, match, or a walrus. Fix the syntax -- never raise the floor in pyproject.toml.",
+      "type": "process",
+      "command": "${command:python.interpreterPath}",
+      "args": [
+        "-c",
+        "import ast, io; ast.parse(io.open('docpipe.py', encoding='utf-8').read(), feature_version=(3, 8)); print('docpipe.py parses as Python 3.8')"
+      ],
+      "problemMatcher": []
+    },
+
+    // -----------------------------------------------------------------
+    // Gate 2 -- the core imports with nothing installed
+    // -----------------------------------------------------------------
+    {
+      "label": "gate: imports with no optional dependencies",
+      "detail": "Poisons numpy/cv2/PIL/fitz/pydantic in sys.modules, then imports docpipe. Failure means a heavy import escaped to module scope.",
+      "type": "process",
+      "command": "${command:python.interpreterPath}",
+      "args": [
+        "-c",
+        "import sys; [sys.modules.__setitem__(m, None) for m in ('numpy', 'cv2', 'PIL', 'fitz', 'pymupdf', 'pydantic')]; import docpipe; assert docpipe.parse_amount('1,23,456.78') is not None; assert docpipe.fuse_confidence({'validation': 0.9}) > 0.5; assert docpipe.Text.parse_amount('1,23,456.78') is not None; assert docpipe.Confidence.fuse_confidence({'validation': 0.9}) > 0.5; print('core imports and runs with no optional dependencies')"
+      ],
+      "problemMatcher": []
+    },
+    {
+      "label": "gate: namespace staticmethods keep their aliases",
+      "detail": "The module-level aliases are load-bearing -- staticmethods call one another through the bare names, so a missing alias fails only at runtime.",
+      "type": "process",
+      "command": "${command:python.interpreterPath}",
+      "args": [
+        "-c",
+        "import docpipe, sys; ns = ['Caps', 'Util', 'Image', 'Quality', 'Ingest', 'Ops', 'Policies', 'Pricing', 'Text', 'Confidence', 'Validators']; bad = [c + '.' + a for c in ns for a, r in vars(getattr(docpipe, c)).items() if isinstance(r, staticmethod) and not a.startswith('_') and getattr(docpipe, a, None) is not getattr(getattr(docpipe, c), a)]; sys.exit('missing or mismatched module-level alias: ' + ', '.join(bad)) if bad else print('every namespaced staticmethod across %d namespaces is aliased' % len(ns))"
+      ],
+      "problemMatcher": []
+    },
+    {
+      "label": "gate: version agrees across pyproject and __version__",
+      "detail": "The version is stated twice because a vendored copy has no pyproject.toml. This is where the drift that invites gets caught.",
+      "type": "process",
+      "command": "${command:python.interpreterPath}",
+      "args": [
+        "-c",
+        "import io, re, sys; d = re.search(r'(?m)^version\\s*=\\s*\"([^\"]+)\"', io.open('pyproject.toml', encoding='utf-8').read()).group(1); v = re.search(r'(?m)^__version__\\s*=\\s*\"([^\"]+)\"', io.open('docpipe.py', encoding='utf-8').read()).group(1); sys.exit('version drift: pyproject says %s, docpipe.__version__ says %s' % (d, v)) if d != v else print('version %s, consistent across pyproject.toml and docpipe.py' % d)"
+      ],
+      "problemMatcher": []
+    },
+
+    // -----------------------------------------------------------------
+    // Gates 4 and 5 -- the suite, both image backends
+    // -----------------------------------------------------------------
+    {
+      "label": "test: full suite",
+      "detail": "~660 tests, roughly 75 seconds. Options come from [tool.pytest.ini_options].",
+      "type": "process",
+      "command": "${command:python.interpreterPath}",
+      "args": ["-m", "pytest", "-q"],
+      "group": { "kind": "test", "isDefault": true },
+      "problemMatcher": []
+    },
+    {
+      "label": "test: current file",
+      "detail": "Runs pytest on the open editor file.",
+      "type": "process",
+      "command": "${command:python.interpreterPath}",
+      "args": ["-m", "pytest", "-q", "${file}"],
+      "group": "test",
+      "problemMatcher": []
+    },
+    {
+      "label": "test: no OpenCV (pure-NumPy fallbacks)",
+      "detail": "OpenCV is optional by promise. Failure means a new image op has no NumPy fallback, or the two disagree beyond tolerance.",
+      "type": "process",
+      "command": "${command:python.interpreterPath}",
+      "args": [
+        "-m",
+        "pytest",
+        "-q",
+        "tests/test_image_ops.py",
+        "tests/test_quality.py",
+        "tests/test_preprocess.py"
+      ],
+      "options": { "env": { "DOCPIPE_DISABLE_OPENCV": "1" } },
+      "group": "test",
+      "problemMatcher": []
+    },
+    {
+      "label": "test: coverage of docpipe.py",
+      "detail": "pytest-cov ships in the dev extra; the report is a terminal summary with missing lines.",
+      "type": "process",
+      "command": "${command:python.interpreterPath}",
+      "args": ["-m", "pytest", "-q", "--cov=docpipe", "--cov-report=term-missing"],
+      "group": "test",
+      "problemMatcher": []
+    },
+
+    // -----------------------------------------------------------------
+    // Gate 6 -- the reference covers every public name
+    // -----------------------------------------------------------------
+    {
+      "label": "docs: build the API reference",
+      "detail": "ast-parses docpipe.py without importing it, so it needs no dependencies. site/ is build output -- do not commit it.",
+      "type": "process",
+      "command": "${command:python.interpreterPath}",
+      "args": ["docs/build_reference.py", "--out", "site/index.html"],
+      "group": "build",
+      "problemMatcher": []
+    },
+    {
+      "label": "docs: every public name is documented",
+      "detail": "Checks __all__ against the built page. Run the build task first. Fix the source, not the check.",
+      "type": "process",
+      "command": "${command:python.interpreterPath}",
+      "args": [
+        "-c",
+        "import ast, io, sys; page = io.open('site/index.html', encoding='utf-8').read(); tree = ast.parse(io.open('docpipe.py', encoding='utf-8').read()); exported = [e.value for s in tree.body if isinstance(s, ast.Assign) and any(getattr(t, 'id', '') == '__all__' for t in s.targets) for e in s.value.elts if isinstance(e, ast.Constant)]; missing = [n for n in exported if \"id='%s'\" % n not in page and not n.startswith('__')]; sys.exit('missing from the reference: ' + ', '.join(missing)) if missing else print('all %d exported names are documented' % len(exported))"
+      ],
+      "dependsOn": ["docs: build the API reference"],
+      "problemMatcher": []
+    },
+    {
+      "label": "docs: every function and class has a docstring",
+      "detail": "516/516 functions and 82/82 classes, and it stays that way.",
+      "type": "process",
+      "command": "${command:python.interpreterPath}",
+      "args": [
+        "-c",
+        "import ast, io; tree = ast.parse(io.open('docpipe.py', encoding='utf-8').read()); bad = ['docpipe.py:%d %s' % (n.lineno, n.name) for n in ast.walk(tree) if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)) and not ast.get_docstring(n)]; print('undocumented: %s' % (bad or 'none'))"
+      ],
+      "problemMatcher": []
+    },
+
+    // -----------------------------------------------------------------
+    // Type checking -- constraint 8, "zero errors across the repo"
+    // -----------------------------------------------------------------
+    {
+      "label": "types: pyright",
+      "detail": "Reads [tool.pyright] from pyproject.toml (pythonVersion 3.8). Needs `npx pyright` or a global install; Pylance reports the same thing live.",
+      "type": "shell",
+      "command": "pyright",
+      "problemMatcher": []
+    },
+
+    // -----------------------------------------------------------------
+    // The whole gate, in CI order
+    // -----------------------------------------------------------------
+    {
+      "label": "CI: all gates",
+      "detail": "Everything ci.yml and docs.yml run, in order. Stops at the first failure.",
+      "dependsOrder": "sequence",
+      "dependsOn": [
+        "gate: parses as Python 3.8",
+        "gate: version agrees across pyproject and __version__",
+        "gate: imports with no optional dependencies",
+        "gate: namespace staticmethods keep their aliases",
+        "test: full suite",
+        "test: no OpenCV (pure-NumPy fallbacks)",
+        "docs: every public name is documented"
+      ],
+      "group": { "kind": "build", "isDefault": true },
+      "problemMatcher": []
+    },
+
+    // -----------------------------------------------------------------
+    // The CLI, for a quick look at a real document
+    // -----------------------------------------------------------------
+    {
+      "label": "cli: caps (what is importable right now)",
+      "type": "process",
+      "command": "${command:python.interpreterPath}",
+      "args": ["-m", "docpipe", "caps"],
+      "problemMatcher": []
+    },
+    {
+      "label": "cli: quality of a document",
+      "detail": "Per-page degradation plus the ops the adaptive policy would apply -- the first thing to run when a document extracts badly.",
+      "type": "process",
+      "command": "${command:python.interpreterPath}",
+      "args": ["-m", "docpipe", "quality", "${input:documentPath}", "--show-policy"],
+      "problemMatcher": []
+    },
+    {
+      "label": "example: hospital_bill.py",
+      "detail": "End-to-end consumer example. Renders its own bill and reads it with a stub backend -- no OCR engine, no API key.",
+      "type": "process",
+      "command": "${command:python.interpreterPath}",
+      "args": ["examples/hospital_bill.py"],
+      "problemMatcher": []
+    }
+  ],
+
+  "inputs": [
+    {
+      "id": "documentPath",
+      "type": "promptString",
+      "description": "Path to a PDF, image, TIFF or .eml file",
+      "default": "pdfs/"
+    }
+  ]
+}

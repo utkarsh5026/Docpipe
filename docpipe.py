@@ -9,7 +9,9 @@ OCR/VLM reading backends, schema-driven extraction with provenance, calibrated
 confidence fusion, and an evaluation harness.
 
 Everything lives in this one module on purpose.  Copy ``docpipe.py`` into a
-project, or ``pip install`` it -- both work, and neither requires a build step.
+project, or ``pip install docpipe-core`` -- both work, and neither requires a
+build step.  (The distribution is ``docpipe-core`` because ``docpipe`` on PyPI
+is an unrelated project; the import name here is unaffected.)
 
 Design in one paragraph
 -----------------------
@@ -30,10 +32,39 @@ Layer 4     :func:`extract` -- schema in, typed result with evidence out
 Layer 3     :func:`read` -- pluggable, cost-aware OCR / VLM backends
 Layer 2     :func:`preprocess` -- composable ``Page -> Page`` ops
 Layer 1     :class:`Document` / :class:`Page` / :class:`TextSpan` / :class:`BBox`
-Layer 0     :func:`ingest` -- PDF, TIFF, image, email attachment
+Layer 0     :func:`Ingest.ingest` -- PDF, TIFF, image, email attachment
 ==========  ==================================================================
 
 Cross-cutting: caching, cost accounting, retries, tracing, provenance.
+
+Namespaces
+----------
+One file does not have to mean one flat heap of names.  Groups of free functions
+that share a subject are gathered onto a namespace class as staticmethods, and
+only the class is exported:
+
+==================  ======================================================
+:class:`Caps`       optional-dependency probing, the OpenCV kill switch
+:class:`Util`       hashing, clamping, string distance, JSON coercion
+:class:`Image`      raster primitives (arrays in, arrays out)
+:class:`Quality`    page-quality measures and estimators
+:class:`Ingest`     bytes of unknown provenance to a :class:`Document`
+:class:`Ops`        the preprocessing ops, as :class:`Op` factories
+:class:`Policies`   measured page to the ops it needs
+:class:`Pricing`    token accounting and the optional price table
+:class:`Text`       script detection, normalisation, value parsing
+:class:`Confidence` signal fusion and calibration metrics
+:class:`Validators` domain-independent validator factories
+==================  ======================================================
+
+Every one of those staticmethods is *also* a module attribute under its bare
+name -- ``dp.to_gray`` and ``dp.Image.to_gray`` are the same object.  The flat
+names are not decoration: they are how the staticmethods call one another, and
+they keep every existing call site working.  ``Image.to_gray`` is the documented
+path; ``to_gray`` is the one that already works.  Classes that carry state or
+are meant for subclassing (:class:`Page`, :class:`BaseBackend`,
+:class:`EvalSuite`) and the layer entry points (:func:`read`,
+:func:`preprocess`, :func:`extract`, :func:`process`) stay where they are.
 
 Quickstart
 ----------
@@ -41,8 +72,8 @@ Quickstart
 
     import docpipe as dp
 
-    doc = dp.ingest("claim_47812.pdf")
-    doc = dp.preprocess(doc, policy=dp.default_policy)
+    doc = dp.Ingest.ingest("claim_47812.pdf")
+    doc = dp.preprocess(doc, policy=dp.Policies.default_policy)
     doc = dp.read(doc, router=dp.default_router)
 
     print(doc.text()[:500])
@@ -81,7 +112,7 @@ pure standard library.  Everything heavier is optional and imported lazily:
 ``pydantic``                schema-driven extraction (v1 and v2 supported)
 ==========================  ================================================
 
-Call :func:`capabilities` to see what is actually importable right now.
+Call :func:`Caps.capabilities` to see what is actually importable right now.
 
 Compatibility
 -------------
@@ -137,20 +168,24 @@ from typing import (
     Generic,
     Iterator,
     List,
+    Literal,
     Mapping,
     Optional,
     Pattern,
     Sequence,
     Set,
     Tuple,
+    Type,
     TypeVar,
     Union,
+    cast,
 )
 
-try:  # pragma: no cover - trivial
-    from typing import Protocol
-except ImportError:  # pragma: no cover - Python 3.7
-    Protocol = object  # type: ignore
+#: ``typing.Protocol`` landed in 3.8, which is this file's floor, so it is
+#: imported outright.  The old ``except ImportError: Protocol = object`` fallback
+#: was dead code that also cost every structural type its meaning -- a checker
+#: reading it cannot tell whether a Protocol base is a class or an instance.
+from typing import Protocol
 
 # -----------------------------------------------------------------------------
 # Type aliases
@@ -174,7 +209,7 @@ GrayImage = Any
 #: A floating-point NumPy array -- an intermediate result of image maths
 #: (projections, integral images, gradient magnitudes) rather than a picture.
 FloatArray = Any
-#: A lazily imported optional dependency, obtained via :func:`require`.
+#: A lazily imported optional dependency, obtained via :func:`Caps.require`.
 Module = Any
 #: Anything a document can be ingested from: a filesystem path, raw bytes, or an
 #: open binary file object.
@@ -262,6 +297,10 @@ _PIP_NAMES = {
     "numpy": "numpy",
     "anthropic": "anthropic",
     "openai": "openai",
+    # The unified Google SDK, not the deprecated `google-generativeai`.  Probed
+    # by its dotted name because `google` alone is a namespace package that many
+    # unrelated Google libraries populate.
+    "google.genai": "google-genai",
     "pypdfium2": "pypdfium2",
 }
 
@@ -288,17 +327,71 @@ def _try_import(name: str) -> Optional[Module]:
         return mod
 
 
-def require(name: str, purpose: str = "") -> Module:
-    """Import ``name`` or raise :class:`MissingDependency` with a pip hint."""
-    mod = _try_import(name)
-    if mod is None:
-        raise MissingDependency(name, purpose, _PIP_NAMES.get(name, name))
-    return mod
+class Caps(object):
+    """Optional-dependency probing and the OpenCV kill switch.
+
+    Grouped so that a caller can ask one object what is importable right
+    now.  :func:`Caps.require` is the only sanctioned way to reach an
+    optional import: it raises :class:`MissingDependency` with a pip hint
+    at the point of the call, rather than letting an ``ImportError``
+    surface three frames deep inside a backend.
+    """
+
+    @staticmethod
+    def require(name: str, purpose: str = "") -> Module:
+        """Import ``name`` or raise :class:`MissingDependency` with a pip hint."""
+        mod = _try_import(name)
+        if mod is None:
+            raise MissingDependency(name, purpose, _PIP_NAMES.get(name, name))
+        return mod
+
+    @staticmethod
+    def have(name: str) -> bool:
+        """True when optional module ``name`` can be imported."""
+        return _try_import(name) is not None
+
+    @staticmethod
+    def set_opencv_enabled(enabled: bool) -> bool:
+        """Enable/disable OpenCV acceleration globally.  Returns the previous value."""
+        global _USE_OPENCV
+        prev = _USE_OPENCV
+        _USE_OPENCV = bool(enabled)
+        return prev
+
+    @staticmethod
+    def without_opencv() -> _OpenCVDisabled:
+        """``with docpipe.without_opencv(): ...`` -- force pure-NumPy image ops."""
+        return _OpenCVDisabled()
+
+    @staticmethod
+    def capabilities() -> Dict[str, bool]:
+        """Report which optional integrations are usable in this interpreter.
+
+        Cheap to call and safe at import time; useful in a health check.
+        """
+        names = [
+            "numpy", "cv2", "PIL", "pypdfium2", "pytesseract", "paddleocr",
+            "rapidocr_onnxruntime", "easyocr", "doctr", "surya", "pydantic",
+            "anthropic", "openai",
+        ]
+        caps: Dict[str, bool] = {}
+        for n in names:
+            caps[n] = have(n)
+        caps["pymupdf"] = _fitz() is not None
+        caps["tesseract_binary"] = shutil.which("tesseract") is not None
+        caps["opencv_enabled"] = bool(caps.get("cv2")) and _USE_OPENCV
+        return caps
 
 
-def have(name: str) -> bool:
-    """True when optional module ``name`` can be imported."""
-    return _try_import(name) is not None
+# Module-level aliases.  These are load-bearing, not merely back-compatible:
+# the staticmethods above call one another through these flat names, resolved
+# from module globals at call time.  Deleting them breaks Caps from the inside.
+# ``Caps.x`` is the documented path; ``x`` is the one that already works.
+require            = Caps.require
+have               = Caps.have
+set_opencv_enabled = Caps.set_opencv_enabled
+without_opencv     = Caps.without_opencv
+capabilities       = Caps.capabilities
 
 
 def _np() -> Module:
@@ -326,14 +419,6 @@ _USE_OPENCV = os.environ.get("DOCPIPE_DISABLE_OPENCV", "").strip().lower() \
     not in ("1", "true", "yes", "on")
 
 
-def set_opencv_enabled(enabled: bool) -> bool:
-    """Enable/disable OpenCV acceleration globally.  Returns the previous value."""
-    global _USE_OPENCV
-    prev = _USE_OPENCV
-    _USE_OPENCV = bool(enabled)
-    return prev
-
-
 def _cv2() -> Optional[Module]:
     """OpenCV if available *and* enabled, else ``None``.
 
@@ -352,34 +437,10 @@ class _OpenCVDisabled(object):
         self._prev = set_opencv_enabled(False)
         return self
 
-    def __exit__(self, *exc) -> bool:
+    def __exit__(self, *exc: Any) -> Literal[False]:
         """Restore the previous setting.  Never swallows an exception."""
         set_opencv_enabled(self._prev)
         return False
-
-
-def without_opencv() -> _OpenCVDisabled:
-    """``with docpipe.without_opencv(): ...`` -- force pure-NumPy image ops."""
-    return _OpenCVDisabled()
-
-
-def capabilities() -> Dict[str, bool]:
-    """Report which optional integrations are usable in this interpreter.
-
-    Cheap to call and safe at import time; useful in a health check.
-    """
-    names = [
-        "numpy", "cv2", "PIL", "pypdfium2", "pytesseract", "paddleocr",
-        "rapidocr_onnxruntime", "easyocr", "doctr", "surya", "pydantic",
-        "anthropic", "openai",
-    ]
-    caps: Dict[str, bool] = {}
-    for n in names:
-        caps[n] = have(n)
-    caps["pymupdf"] = _fitz() is not None
-    caps["tesseract_binary"] = shutil.which("tesseract") is not None
-    caps["opencv_enabled"] = bool(caps.get("cv2")) and _USE_OPENCV
-    return caps
 
 
 # =============================================================================
@@ -387,113 +448,177 @@ def capabilities() -> Dict[str, bool]:
 # =============================================================================
 
 
-def stable_hash(*parts: Any) -> str:
-    """A short, stable, cross-process content hash.
+class Util(object):
+    """Small, dependency-free helpers used across every layer.
 
-    ``hash()`` is salted per process and useless for caching; this is not.
+    Nothing here knows about documents.  They live together because they
+    are the handful of primitives -- stable hashing, clamping, string
+    distance, JSON coercion -- that the rest of the file assumes exist.
     """
-    h = hashlib.sha256()
-    for p in parts:
-        if p is None:
-            h.update(b"\x00none")
-        elif isinstance(p, bytes):
-            h.update(b"\x01"); h.update(p)
-        elif isinstance(p, str):
-            h.update(b"\x02"); h.update(p.encode("utf-8", "replace"))
-        elif isinstance(p, (int, float, bool)):
-            h.update(b"\x03"); h.update(repr(p).encode("ascii"))
-        else:
-            h.update(b"\x04")
+
+    @staticmethod
+    def stable_hash(*parts: Any) -> str:
+        """A short, stable, cross-process content hash.
+
+        ``hash()`` is salted per process and useless for caching; this is not.
+        """
+        h = hashlib.sha256()
+        for p in parts:
+            if p is None:
+                h.update(b"\x00none")
+            elif isinstance(p, bytes):
+                h.update(b"\x01"); h.update(p)
+            elif isinstance(p, str):
+                h.update(b"\x02"); h.update(p.encode("utf-8", "replace"))
+            elif isinstance(p, (int, float, bool)):
+                h.update(b"\x03"); h.update(repr(p).encode("ascii"))
+            else:
+                h.update(b"\x04")
+                try:
+                    h.update(json.dumps(p, sort_keys=True, default=str).encode("utf-8"))
+                except Exception:
+                    h.update(repr(p).encode("utf-8", "replace"))
+        return h.hexdigest()[:32]
+
+    @staticmethod
+    def array_hash(arr: ImageArray) -> str:
+        """Content hash of a NumPy array, for caching backend reads."""
+        try:
+            buf = arr.tobytes()
+        except AttributeError:
+            return stable_hash(repr(arr))
+        return stable_hash(buf, str(getattr(arr, "shape", "")), str(getattr(arr, "dtype", "")))
+
+    @staticmethod
+    def clamp(value: float, lo: float, hi: float) -> float:
+        """Clamp ``value`` into ``[lo, hi]``."""
+        if value < lo:
+            return lo
+        if value > hi:
+            return hi
+        return value
+
+    @staticmethod
+    def percentile(values: Sequence[float], q: float) -> float:
+        """Linear-interpolated percentile without pulling in NumPy.
+
+        ``q`` is in ``[0, 100]``.  Returns ``0.0`` for an empty sequence, which is
+        the convention the metrics code below relies on.
+        """
+        if not values:
+            return 0.0
+        ordered = sorted(values)
+        if len(ordered) == 1:
+            return float(ordered[0])
+        pos = (len(ordered) - 1) * clamp(q, 0.0, 100.0) / 100.0
+        lo = int(math.floor(pos))
+        hi = int(math.ceil(pos))
+        if lo == hi:
+            return float(ordered[lo])
+        frac = pos - lo
+        return float(ordered[lo]) * (1.0 - frac) + float(ordered[hi]) * frac
+
+    @staticmethod
+    def levenshtein(a: str, b: str, max_distance: Optional[int] = None) -> int:
+        """Edit distance with an optional early-exit bound.
+
+        Iterative two-row DP: O(len(a) * len(b)) time, O(min) space.  When
+        ``max_distance`` is given and every cell in a row exceeds it, we bail out
+        early and return ``max_distance + 1``.
+        """
+        if a == b:
+            return 0
+        if not a:
+            return len(b)
+        if not b:
+            return len(a)
+        if len(a) < len(b):
+            a, b = b, a
+        if max_distance is not None and abs(len(a) - len(b)) > max_distance:
+            return max_distance + 1
+
+        previous = list(range(len(b) + 1))
+        for i, ca in enumerate(a, start=1):
+            current = [i]
+            best = current[0]
+            for j, cb in enumerate(b, start=1):
+                cost = 0 if ca == cb else 1
+                current.append(min(previous[j] + 1, current[j - 1] + 1, previous[j - 1] + cost))
+                if current[-1] < best:
+                    best = current[-1]
+            previous = current
+            if max_distance is not None and best > max_distance:
+                return max_distance + 1
+        return previous[-1]
+
+    @staticmethod
+    def similarity(a: str, b: str) -> float:
+        """Normalised similarity in ``[0, 1]``: ``1 - edit_distance / max_len``."""
+        if a == b:
+            return 1.0
+        if not a or not b:
+            return 0.0
+        return 1.0 - levenshtein(a, b) / float(max(len(a), len(b)))
+
+    @staticmethod
+    def retry_call(fn: Callable[[], T], attempts: int = 3, base_delay: float = 0.5,
+                   max_delay: float = 8.0, jitter: float = 0.25,
+                   retry_on: Tuple[Type[BaseException], ...] = (Exception,),
+                   give_up_on: Tuple[Type[BaseException], ...] = (),
+                   on_retry: Optional[Callable[[int, BaseException, float], None]] = None,
+                   sleep: Callable[[float], None] = time.sleep) -> T:
+        """Call ``fn`` with exponential backoff and full jitter.
+
+        ``give_up_on`` wins over ``retry_on`` so that non-retryable failures (bad
+        API key, malformed request) fail immediately instead of being hammered
+        three times and billed three times.  ``on_retry(attempt, exc, delay)`` is
+        the hook the cost tracker uses to record failed-but-charged attempts.
+        """
+        if attempts < 1:
+            raise ConfigError("attempts must be >= 1")
+        last: Optional[BaseException] = None
+        for attempt in range(1, attempts + 1):
             try:
-                h.update(json.dumps(p, sort_keys=True, default=str).encode("utf-8"))
-            except Exception:
-                h.update(repr(p).encode("utf-8", "replace"))
-    return h.hexdigest()[:32]
+                return fn()
+            except give_up_on:
+                raise
+            except retry_on as exc:
+                last = exc
+                if attempt >= attempts:
+                    break
+                delay = min(max_delay, base_delay * (2 ** (attempt - 1)))
+                delay += random.uniform(0.0, jitter * delay)
+                if on_retry is not None:
+                    on_retry(attempt, exc, delay)
+                logger.warning("attempt %d/%d failed (%s); retrying in %.2fs",
+                               attempt, attempts, exc, delay)
+                sleep(delay)
+        assert last is not None
+        raise last
+
+    @staticmethod
+    def to_json(obj: Any, indent: Optional[int] = 2, sort_keys: bool = False) -> str:
+        """Serialise any docpipe object graph to JSON."""
+        return json.dumps(_as_jsonable(obj), indent=indent, sort_keys=sort_keys, ensure_ascii=False)
 
 
-def array_hash(arr: ImageArray) -> str:
-    """Content hash of a NumPy array, for caching backend reads."""
-    try:
-        buf = arr.tobytes()
-    except AttributeError:
-        return stable_hash(repr(arr))
-    return stable_hash(buf, str(getattr(arr, "shape", "")), str(getattr(arr, "dtype", "")))
-
-
-def clamp(value: float, lo: float, hi: float) -> float:
-    """Clamp ``value`` into ``[lo, hi]``."""
-    if value < lo:
-        return lo
-    if value > hi:
-        return hi
-    return value
+# Module-level aliases.  These are load-bearing, not merely back-compatible:
+# the staticmethods above call one another through these flat names, resolved
+# from module globals at call time.  Deleting them breaks Util from the inside.
+# ``Util.x`` is the documented path; ``x`` is the one that already works.
+stable_hash = Util.stable_hash
+array_hash  = Util.array_hash
+clamp       = Util.clamp
+percentile  = Util.percentile
+levenshtein = Util.levenshtein
+similarity  = Util.similarity
+retry_call  = Util.retry_call
+to_json     = Util.to_json
 
 
 def _safe_div(a: float, b: float, default: float = 0.0) -> float:
     """``a / b``, or ``default`` when ``b`` is zero."""
     return a / b if b else default
-
-
-def percentile(values: Sequence[float], q: float) -> float:
-    """Linear-interpolated percentile without pulling in NumPy.
-
-    ``q`` is in ``[0, 100]``.  Returns ``0.0`` for an empty sequence, which is
-    the convention the metrics code below relies on.
-    """
-    if not values:
-        return 0.0
-    ordered = sorted(values)
-    if len(ordered) == 1:
-        return float(ordered[0])
-    pos = (len(ordered) - 1) * clamp(q, 0.0, 100.0) / 100.0
-    lo = int(math.floor(pos))
-    hi = int(math.ceil(pos))
-    if lo == hi:
-        return float(ordered[lo])
-    frac = pos - lo
-    return float(ordered[lo]) * (1.0 - frac) + float(ordered[hi]) * frac
-
-
-def levenshtein(a: str, b: str, max_distance: Optional[int] = None) -> int:
-    """Edit distance with an optional early-exit bound.
-
-    Iterative two-row DP: O(len(a) * len(b)) time, O(min) space.  When
-    ``max_distance`` is given and every cell in a row exceeds it, we bail out
-    early and return ``max_distance + 1``.
-    """
-    if a == b:
-        return 0
-    if not a:
-        return len(b)
-    if not b:
-        return len(a)
-    if len(a) < len(b):
-        a, b = b, a
-    if max_distance is not None and abs(len(a) - len(b)) > max_distance:
-        return max_distance + 1
-
-    previous = list(range(len(b) + 1))
-    for i, ca in enumerate(a, start=1):
-        current = [i]
-        best = current[0]
-        for j, cb in enumerate(b, start=1):
-            cost = 0 if ca == cb else 1
-            current.append(min(previous[j] + 1, current[j - 1] + 1, previous[j - 1] + cost))
-            if current[-1] < best:
-                best = current[-1]
-        previous = current
-        if max_distance is not None and best > max_distance:
-            return max_distance + 1
-    return previous[-1]
-
-
-def similarity(a: str, b: str) -> float:
-    """Normalised similarity in ``[0, 1]``: ``1 - edit_distance / max_len``."""
-    if a == b:
-        return 1.0
-    if not a or not b:
-        return 0.0
-    return 1.0 - levenshtein(a, b) / float(max(len(a), len(b)))
 
 
 class Timer(object):
@@ -511,7 +636,7 @@ class Timer(object):
         self.start = time.time()
         return self
 
-    def __exit__(self, *exc) -> bool:
+    def __exit__(self, *exc: Any) -> Literal[False]:
         """Stop the clock.  Never swallows an exception."""
         self.end = time.time()
         return False
@@ -521,41 +646,6 @@ class Timer(object):
         """Elapsed milliseconds -- so far, if the block has not exited yet."""
         end = self.end or time.time()
         return (end - self.start) * 1000.0
-
-
-def retry_call(fn: Callable[[], T], attempts: int = 3, base_delay: float = 0.5,
-               max_delay: float = 8.0, jitter: float = 0.25,
-               retry_on: Tuple[type, ...] = (Exception,), give_up_on: Tuple[type, ...] = (),
-               on_retry: Optional[Callable[[int, BaseException, float], None]] = None,
-               sleep: Callable[[float], None] = time.sleep) -> T:
-    """Call ``fn`` with exponential backoff and full jitter.
-
-    ``give_up_on`` wins over ``retry_on`` so that non-retryable failures (bad
-    API key, malformed request) fail immediately instead of being hammered
-    three times and billed three times.  ``on_retry(attempt, exc, delay)`` is
-    the hook the cost tracker uses to record failed-but-charged attempts.
-    """
-    if attempts < 1:
-        raise ConfigError("attempts must be >= 1")
-    last: Optional[BaseException] = None
-    for attempt in range(1, attempts + 1):
-        try:
-            return fn()
-        except give_up_on:
-            raise
-        except retry_on as exc:
-            last = exc
-            if attempt >= attempts:
-                break
-            delay = min(max_delay, base_delay * (2 ** (attempt - 1)))
-            delay += random.uniform(0.0, jitter * delay)
-            if on_retry is not None:
-                on_retry(attempt, exc, delay)
-            logger.warning("attempt %d/%d failed (%s); retrying in %.2fs",
-                           attempt, attempts, exc, delay)
-            sleep(delay)
-    assert last is not None
-    raise last
 
 
 def chunked(seq: Sequence[T], size: int) -> Iterator[List[T]]:
@@ -587,8 +677,14 @@ def _map_maybe_parallel(fn: Callable[[Any], Any], items: Sequence[Any],
 
 
 def _utcnow() -> str:
-    """Current UTC time as a second-resolution ISO-8601 string."""
-    return _dt.datetime.utcnow().replace(microsecond=0).isoformat() + "Z"
+    """Current UTC time as a second-resolution ISO-8601 string.
+
+    Reads the clock as an aware UTC datetime and then drops the offset, because
+    ``datetime.utcnow()`` is deprecated from 3.12 on.  The ``Z`` suffix is
+    appended by hand, so the output is unchanged: ``2026-08-12T09:15:00Z``.
+    """
+    return _dt.datetime.now(_dt.timezone.utc).replace(
+        microsecond=0, tzinfo=None).isoformat() + "Z"
 
 
 def _as_jsonable(obj: Any) -> Any:
@@ -617,27 +713,25 @@ def _as_jsonable(obj: Any) -> Any:
                 continue
             out[f.name] = _as_jsonable(getattr(obj, f.name))
         return out
+    # Deliberate duck typing: these three shapes come from optional dependencies
+    # that may not be installed, so they are probed rather than imported.
+    duck = cast(Any, obj)
     if hasattr(obj, "model_dump"):  # pydantic v2
         try:
-            return _as_jsonable(obj.model_dump())
+            return _as_jsonable(duck.model_dump())
         except Exception:
             pass
     if hasattr(obj, "dict"):  # pydantic v1
         try:
-            return _as_jsonable(obj.dict())
+            return _as_jsonable(duck.dict())
         except Exception:
             pass
     if hasattr(obj, "tolist"):  # numpy
         try:
-            return obj.tolist()
+            return duck.tolist()
         except Exception:
             pass
     return str(obj)
-
-
-def to_json(obj: Any, indent: Optional[int] = 2, sort_keys: bool = False) -> str:
-    """Serialise any docpipe object graph to JSON."""
-    return json.dumps(_as_jsonable(obj), indent=indent, sort_keys=sort_keys, ensure_ascii=False)
 
 
 # =============================================================================
@@ -670,7 +764,7 @@ class PageKind(str, enum.Enum):
 
 
 class Verdict(str, enum.Enum):
-    """Coarse readability judgement produced by :func:`measure_quality`."""
+    """Coarse readability judgement produced by :func:`Quality.measure_quality`."""
 
     CLEAN = "clean"
     DEGRADED = "degraded"
@@ -930,7 +1024,7 @@ class PageQuality(object):
 
     Every number here is a *measurement*, not a guess, and the preprocessing
     policy and confidence prior are both functions of these values.  See
-    :func:`measure_quality` for how each is computed.
+    :func:`Quality.measure_quality` for how each is computed.
     """
 
     blur: float = 1.0                  #: 0 = smeared, 1 = crisp (normalised VoL)
@@ -1523,46 +1617,6 @@ def image_shape(img: ImageArray) -> Tuple[int, int]:
     return (int(img.shape[0]), int(img.shape[1]))
 
 
-def ensure_uint8(img: ImageArray) -> ImageArray:
-    """Coerce any numeric array to uint8, scaling float [0,1] images by 255."""
-    np = _np()
-    arr = np.asarray(img)
-    if arr.dtype == np.uint8:
-        return arr
-    if arr.dtype in (np.float32, np.float64, np.float16):
-        peak = float(arr.max()) if arr.size else 0.0
-        if peak <= 1.0 + 1e-6:
-            arr = arr * 255.0
-    if arr.dtype == np.bool_:
-        arr = arr.astype(np.uint8) * 255
-        return arr
-    return np.clip(arr, 0, 255).astype(np.uint8)
-
-
-def to_gray(img: ImageArray) -> GrayImage:
-    """Grayscale view of ``img`` using ITU-R 601 luma weights."""
-    np = _np()
-    arr = ensure_uint8(img)
-    if arr.ndim == 2:
-        return arr
-    cv = _cv2()
-    if arr.shape[2] == 4:
-        arr = arr[:, :, :3]
-    if cv is not None:
-        return cv.cvtColor(arr, cv.COLOR_RGB2GRAY)
-    weights = np.array([0.299, 0.587, 0.114], dtype=np.float32)
-    return np.clip(arr[:, :, :3].astype(np.float32).dot(weights), 0, 255).astype(np.uint8)
-
-
-def to_rgb(img: ImageArray) -> ImageArray:
-    """3-channel RGB view of ``img``."""
-    np = _np()
-    arr = ensure_uint8(img)
-    if arr.ndim == 3:
-        return arr[:, :, :3]
-    return np.repeat(arr[:, :, None], 3, axis=2)
-
-
 def _integral(arr: ImageArray) -> FloatArray:
     """Summed-area table with a zero row/column, shape ``(H+1, W+1)``."""
     np = _np()
@@ -1570,54 +1624,554 @@ def _integral(arr: ImageArray) -> FloatArray:
     return np.pad(cs, ((1, 0), (1, 0)), mode="constant")
 
 
-def window_stats(gray: GrayImage, window: int) -> Tuple[FloatArray, FloatArray]:
-    """Local ``(mean, std)`` over a ``window x window`` neighbourhood.
-
-    Uses summed-area tables, so cost is independent of window size -- which is
-    what makes Sauvola-family binarisation practical at 300 DPI.  Windows are
-    clipped at the borders and the divisor tracks the clipped area, so edge
-    pixels are not biased toward black the way zero-padding would make them.
-    """
+def _rect_box_sum(arr: ImageArray, kh: int, kw: int) -> Tuple[FloatArray, FloatArray]:
+    """``(window_sums, window_counts)`` over a ``kh x kw`` rectangle, clamped."""
     np = _np()
-    g = np.asarray(gray, dtype=np.float64)
-    h, w = g.shape[:2]
-    r = max(1, int(window) // 2)
-    i1 = _integral(g)
-    i2 = _integral(g * g)
-
-    ys = np.arange(h)
-    xs = np.arange(w)
-    y0 = np.clip(ys - r, 0, h)
-    y1 = np.clip(ys + r + 1, 0, h)
-    x0 = np.clip(xs - r, 0, w)
-    x1 = np.clip(xs + r + 1, 0, w)
-
-    def block(integral: FloatArray) -> FloatArray:
-        """Sum over every clipped window at once, from a summed-area table."""
-        return (integral[np.ix_(y1, x1)] - integral[np.ix_(y0, x1)]
-                - integral[np.ix_(y1, x0)] + integral[np.ix_(y0, x0)])
-
+    a = np.asarray(arr, dtype=np.float64)
+    h, w = a.shape[:2]
+    ry, rx = max(0, kh // 2), max(0, kw // 2)
+    integral = _integral(a)
+    ys = np.arange(h); xs = np.arange(w)
+    y0 = np.clip(ys - ry, 0, h); y1 = np.clip(ys + ry + 1, 0, h)
+    x0 = np.clip(xs - rx, 0, w); x1 = np.clip(xs + rx + 1, 0, w)
+    sums = (integral[np.ix_(y1, x1)] - integral[np.ix_(y0, x1)]
+            - integral[np.ix_(y1, x0)] + integral[np.ix_(y0, x0)])
     counts = ((y1 - y0)[:, None] * (x1 - x0)[None, :]).astype(np.float64)
-    counts[counts == 0] = 1.0
-    mean = block(i1) / counts
-    var = np.maximum(block(i2) / counts - mean * mean, 0.0)
-    return mean, np.sqrt(var)
+    return sums, counts
 
 
-def box_blur(img: ImageArray, radius: int) -> ImageArray:
-    """Mean filter of radius ``radius`` (integral-image based in the fallback)."""
-    np = _np()
-    if radius < 1:
-        return ensure_uint8(img)
-    cv = _cv2()
-    arr = ensure_uint8(img)
-    k = 2 * int(radius) + 1
-    if cv is not None:
-        return cv.blur(arr, (k, k))
-    if arr.ndim == 3:
-        return np.stack([box_blur(arr[:, :, c], radius) for c in range(arr.shape[2])], axis=2)
-    mean, _ = window_stats(arr, k)
-    return np.clip(mean, 0, 255).astype(np.uint8)
+class Image(object):
+    """Raster primitives, each with an OpenCV path and a NumPy fallback.
+
+    Array convention: uint8, ``(H, W)`` greyscale or ``(H, W, 3)`` RGB --
+    RGB, not BGR.  The OpenCV boundary is crossed inside these helpers and
+    never outside them, which is what makes
+    :func:`Caps.set_opencv_enabled` a single switch rather than a hunt.
+
+    These take arrays and return arrays; they know nothing about a
+    :class:`Page`.  Pixel work that corrects a *measured* degradation is an
+    op instead -- see :class:`Ops`.
+    """
+
+    @staticmethod
+    def ensure_uint8(img: ImageArray) -> ImageArray:
+        """Coerce any numeric array to uint8, scaling float [0,1] images by 255."""
+        np = _np()
+        arr = np.asarray(img)
+        if arr.dtype == np.uint8:
+            return arr
+        if arr.dtype in (np.float32, np.float64, np.float16):
+            peak = float(arr.max()) if arr.size else 0.0
+            if peak <= 1.0 + 1e-6:
+                arr = arr * 255.0
+        if arr.dtype == np.bool_:
+            arr = arr.astype(np.uint8) * 255
+            return arr
+        return np.clip(arr, 0, 255).astype(np.uint8)
+
+    @staticmethod
+    def to_gray(img: ImageArray) -> GrayImage:
+        """Grayscale view of ``img`` using ITU-R 601 luma weights."""
+        np = _np()
+        arr = ensure_uint8(img)
+        if arr.ndim == 2:
+            return arr
+        cv = _cv2()
+        if arr.shape[2] == 4:
+            arr = arr[:, :, :3]
+        if cv is not None:
+            return cv.cvtColor(arr, cv.COLOR_RGB2GRAY)
+        weights = np.array([0.299, 0.587, 0.114], dtype=np.float32)
+        return np.clip(arr[:, :, :3].astype(np.float32).dot(weights), 0, 255).astype(np.uint8)
+
+    @staticmethod
+    def to_rgb(img: ImageArray) -> ImageArray:
+        """3-channel RGB view of ``img``."""
+        np = _np()
+        arr = ensure_uint8(img)
+        if arr.ndim == 3:
+            return arr[:, :, :3]
+        return np.repeat(arr[:, :, None], 3, axis=2)
+
+    @staticmethod
+    def window_stats(gray: GrayImage, window: int) -> Tuple[FloatArray, FloatArray]:
+        """Local ``(mean, std)`` over a ``window x window`` neighbourhood.
+
+        Uses summed-area tables, so cost is independent of window size -- which is
+        what makes Sauvola-family binarisation practical at 300 DPI.  Windows are
+        clipped at the borders and the divisor tracks the clipped area, so edge
+        pixels are not biased toward black the way zero-padding would make them.
+        """
+        np = _np()
+        g = np.asarray(gray, dtype=np.float64)
+        h, w = g.shape[:2]
+        r = max(1, int(window) // 2)
+        i1 = _integral(g)
+        i2 = _integral(g * g)
+
+        ys = np.arange(h)
+        xs = np.arange(w)
+        y0 = np.clip(ys - r, 0, h)
+        y1 = np.clip(ys + r + 1, 0, h)
+        x0 = np.clip(xs - r, 0, w)
+        x1 = np.clip(xs + r + 1, 0, w)
+
+        def block(integral: FloatArray) -> FloatArray:
+            """Sum over every clipped window at once, from a summed-area table."""
+            return (integral[np.ix_(y1, x1)] - integral[np.ix_(y0, x1)]
+                    - integral[np.ix_(y1, x0)] + integral[np.ix_(y0, x0)])
+
+        counts = ((y1 - y0)[:, None] * (x1 - x0)[None, :]).astype(np.float64)
+        counts[counts == 0] = 1.0
+        mean = block(i1) / counts
+        var = np.maximum(block(i2) / counts - mean * mean, 0.0)
+        return mean, np.sqrt(var)
+
+    @staticmethod
+    def box_blur(img: ImageArray, radius: int) -> ImageArray:
+        """Mean filter of radius ``radius`` (integral-image based in the fallback)."""
+        np = _np()
+        if radius < 1:
+            return ensure_uint8(img)
+        cv = _cv2()
+        arr = ensure_uint8(img)
+        k = 2 * int(radius) + 1
+        if cv is not None:
+            return cv.blur(arr, (k, k))
+        if arr.ndim == 3:
+            return np.stack([box_blur(arr[:, :, c], radius) for c in range(arr.shape[2])], axis=2)
+        mean, _ = window_stats(arr, k)
+        return np.clip(mean, 0, 255).astype(np.uint8)
+
+    @staticmethod
+    def gaussian_blur(img: ImageArray, sigma: float) -> ImageArray:
+        """Gaussian blur.  The fallback is three variance-matched box blurs.
+
+        The fallback still loses a little tail mass, because each pass rounds back
+        to uint8, so its effective sigma runs slightly under the request at large
+        radii.  Measured against :func:`Quality.measure_blur` the two paths agree to within
+        about 0.02 over sigma 0.8-4.0, which is what the tests assert.
+        """
+        if sigma <= 0:
+            return ensure_uint8(img)
+        cv = _cv2()
+        arr = ensure_uint8(img)
+        if cv is not None:
+            k = int(2 * round(3.0 * sigma) + 1)
+            return cv.GaussianBlur(arr, (k, k), sigma)
+        out = arr
+        for width in _box_widths_for_gaussian(sigma):
+            if width > 1:
+                out = box_blur(out, (width - 1) // 2)
+        return out
+
+    @staticmethod
+    def median_blur(img: ImageArray, ksize: int = 3) -> ImageArray:
+        """Median filter -- the right tool for salt-and-pepper scanner speckle."""
+        np = _np()
+        cv = _cv2()
+        arr = ensure_uint8(img)
+        if cv is not None:
+            k = int(ksize) | 1
+            return cv.medianBlur(arr, k)
+        if arr.ndim == 3:
+            return np.stack([median_blur(arr[:, :, c], ksize) for c in range(arr.shape[2])], axis=2)
+        r = max(1, int(ksize) // 2)
+        padded = np.pad(arr, r, mode="edge")
+        h, w = arr.shape
+        stack = []
+        for dy in range(-r, r + 1):
+            for dx in range(-r, r + 1):
+                stack.append(padded[r + dy:r + dy + h, r + dx:r + dx + w])
+        return np.median(np.stack(stack, axis=0), axis=0).astype(np.uint8)
+
+    @staticmethod
+    def resize_image(img: ImageArray, size: Optional[Tuple[int, int]] = None,
+                     scale: Optional[float] = None, interpolation: str = "auto") -> ImageArray:
+        """Resize to ``size=(width, height)`` or by ``scale``.
+
+        ``interpolation="auto"`` picks cubic when upscaling (preserves stroke edges
+        that OCR character models rely on) and area when downscaling (avoids the
+        aliasing that makes fine print look like noise).
+        """
+        np = _np()
+        arr = ensure_uint8(img)
+        h, w = image_shape(arr)
+        if size is None:
+            if not scale or abs(scale - 1.0) < 1e-9:
+                return arr
+            size = (max(1, int(round(w * scale))), max(1, int(round(h * scale))))
+        tw, th = int(size[0]), int(size[1])
+        if tw == w and th == h:
+            return arr
+        cv = _cv2()
+        if cv is not None:
+            if interpolation == "auto":
+                interp = cv.INTER_CUBIC if (tw * th) > (w * h) else cv.INTER_AREA
+            else:
+                interp = {"nearest": cv.INTER_NEAREST, "linear": cv.INTER_LINEAR,
+                          "cubic": cv.INTER_CUBIC, "area": cv.INTER_AREA,
+                          "lanczos": cv.INTER_LANCZOS4}.get(interpolation, cv.INTER_LINEAR)
+            return cv.resize(arr, (tw, th), interpolation=interp)
+        # Bilinear fallback with half-pixel centre alignment (matches OpenCV).
+        ys = (np.arange(th, dtype=np.float64) + 0.5) * (float(h) / th) - 0.5
+        xs = (np.arange(tw, dtype=np.float64) + 0.5) * (float(w) / tw) - 0.5
+        ys = np.clip(ys, 0, h - 1)
+        xs = np.clip(xs, 0, w - 1)
+        y0 = np.floor(ys).astype(np.int64)
+        x0 = np.floor(xs).astype(np.int64)
+        y1 = np.minimum(y0 + 1, h - 1)
+        x1 = np.minimum(x0 + 1, w - 1)
+        wy = (ys - y0)[:, None]
+        wx = (xs - x0)[None, :]
+        src = arr.astype(np.float64)
+        if src.ndim == 3:
+            wy = wy[:, :, None]
+            wx = wx[:, :, None]
+        top = src[np.ix_(y0, x0)] * (1 - wx) + src[np.ix_(y0, x1)] * wx
+        bot = src[np.ix_(y1, x0)] * (1 - wx) + src[np.ix_(y1, x1)] * wx
+        return np.clip(top * (1 - wy) + bot * wy, 0, 255).astype(np.uint8)
+
+    @staticmethod
+    def rotate_image(img: ImageArray, angle_deg: float, border_value: Optional[int] = None,
+                     expand: bool = True) -> ImageArray:
+        """Rotate counter-clockwise by ``angle_deg`` about the image centre.
+
+        ``expand=True`` grows the canvas so no content is clipped -- deskewing a
+        page and losing the top-right corner of the letterhead is a real failure
+        mode of the naive implementation.  ``border_value`` defaults to the
+        image's median, which keeps a white page white and a dark scan dark rather
+        than stamping black wedges that later confuse ink-coverage measurement.
+        """
+        np = _np()
+        arr = ensure_uint8(img)
+        if abs(angle_deg) < 1e-4:
+            return arr
+        h, w = image_shape(arr)
+        if border_value is None:
+            border_value = int(np.median(to_gray(arr)))
+        theta = math.radians(angle_deg)
+        cos_t, sin_t = abs(math.cos(theta)), abs(math.sin(theta))
+        if expand:
+            nw = int(math.ceil(w * cos_t + h * sin_t))
+            nh = int(math.ceil(w * sin_t + h * cos_t))
+        else:
+            nw, nh = w, h
+
+        cv = _cv2()
+        if cv is not None:
+            m = cv.getRotationMatrix2D((w / 2.0, h / 2.0), angle_deg, 1.0)
+            m[0, 2] += (nw - w) / 2.0
+            m[1, 2] += (nh - h) / 2.0
+            bv = (border_value, border_value, border_value) if arr.ndim == 3 else border_value
+            return cv.warpAffine(arr, m, (nw, nh), flags=cv.INTER_LINEAR,
+                                 borderMode=cv.BORDER_CONSTANT, borderValue=bv)
+
+        # Inverse mapping with bilinear sampling.
+        cy, cx = (nh - 1) / 2.0, (nw - 1) / 2.0
+        sy, sx = (h - 1) / 2.0, (w - 1) / 2.0
+        yy, xx = np.meshgrid(np.arange(nh, dtype=np.float64) - cy,
+                             np.arange(nw, dtype=np.float64) - cx, indexing="ij")
+        # Inverse of OpenCV's forward matrix [[c, s], [-s, c]], so that a positive
+        # angle rotates counter-clockwise in both code paths.
+        c, s = math.cos(theta), math.sin(theta)
+        src_x = c * xx - s * yy + sx
+        src_y = s * xx + c * yy + sy
+        valid = (src_x >= 0) & (src_x <= w - 1) & (src_y >= 0) & (src_y <= h - 1)
+        xc = np.clip(src_x, 0, w - 1)
+        yc = np.clip(src_y, 0, h - 1)
+        x0 = np.floor(xc).astype(np.int64); x1 = np.minimum(x0 + 1, w - 1)
+        y0 = np.floor(yc).astype(np.int64); y1 = np.minimum(y0 + 1, h - 1)
+        fx = (xc - x0); fy = (yc - y0)
+        src = arr.astype(np.float64)
+        if src.ndim == 3:
+            fx = fx[:, :, None]; fy = fy[:, :, None]
+            valid3 = valid[:, :, None]
+        else:
+            valid3 = valid
+        top = src[y0, x0] * (1 - fx) + src[y0, x1] * fx
+        bot = src[y1, x0] * (1 - fx) + src[y1, x1] * fx
+        out = top * (1 - fy) + bot * fy
+        out = np.where(valid3, out, float(border_value))
+        return np.clip(out, 0, 255).astype(np.uint8)
+
+    @staticmethod
+    def row_projection_at_angle(gray: GrayImage, angle_deg: float) -> FloatArray:
+        """Horizontal projection profile as if the image were rotated by ``angle_deg``.
+
+        Note carefully which axis is sheared.  Shearing *rows* horizontally --
+        the obvious reading of "shear to simulate rotation" -- leaves every row sum
+        unchanged, so a skew search built on it measures nothing but border
+        artefacts.  The columns must be shifted *vertically* instead, so that
+        content from a tilted text line lands in the same output row.
+
+        For angles under ~15 degrees a shear and a rotation give indistinguishable
+        profiles, and the shear costs one integer fancy-index instead of a full
+        resampling pass.
+        """
+        np = _np()
+        g = np.asarray(gray, dtype=np.float64)
+        h, w = g.shape[:2]
+        if abs(angle_deg) < 1e-6:
+            return g.sum(axis=1)
+        tan_t = math.tan(math.radians(angle_deg))
+        shifts = np.round((np.arange(w) - w / 2.0) * tan_t).astype(np.int64)
+        rows = np.clip(np.arange(h)[:, None] + shifts[None, :], 0, h - 1)
+        cols = np.arange(w)[None, :]
+        return g[rows, cols].sum(axis=1)
+
+    @staticmethod
+    def otsu_threshold(gray: GrayImage) -> int:
+        """Otsu's global threshold via between-class variance maximisation."""
+        np = _np()
+        g = to_gray(gray)
+        hist = np.bincount(g.ravel(), minlength=256).astype(np.float64)
+        total = float(g.size)
+        if total == 0:
+            return 128
+        p = hist / total
+        omega = np.cumsum(p)
+        mu = np.cumsum(p * np.arange(256))
+        mu_t = mu[-1]
+        denom = omega * (1.0 - omega)
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            sigma_b = np.where(denom > 1e-12, (mu_t * omega - mu) ** 2 / np.maximum(denom, 1e-12), 0.0)
+        # A cleanly bimodal image gives an entire *plateau* of equally optimal
+        # thresholds spanning the empty valley between the modes.  argmax would
+        # return its left edge, putting the threshold right against the dark mode,
+        # where a little sensor noise flips pixels to background.  Take the centre.
+        best = float(sigma_b.max())
+        if best <= 0.0:
+            return 128
+        optimal = np.nonzero(sigma_b >= best - 1e-9)[0]
+        return int(round(float(optimal.mean())))
+
+    @staticmethod
+    def ink_mask(gray: GrayImage, threshold: Optional[int] = None,
+                 adaptive: Any = "auto") -> GrayImage:
+        """Boolean mask of "ink" pixels (dark on light).
+
+        Otsu is the right default: it is cheap, global, and exact on an evenly-lit
+        page.  It is also catastrophically wrong on an unevenly-lit one -- under a
+        shadow gradient the darker *paper* falls below the global threshold, so a
+        third of the page is classified as ink.  Everything built on this mask then
+        fails together: ink coverage reads 40%, the skew search locks onto the
+        shadow boundary instead of the text lines, and stroke width becomes
+        meaningless.  Shadowed phone photographs are a primary input here, so the
+        mask checks for that case and switches to a local (Sauvola) threshold,
+        which is immune to it.
+
+        ``adaptive`` may be ``"auto"`` (default), ``True`` or ``False``.
+        """
+        g = to_gray(gray)
+        if threshold is not None:
+            return g <= int(threshold)
+        use_local = adaptive is True or (
+            adaptive == "auto" and measure_illumination(g) < _UNEVEN_ILLUMINATION)
+        if use_local and g.size >= 4096:
+            h, w = image_shape(g)
+            window = max(15, int(min(h, w) // 24) | 1)
+            return binarize_array(g, method="sauvola", window=window) == 0
+        return g <= otsu_threshold(g)
+
+    @staticmethod
+    def gradient_magnitude(gray: GrayImage) -> FloatArray:
+        """Sobel gradient magnitude as float64.  Used by the sharpness metric."""
+        np = _np()
+        g = to_gray(gray).astype(np.float64)
+        cv = _cv2()
+        if cv is not None:
+            gx = cv.Sobel(g, cv.CV_64F, 1, 0, ksize=3)
+            gy = cv.Sobel(g, cv.CV_64F, 0, 1, ksize=3)
+        else:
+            p = np.pad(g, 1, mode="edge")
+            # Separable Sobel: smooth with [1, 2, 1] across, differentiate with
+            # [-1, 0, 1] along -- identical kernel, three cheap array adds.
+            smooth_y = p[:-2, :] + 2.0 * p[1:-1, :] + p[2:, :]
+            gx = smooth_y[:, 2:] - smooth_y[:, :-2]
+            smooth_x = p[:, :-2] + 2.0 * p[:, 1:-1] + p[:, 2:]
+            gy = smooth_x[2:, :] - smooth_x[:-2, :]
+        return np.hypot(gx, gy)
+
+    @staticmethod
+    def morph_binary(mask: GrayImage, kh: int, kw: int, operation: str = "erode") -> GrayImage:
+        """Binary morphology with a rectangular structuring element.
+
+        Implemented with summed-area tables so that a 1x120 kernel (what line
+        removal needs) costs the same as a 3x3 one.
+        """
+        np = _np()
+        m = np.asarray(mask).astype(np.uint8)
+        cv = _cv2()
+        if cv is not None:
+            kernel = cv.getStructuringElement(cv.MORPH_RECT, (max(1, kw), max(1, kh)))
+            ops = {"erode": cv.MORPH_ERODE, "dilate": cv.MORPH_DILATE,
+                   "open": cv.MORPH_OPEN, "close": cv.MORPH_CLOSE}
+            if operation not in ops:
+                raise ConfigError("unknown morphological operation %r" % operation)
+            return cv.morphologyEx(m * 255, ops[operation], kernel).astype(bool)
+        if operation == "open":
+            return morph_binary(morph_binary(m, kh, kw, "erode"), kh, kw, "dilate")
+        if operation == "close":
+            return morph_binary(morph_binary(m, kh, kw, "dilate"), kh, kw, "erode")
+        sums, counts = _rect_box_sum(m, kh, kw)
+        if operation == "erode":
+            return sums >= counts - 1e-6
+        if operation == "dilate":
+            return sums > 0.5
+        raise ConfigError("unknown morphological operation %r" % operation)
+
+    @staticmethod
+    def estimate_background(gray: GrayImage, radius: Optional[int] = None) -> GrayImage:
+        """Estimate the page background (paper + lighting) with the text erased.
+
+        The kernel has to be *larger than the tallest glyph*, or the middle of a
+        text line survives as background and the correction punches a hole through
+        it.  Sized at 1/12 of the shorter side and clamped: big enough for body
+        text at any sane DPI, small enough to still follow a shadow gradient.
+        """
+        np = _np()
+        g = to_gray(gray)
+        h, w = image_shape(g)
+        if radius is None:
+            radius = int(clamp(min(h, w) // 12, 15, 101))
+        radius = max(3, int(radius) | 1)
+
+        cv = _cv2()
+        if cv is not None:
+            # RECT rather than ELLIPSE: OpenCV decomposes rectangular kernels into
+            # separable passes, so a 101x101 close stays affordable on a full page.
+            kernel = cv.getStructuringElement(cv.MORPH_RECT, (radius, radius))
+            closed = cv.morphologyEx(g, cv.MORPH_CLOSE, kernel)
+            return cv.GaussianBlur(closed, (0, 0), radius / 4.0)
+
+        # Fallback: block-maximum downsampling is grayscale dilation plus
+        # subsampling, which erases dark text in one pass and costs almost nothing.
+        # A median pass first is not optional -- the maximum over a 50x50 block is
+        # the brightest noise spike in 2500 samples, so on a grainy scan the raw
+        # block max sits several sigma above the true paper level and dividing by
+        # it darkens the whole page unevenly.
+        smoothed = median_blur(g, 3)
+        block = max(2, radius // 2)
+        pad_h = (-h) % block
+        pad_w = (-w) % block
+        padded = np.pad(smoothed, ((0, pad_h), (0, pad_w)), mode="edge")
+        ph, pw = padded.shape
+        coarse = padded.reshape(ph // block, block, pw // block, block).max(axis=(1, 3))
+        if min(coarse.shape) >= 3:
+            coarse = median_blur(ensure_uint8(coarse), 3)
+        smoothed = box_blur(ensure_uint8(coarse), 1)
+        return resize_image(smoothed, size=(w, h), interpolation="linear")
+
+    @staticmethod
+    def encode_png(img: ImageArray) -> bytes:
+        """Encode an array as PNG bytes -- what vision backends actually send."""
+        arr = ensure_uint8(img)
+        cv = _cv2()
+        if cv is not None:
+            rgb = to_rgb(arr) if arr.ndim == 3 else arr
+            data = rgb[:, :, ::-1] if rgb.ndim == 3 else rgb  # RGB -> BGR for cv2
+            ok, buf = cv.imencode(".png", data)
+            if ok:
+                return buf.tobytes()
+        pil = _try_import("PIL.Image")
+        if pil is not None:
+            bio = io.BytesIO()
+            pil.fromarray(arr).save(bio, format="PNG")
+            return bio.getvalue()
+        raise MissingDependency("PIL", "PNG encoding", "pillow")
+
+    @staticmethod
+    def encode_jpeg(img: ImageArray, quality: int = 88) -> bytes:
+        """Encode as JPEG.  Preferred for VLM calls: a 300 DPI page as PNG is
+        several megabytes, and the artefacts JPEG adds at q>=85 are well below what
+        the scanner already introduced."""
+        arr = ensure_uint8(img)
+        cv = _cv2()
+        if cv is not None:
+            rgb = to_rgb(arr)
+            ok, buf = cv.imencode(".jpg", rgb[:, :, ::-1],
+                                  [int(cv.IMWRITE_JPEG_QUALITY), int(quality)])
+            if ok:
+                return buf.tobytes()
+        pil = _try_import("PIL.Image")
+        if pil is not None:
+            bio = io.BytesIO()
+            pil.fromarray(to_rgb(arr)).save(bio, format="JPEG", quality=int(quality))
+            return bio.getvalue()
+        raise MissingDependency("PIL", "JPEG encoding", "pillow")
+
+    @staticmethod
+    def decode_image(data: bytes) -> ImageArray:
+        """Decode image bytes to a uint8 RGB/gray array.
+
+        Raises :class:`IngestError` -- not a Pillow or OpenCV exception -- when the
+        bytes are not a decodable image.  Callers batch-processing a directory or
+        walking email attachments need one exception type to catch, or a single
+        corrupt scan takes down the run.
+        """
+        np = _np()
+        if not data:
+            raise IngestError("cannot decode an empty image")
+        cv = _cv2()
+        if cv is not None:
+            try:
+                arr = cv.imdecode(np.frombuffer(data, dtype=np.uint8), cv.IMREAD_UNCHANGED)
+            except Exception:
+                arr = None
+            if arr is not None and arr.size:
+                if arr.ndim == 3:
+                    if arr.shape[2] == 4:
+                        arr = arr[:, :, :3]
+                    arr = arr[:, :, ::-1]  # BGR -> RGB
+                return ensure_uint8(np.ascontiguousarray(arr))
+        pil = _try_import("PIL.Image")
+        if pil is None:
+            raise MissingDependency("PIL", "image decoding", "pillow")
+        try:
+            im = pil.open(io.BytesIO(data))
+            im.load()
+            if im.mode not in ("L", "RGB"):
+                im = im.convert("RGB" if im.mode not in ("1", "I;16", "I", "F") else "L")
+            return ensure_uint8(np.array(im))
+        except Exception as exc:
+            raise IngestError("could not decode image (%d bytes, first bytes %r): %s"
+                              % (len(data), data[:8], exc))
+
+    @staticmethod
+    def save_image(img: ImageArray, path: str) -> str:
+        """Write an array to disk, choosing the encoder from the extension."""
+        ext = os.path.splitext(path)[1].lower()
+        data = encode_jpeg(img) if ext in (".jpg", ".jpeg") else encode_png(img)
+        with open(path, "wb") as fh:
+            fh.write(data)
+        return path
+
+
+# Module-level aliases.  These are load-bearing, not merely back-compatible:
+# the staticmethods above call one another through these flat names, resolved
+# from module globals at call time.  Deleting them breaks Image from the inside.
+# ``Image.x`` is the documented path; ``x`` is the one that already works.
+ensure_uint8            = Image.ensure_uint8
+to_gray                 = Image.to_gray
+to_rgb                  = Image.to_rgb
+window_stats            = Image.window_stats
+box_blur                = Image.box_blur
+gaussian_blur           = Image.gaussian_blur
+median_blur             = Image.median_blur
+resize_image            = Image.resize_image
+rotate_image            = Image.rotate_image
+row_projection_at_angle = Image.row_projection_at_angle
+otsu_threshold          = Image.otsu_threshold
+ink_mask                = Image.ink_mask
+gradient_magnitude      = Image.gradient_magnitude
+morph_binary            = Image.morph_binary
+estimate_background     = Image.estimate_background
+encode_png              = Image.encode_png
+encode_jpeg             = Image.encode_jpeg
+decode_image            = Image.decode_image
+save_image              = Image.save_image
 
 
 def _box_widths_for_gaussian(sigma: float, passes: int = 3) -> List[int]:
@@ -1651,330 +2205,14 @@ def _box_widths_for_gaussian(sigma: float, passes: int = 3) -> List[int]:
     return [lower if i < count else upper for i in range(passes)]
 
 
-def gaussian_blur(img: ImageArray, sigma: float) -> ImageArray:
-    """Gaussian blur.  The fallback is three variance-matched box blurs.
-
-    The fallback still loses a little tail mass, because each pass rounds back
-    to uint8, so its effective sigma runs slightly under the request at large
-    radii.  Measured against :func:`measure_blur` the two paths agree to within
-    about 0.02 over sigma 0.8-4.0, which is what the tests assert.
-    """
-    if sigma <= 0:
-        return ensure_uint8(img)
-    cv = _cv2()
-    arr = ensure_uint8(img)
-    if cv is not None:
-        k = int(2 * round(3.0 * sigma) + 1)
-        return cv.GaussianBlur(arr, (k, k), sigma)
-    out = arr
-    for width in _box_widths_for_gaussian(sigma):
-        if width > 1:
-            out = box_blur(out, (width - 1) // 2)
-    return out
-
-
-def median_blur(img: ImageArray, ksize: int = 3) -> ImageArray:
-    """Median filter -- the right tool for salt-and-pepper scanner speckle."""
-    np = _np()
-    cv = _cv2()
-    arr = ensure_uint8(img)
-    if cv is not None:
-        k = int(ksize) | 1
-        return cv.medianBlur(arr, k)
-    if arr.ndim == 3:
-        return np.stack([median_blur(arr[:, :, c], ksize) for c in range(arr.shape[2])], axis=2)
-    r = max(1, int(ksize) // 2)
-    padded = np.pad(arr, r, mode="edge")
-    h, w = arr.shape
-    stack = []
-    for dy in range(-r, r + 1):
-        for dx in range(-r, r + 1):
-            stack.append(padded[r + dy:r + dy + h, r + dx:r + dx + w])
-    return np.median(np.stack(stack, axis=0), axis=0).astype(np.uint8)
-
-
-def resize_image(img: ImageArray, size: Optional[Tuple[int, int]] = None,
-                 scale: Optional[float] = None, interpolation: str = "auto") -> ImageArray:
-    """Resize to ``size=(width, height)`` or by ``scale``.
-
-    ``interpolation="auto"`` picks cubic when upscaling (preserves stroke edges
-    that OCR character models rely on) and area when downscaling (avoids the
-    aliasing that makes fine print look like noise).
-    """
-    np = _np()
-    arr = ensure_uint8(img)
-    h, w = image_shape(arr)
-    if size is None:
-        if not scale or abs(scale - 1.0) < 1e-9:
-            return arr
-        size = (max(1, int(round(w * scale))), max(1, int(round(h * scale))))
-    tw, th = int(size[0]), int(size[1])
-    if tw == w and th == h:
-        return arr
-    cv = _cv2()
-    if cv is not None:
-        if interpolation == "auto":
-            interp = cv.INTER_CUBIC if (tw * th) > (w * h) else cv.INTER_AREA
-        else:
-            interp = {"nearest": cv.INTER_NEAREST, "linear": cv.INTER_LINEAR,
-                      "cubic": cv.INTER_CUBIC, "area": cv.INTER_AREA,
-                      "lanczos": cv.INTER_LANCZOS4}.get(interpolation, cv.INTER_LINEAR)
-        return cv.resize(arr, (tw, th), interpolation=interp)
-    # Bilinear fallback with half-pixel centre alignment (matches OpenCV).
-    ys = (np.arange(th, dtype=np.float64) + 0.5) * (float(h) / th) - 0.5
-    xs = (np.arange(tw, dtype=np.float64) + 0.5) * (float(w) / tw) - 0.5
-    ys = np.clip(ys, 0, h - 1)
-    xs = np.clip(xs, 0, w - 1)
-    y0 = np.floor(ys).astype(np.int64)
-    x0 = np.floor(xs).astype(np.int64)
-    y1 = np.minimum(y0 + 1, h - 1)
-    x1 = np.minimum(x0 + 1, w - 1)
-    wy = (ys - y0)[:, None]
-    wx = (xs - x0)[None, :]
-    src = arr.astype(np.float64)
-    if src.ndim == 3:
-        wy = wy[:, :, None]
-        wx = wx[:, :, None]
-    top = src[np.ix_(y0, x0)] * (1 - wx) + src[np.ix_(y0, x1)] * wx
-    bot = src[np.ix_(y1, x0)] * (1 - wx) + src[np.ix_(y1, x1)] * wx
-    return np.clip(top * (1 - wy) + bot * wy, 0, 255).astype(np.uint8)
-
-
-def rotate_image(img: ImageArray, angle_deg: float, border_value: Optional[int] = None,
-                 expand: bool = True) -> ImageArray:
-    """Rotate counter-clockwise by ``angle_deg`` about the image centre.
-
-    ``expand=True`` grows the canvas so no content is clipped -- deskewing a
-    page and losing the top-right corner of the letterhead is a real failure
-    mode of the naive implementation.  ``border_value`` defaults to the
-    image's median, which keeps a white page white and a dark scan dark rather
-    than stamping black wedges that later confuse ink-coverage measurement.
-    """
-    np = _np()
-    arr = ensure_uint8(img)
-    if abs(angle_deg) < 1e-4:
-        return arr
-    h, w = image_shape(arr)
-    if border_value is None:
-        border_value = int(np.median(to_gray(arr)))
-    theta = math.radians(angle_deg)
-    cos_t, sin_t = abs(math.cos(theta)), abs(math.sin(theta))
-    if expand:
-        nw = int(math.ceil(w * cos_t + h * sin_t))
-        nh = int(math.ceil(w * sin_t + h * cos_t))
-    else:
-        nw, nh = w, h
-
-    cv = _cv2()
-    if cv is not None:
-        m = cv.getRotationMatrix2D((w / 2.0, h / 2.0), angle_deg, 1.0)
-        m[0, 2] += (nw - w) / 2.0
-        m[1, 2] += (nh - h) / 2.0
-        bv = (border_value, border_value, border_value) if arr.ndim == 3 else border_value
-        return cv.warpAffine(arr, m, (nw, nh), flags=cv.INTER_LINEAR,
-                             borderMode=cv.BORDER_CONSTANT, borderValue=bv)
-
-    # Inverse mapping with bilinear sampling.
-    cy, cx = (nh - 1) / 2.0, (nw - 1) / 2.0
-    sy, sx = (h - 1) / 2.0, (w - 1) / 2.0
-    yy, xx = np.meshgrid(np.arange(nh, dtype=np.float64) - cy,
-                         np.arange(nw, dtype=np.float64) - cx, indexing="ij")
-    # Inverse of OpenCV's forward matrix [[c, s], [-s, c]], so that a positive
-    # angle rotates counter-clockwise in both code paths.
-    c, s = math.cos(theta), math.sin(theta)
-    src_x = c * xx - s * yy + sx
-    src_y = s * xx + c * yy + sy
-    valid = (src_x >= 0) & (src_x <= w - 1) & (src_y >= 0) & (src_y <= h - 1)
-    xc = np.clip(src_x, 0, w - 1)
-    yc = np.clip(src_y, 0, h - 1)
-    x0 = np.floor(xc).astype(np.int64); x1 = np.minimum(x0 + 1, w - 1)
-    y0 = np.floor(yc).astype(np.int64); y1 = np.minimum(y0 + 1, h - 1)
-    fx = (xc - x0); fy = (yc - y0)
-    src = arr.astype(np.float64)
-    if src.ndim == 3:
-        fx = fx[:, :, None]; fy = fy[:, :, None]
-        valid3 = valid[:, :, None]
-    else:
-        valid3 = valid
-    top = src[y0, x0] * (1 - fx) + src[y0, x1] * fx
-    bot = src[y1, x0] * (1 - fx) + src[y1, x1] * fx
-    out = top * (1 - fy) + bot * fy
-    out = np.where(valid3, out, float(border_value))
-    return np.clip(out, 0, 255).astype(np.uint8)
-
-
-def row_projection_at_angle(gray: GrayImage, angle_deg: float) -> FloatArray:
-    """Horizontal projection profile as if the image were rotated by ``angle_deg``.
-
-    Note carefully which axis is sheared.  Shearing *rows* horizontally --
-    the obvious reading of "shear to simulate rotation" -- leaves every row sum
-    unchanged, so a skew search built on it measures nothing but border
-    artefacts.  The columns must be shifted *vertically* instead, so that
-    content from a tilted text line lands in the same output row.
-
-    For angles under ~15 degrees a shear and a rotation give indistinguishable
-    profiles, and the shear costs one integer fancy-index instead of a full
-    resampling pass.
-    """
-    np = _np()
-    g = np.asarray(gray, dtype=np.float64)
-    h, w = g.shape[:2]
-    if abs(angle_deg) < 1e-6:
-        return g.sum(axis=1)
-    tan_t = math.tan(math.radians(angle_deg))
-    shifts = np.round((np.arange(w) - w / 2.0) * tan_t).astype(np.int64)
-    rows = np.clip(np.arange(h)[:, None] + shifts[None, :], 0, h - 1)
-    cols = np.arange(w)[None, :]
-    return g[rows, cols].sum(axis=1)
-
-
-def otsu_threshold(gray: GrayImage) -> int:
-    """Otsu's global threshold via between-class variance maximisation."""
-    np = _np()
-    g = to_gray(gray)
-    hist = np.bincount(g.ravel(), minlength=256).astype(np.float64)
-    total = float(g.size)
-    if total == 0:
-        return 128
-    p = hist / total
-    omega = np.cumsum(p)
-    mu = np.cumsum(p * np.arange(256))
-    mu_t = mu[-1]
-    denom = omega * (1.0 - omega)
-    with warnings.catch_warnings():
-        warnings.simplefilter("ignore")
-        sigma_b = np.where(denom > 1e-12, (mu_t * omega - mu) ** 2 / np.maximum(denom, 1e-12), 0.0)
-    # A cleanly bimodal image gives an entire *plateau* of equally optimal
-    # thresholds spanning the empty valley between the modes.  argmax would
-    # return its left edge, putting the threshold right against the dark mode,
-    # where a little sensor noise flips pixels to background.  Take the centre.
-    best = float(sigma_b.max())
-    if best <= 0.0:
-        return 128
-    optimal = np.nonzero(sigma_b >= best - 1e-9)[0]
-    return int(round(float(optimal.mean())))
-
-
 #: Below this illumination score a global threshold is unsafe -- see `ink_mask`.
 _UNEVEN_ILLUMINATION = 0.55
-
-
-def ink_mask(gray: GrayImage, threshold: Optional[int] = None,
-             adaptive: Any = "auto") -> GrayImage:
-    """Boolean mask of "ink" pixels (dark on light).
-
-    Otsu is the right default: it is cheap, global, and exact on an evenly-lit
-    page.  It is also catastrophically wrong on an unevenly-lit one -- under a
-    shadow gradient the darker *paper* falls below the global threshold, so a
-    third of the page is classified as ink.  Everything built on this mask then
-    fails together: ink coverage reads 40%, the skew search locks onto the
-    shadow boundary instead of the text lines, and stroke width becomes
-    meaningless.  Shadowed phone photographs are a primary input here, so the
-    mask checks for that case and switches to a local (Sauvola) threshold,
-    which is immune to it.
-
-    ``adaptive`` may be ``"auto"`` (default), ``True`` or ``False``.
-    """
-    g = to_gray(gray)
-    if threshold is not None:
-        return g <= int(threshold)
-    use_local = adaptive is True or (
-        adaptive == "auto" and measure_illumination(g) < _UNEVEN_ILLUMINATION)
-    if use_local and g.size >= 4096:
-        h, w = image_shape(g)
-        window = max(15, int(min(h, w) // 24) | 1)
-        return binarize_array(g, method="sauvola", window=window) == 0
-    return g <= otsu_threshold(g)
 
 
 def _percentile_np(arr: ImageArray, q: float) -> float:
     """``q``-th percentile of an array, via NumPy when it is loaded."""
     np = _np()
     return float(np.percentile(arr, q))
-
-
-def encode_png(img: ImageArray) -> bytes:
-    """Encode an array as PNG bytes -- what vision backends actually send."""
-    arr = ensure_uint8(img)
-    cv = _cv2()
-    if cv is not None:
-        rgb = to_rgb(arr) if arr.ndim == 3 else arr
-        data = rgb[:, :, ::-1] if rgb.ndim == 3 else rgb  # RGB -> BGR for cv2
-        ok, buf = cv.imencode(".png", data)
-        if ok:
-            return buf.tobytes()
-    pil = _try_import("PIL.Image")
-    if pil is not None:
-        bio = io.BytesIO()
-        pil.fromarray(arr).save(bio, format="PNG")
-        return bio.getvalue()
-    raise MissingDependency("PIL", "PNG encoding", "pillow")
-
-
-def encode_jpeg(img: ImageArray, quality: int = 88) -> bytes:
-    """Encode as JPEG.  Preferred for VLM calls: a 300 DPI page as PNG is
-    several megabytes, and the artefacts JPEG adds at q>=85 are well below what
-    the scanner already introduced."""
-    arr = ensure_uint8(img)
-    cv = _cv2()
-    if cv is not None:
-        rgb = to_rgb(arr)
-        ok, buf = cv.imencode(".jpg", rgb[:, :, ::-1],
-                              [int(cv.IMWRITE_JPEG_QUALITY), int(quality)])
-        if ok:
-            return buf.tobytes()
-    pil = _try_import("PIL.Image")
-    if pil is not None:
-        bio = io.BytesIO()
-        pil.fromarray(to_rgb(arr)).save(bio, format="JPEG", quality=int(quality))
-        return bio.getvalue()
-    raise MissingDependency("PIL", "JPEG encoding", "pillow")
-
-
-def decode_image(data: bytes) -> ImageArray:
-    """Decode image bytes to a uint8 RGB/gray array.
-
-    Raises :class:`IngestError` -- not a Pillow or OpenCV exception -- when the
-    bytes are not a decodable image.  Callers batch-processing a directory or
-    walking email attachments need one exception type to catch, or a single
-    corrupt scan takes down the run.
-    """
-    np = _np()
-    if not data:
-        raise IngestError("cannot decode an empty image")
-    cv = _cv2()
-    if cv is not None:
-        try:
-            arr = cv.imdecode(np.frombuffer(data, dtype=np.uint8), cv.IMREAD_UNCHANGED)
-        except Exception:
-            arr = None
-        if arr is not None and arr.size:
-            if arr.ndim == 3:
-                if arr.shape[2] == 4:
-                    arr = arr[:, :, :3]
-                arr = arr[:, :, ::-1]  # BGR -> RGB
-            return ensure_uint8(np.ascontiguousarray(arr))
-    pil = _try_import("PIL.Image")
-    if pil is None:
-        raise MissingDependency("PIL", "image decoding", "pillow")
-    try:
-        im = pil.open(io.BytesIO(data))
-        im.load()
-        if im.mode not in ("L", "RGB"):
-            im = im.convert("RGB" if im.mode not in ("1", "I;16", "I", "F") else "L")
-        return ensure_uint8(np.array(im))
-    except Exception as exc:
-        raise IngestError("could not decode image (%d bytes, first bytes %r): %s"
-                          % (len(data), data[:8], exc))
-
-
-def save_image(img: ImageArray, path: str) -> str:
-    """Write an array to disk, choosing the encoder from the extension."""
-    ext = os.path.splitext(path)[1].lower()
-    data = encode_jpeg(img) if ext in (".jpg", ".jpeg") else encode_png(img)
-    with open(path, "wb") as fh:
-        fh.write(data)
-    return path
 
 
 # =============================================================================
@@ -2014,25 +2252,6 @@ class QualityThresholds:
 DEFAULT_THRESHOLDS = QualityThresholds()
 
 
-def gradient_magnitude(gray: GrayImage) -> FloatArray:
-    """Sobel gradient magnitude as float64.  Used by the sharpness metric."""
-    np = _np()
-    g = to_gray(gray).astype(np.float64)
-    cv = _cv2()
-    if cv is not None:
-        gx = cv.Sobel(g, cv.CV_64F, 1, 0, ksize=3)
-        gy = cv.Sobel(g, cv.CV_64F, 0, 1, ksize=3)
-    else:
-        p = np.pad(g, 1, mode="edge")
-        # Separable Sobel: smooth with [1, 2, 1] across, differentiate with
-        # [-1, 0, 1] along -- identical kernel, three cheap array adds.
-        smooth_y = p[:-2, :] + 2.0 * p[1:-1, :] + p[2:, :]
-        gx = smooth_y[:, 2:] - smooth_y[:, :-2]
-        smooth_x = p[:, :-2] + 2.0 * p[:, 1:-1] + p[:, 2:]
-        gy = smooth_x[2:, :] - smooth_x[:-2, :]
-    return np.hypot(gx, gy)
-
-
 #: Bracketing values for the two sharpness sub-scores, calibrated on synthetic
 #: text degraded by known Gaussian blur and by known downsample-upsample loss;
 #: see tests/test_quality.py, which asserts monotonicity across both.
@@ -2040,398 +2259,531 @@ _BLUR_RATIO_FLOOR, _BLUR_RATIO_CEIL = 0.35, 0.80
 _BLUR_STEEP_FLOOR, _BLUR_STEEP_CEIL = 0.80, 3.50
 
 
-def measure_blur(gray: GrayImage) -> float:
-    """Sharpness in ``[0, 1]``, from edge-transition width.
+class Quality(object):
+    """Page quality measurement -- the evidence preprocessing acts on.
 
-    Variance of the Laplacian is the textbook answer and it is the wrong one
-    here.  It rises with noise, so a grainy scan scores *sharper* than a clean
-    one, and it falls on sparse pages, so a crisp page with little ink scores
-    blurry.  Both are everyday cases in scanned bills.
-
-    Two independent sub-scores are computed instead, and the **worse of the two
-    wins**, because each covers the other's blind spot:
-
-    *Concentration* -- the fraction of edge pixels carrying strong gradient.  A
-    sharp edge puts its whole intensity step into one or two pixels; blurring
-    spreads it over many pixels of medium gradient.  Being a ratio it is
-    immune to contrast and to noise, and it correctly catches a low-resolution
-    page that was upsampled.  It *saturates* under extreme blur, where the
-    gradient field becomes smooth and self-similar.
-
-    *Steepness* -- peak gradient divided by the ink-to-paper step, i.e. the
-    reciprocal of the edge's transition width in pixels.  It degrades cleanly
-    all the way into heavy blur, but it is fooled by noise (which supplies
-    spurious steep gradients) and by upsampling.
-
-    The result is contrast-invariant by construction: a faded page and a dark
-    one score the same, which is correct, because fading is
-    :func:`measure_contrast`'s job to report, not this one's.
-
-    Roughly: crisp print ~0.9, Gaussian sigma=1 ~0.6, sigma=2 ~0.45,
-    sigma=4 ~0.3, sigma=8 ~0.05, a 120 DPI scan upsampled to 300 ~0.18.
+    Every measure is deliberately cheap and scale-aware, because the point
+    is to decide what to *do* to a page, not to score it for its own sake.
+    A measure that cost as much as the OCR it is protecting would be worse
+    than no measure at all.
     """
-    np = _np()
-    g = to_gray(gray)
-    if g.size < 256:
-        return 0.0
-    mag = gradient_magnitude(g)
-    peak = float(np.percentile(mag, 99.9))
-    if peak < 5.0:  # no edges at all: a blank page is not "blurry"
-        return 1.0 if float(np.std(g)) < 2.0 else 0.0
-    weak = float((mag > 0.15 * peak).sum())
-    if weak < 32:
-        return 1.0
 
-    concentration = float((mag > 0.50 * peak).sum()) / weak
-    concentration_score = clamp(
-        (concentration - _BLUR_RATIO_FLOOR) / (_BLUR_RATIO_CEIL - _BLUR_RATIO_FLOOR),
-        0.0, 1.0)
+    @staticmethod
+    def measure_blur(gray: GrayImage) -> float:
+        """Sharpness in ``[0, 1]``, from edge-transition width.
 
-    step = max(measure_contrast(g) * 255.0, 1.0)
-    steepness = peak / step
-    steepness_score = clamp(
-        (steepness - _BLUR_STEEP_FLOOR) / (_BLUR_STEEP_CEIL - _BLUR_STEEP_FLOOR),
-        0.0, 1.0)
+        Variance of the Laplacian is the textbook answer and it is the wrong one
+        here.  It rises with noise, so a grainy scan scores *sharper* than a clean
+        one, and it falls on sparse pages, so a crisp page with little ink scores
+        blurry.  Both are everyday cases in scanned bills.
 
-    return round(float(min(concentration_score, steepness_score)), 4)
+        Two independent sub-scores are computed instead, and the **worse of the two
+        wins**, because each covers the other's blind spot:
 
+        *Concentration* -- the fraction of edge pixels carrying strong gradient.  A
+        sharp edge puts its whole intensity step into one or two pixels; blurring
+        spreads it over many pixels of medium gradient.  Being a ratio it is
+        immune to contrast and to noise, and it correctly catches a low-resolution
+        page that was upsampled.  It *saturates* under extreme blur, where the
+        gradient field becomes smooth and self-similar.
 
-def measure_contrast(gray: GrayImage) -> float:
-    """Contrast in ``[0, 1]`` -- specifically, ink-to-paper separation.
+        *Steepness* -- peak gradient divided by the ink-to-paper step, i.e. the
+        reciprocal of the edge's transition width in pixels.  It degrades cleanly
+        all the way into heavy blur, but it is fooled by noise (which supplies
+        spurious steep gradients) and by upsampling.
 
-    A generic 5th-95th percentile spread is wrong for documents: a perfectly
-    crisp page that is 97% white paper has both percentiles sitting at 255 and
-    reports zero contrast.  What actually matters to a recogniser is how far
-    the ink sits from the paper, so we split on Otsu and measure the gap
-    between the two populations, using inner percentiles on each side so that
-    antialiased edge pixels do not flatter the result.
+        The result is contrast-invariant by construction: a faded page and a dark
+        one score the same, which is correct, because fading is
+        :func:`Quality.measure_contrast`'s job to report, not this one's.
 
-    Falls back to the percentile spread when the page has too little (or too
-    much) ink for the split to mean anything.
-    """
-    np = _np()
-    g = to_gray(gray)
-    if g.size == 0:
-        return 0.0
-    mask = ink_mask(g)
-    coverage = float(mask.mean())
-    if 0.001 < coverage < 0.6:
-        ink_level = float(np.percentile(g[mask], 60))
-        paper_level = float(np.percentile(g[~mask], 40))
-        return round(float(clamp((paper_level - ink_level) / 255.0, 0.0, 1.0)), 4)
-    lo = _percentile_np(g, 5.0)
-    hi = _percentile_np(g, 95.0)
-    return round(float(clamp((hi - lo) / 255.0, 0.0, 1.0)), 4)
-
-
-def measure_ink_coverage(gray: GrayImage) -> float:
-    """Fraction of pixels that are ink, using an illumination-aware mask."""
-    mask = ink_mask(gray)
-    return round(float(mask.mean()), 5) if mask.size else 0.0
-
-
-def measure_noise(gray: GrayImage) -> float:
-    """Speckle estimate in ``[0, 1]``.
-
-    The high-frequency residual (image minus its median-filtered self) contains
-    both text edges and noise.  Text edges are sparse and large; sensor noise is
-    dense and small, so the *median* absolute residual tracks noise while being
-    largely blind to text.
-    """
-    np = _np()
-    g = to_gray(gray)
-    if g.size < 64:
-        return 0.0
-    small = g if max(g.shape) <= 1200 else resize_image(g, scale=1200.0 / max(g.shape))
-    smooth = median_blur(small, 3).astype(np.float64)
-    residual = np.abs(small.astype(np.float64) - smooth)
-    mad = float(np.median(residual))
-    return round(float(clamp(mad / 12.0, 0.0, 1.0)), 4)
-
-
-def measure_illumination(gray: GrayImage) -> float:
-    """Lighting evenness in ``[0, 1]``; 1 is flat, 0 is a hard shadow gradient.
-
-    The page background is estimated by heavy downsampling (which averages text
-    away) and its spread measured.  This is what catches phone photos with a
-    shadow across one half -- the exact case where global binarisation destroys
-    a third of the page.
-    """
-    np = _np()
-    g = to_gray(gray).astype(np.float64)
-    if g.size < 256:
-        return 1.0
-    tiny = resize_image(ensure_uint8(g), size=(16, 16), interpolation="area").astype(np.float64)
-    spread = float(np.percentile(tiny, 90) - np.percentile(tiny, 10))
-    return round(float(clamp(1.0 - spread / 120.0, 0.0, 1.0)), 4)
-
-
-def estimate_skew(gray: GrayImage, max_angle: float = 15.0, method: str = "auto",
-                  coarse_step: float = 1.0, fine_step: float = 0.1,
-                  min_improvement: float = 0.15) -> float:
-    """Estimate the page's skew in degrees (positive = content tilted clockwise).
-
-    ``method``:
-
-    ``projection``
-        Coarse-to-fine search maximising the variance of the horizontal
-        projection profile.  Text lines align into sharp peaks only at the
-        correct angle.  Robust on sparse pages, needs no OpenCV, and is the
-        default because it degrades gracefully on forms and tables.
-    ``hough``
-        Probabilistic Hough transform over Canny edges, taking the median angle
-        of near-horizontal segments.  Excellent when ruled lines exist.
-    ``minarearect``
-        Minimum-area rectangle of all ink pixels.  Fast, but fooled by a single
-        stray margin mark, so it is only used inside ``auto``'s median.
-    ``auto``
-        Median of whichever of the above are available -- a cheap consensus
-        that avoids each method's individual failure mode.
-
-    ``min_improvement`` is how much better than the straight-page hypothesis a
-    candidate angle must score before it is believed; see ``by_projection``.
-
-    Returns ``0.0`` when the page has too little ink to judge, or when no angle
-    is convincingly better than leaving the page alone.
-    """
-    np = _np()
-    g = to_gray(gray)
-    if g.size < 1024:
-        return 0.0
-    # Work small: skew is a global property and 800px is plenty of evidence.
-    scale = 800.0 / max(g.shape)
-    small = resize_image(g, scale=scale) if scale < 1.0 else g
-    mask = ink_mask(small)
-    if mask.mean() < 0.0005 or mask.mean() > 0.9:
-        return 0.0
-
-    estimates: List[float] = []
-
-    def by_projection() -> float:
-        """Coarse-to-fine search for the angle with the sharpest projection.
-
-        Returns ``0.0`` when no angle beats the straight-page hypothesis by
-        ``min_improvement``.
+        Roughly: crisp print ~0.9, Gaussian sigma=1 ~0.6, sigma=2 ~0.45,
+        sigma=4 ~0.3, sigma=8 ~0.05, a 120 DPI scan upsampled to 300 ~0.18.
         """
-        # Only ink pixels can contribute to the profile, and they are a few
-        # percent of the page, so shifting the *coordinates* of the ink is
-        # dramatically cheaper than shearing the whole raster once per angle --
-        # and this search evaluates ~50 angles.
-        height, width = mask.shape[:2]
-        ink_y, ink_x = np.nonzero(mask)
-        if ink_y.size < 32:
+        np = _np()
+        g = to_gray(gray)
+        if g.size < 256:
             return 0.0
-        centred_x = (ink_x - width / 2.0)
+        mag = gradient_magnitude(g)
+        peak = float(np.percentile(mag, 99.9))
+        if peak < 5.0:  # no edges at all: a blank page is not "blurry"
+            return 1.0 if float(np.std(g)) < 2.0 else 0.0
+        weak = float((mag > 0.15 * peak).sum())
+        if weak < 32:
+            return 1.0
 
-        def score(angle: float) -> float:
-            """Variance of the row-projection profile after shearing by ``angle``."""
-            # Variance of the projection peaks sharply at the true angle:
-            # text lines only stack into tall, narrow bands when horizontal.
-            # Forward map, so the sign is the negative of the inverse-mapped
-            # shear in row_projection_at_angle -- the two must agree.
-            shifted = ink_y - np.round(centred_x * math.tan(math.radians(angle)))
-            # Ink sheared off the page is *discarded*, not clamped.  Clamping
-            # heaps every out-of-range pixel onto the first or last row, and
-            # since the amount sheared off grows with the angle, that artefact
-            # hands ever-larger variance to ever-more-extreme angles -- the
-            # search then reliably reports 15 degrees for a straight page.
-            inside = (shifted >= 0) & (shifted < height)
-            if not inside.any():
-                return 0.0
-            profile = np.bincount(shifted[inside].astype(np.int64), minlength=height)
-            total = float(profile.sum())
-            if total <= 0:
-                return 0.0
-            # Normalise to a distribution so angles that retain different
-            # amounts of ink remain comparable.
-            return float(np.var(profile / total))
+        concentration = float((mag > 0.50 * peak).sum()) / weak
+        concentration_score = clamp(
+            (concentration - _BLUR_RATIO_FLOOR) / (_BLUR_RATIO_CEIL - _BLUR_RATIO_FLOOR),
+            0.0, 1.0)
 
-        # Scan outward from zero so that ties keep the smaller angle.
-        candidates = [0.0]
-        step = coarse_step
-        while step <= max_angle + 1e-9:
-            candidates.extend([-step, step])
-            step += coarse_step
+        step = max(measure_contrast(g) * 255.0, 1.0)
+        steepness = peak / step
+        steepness_score = clamp(
+            (steepness - _BLUR_STEEP_FLOOR) / (_BLUR_STEEP_CEIL - _BLUR_STEEP_FLOOR),
+            0.0, 1.0)
 
-        baseline = score(0.0)
-        best_angle, best_score = 0.0, baseline
-        for angle in candidates:
-            s = score(angle)
-            if s > best_score:
-                best_score, best_angle = s, angle
+        return round(float(min(concentration_score, steepness_score)), 4)
 
-        a = max(-max_angle, best_angle - coarse_step)
-        stop = min(max_angle, best_angle + coarse_step)
-        refined_angle, refined_score = best_angle, best_score
-        while a <= stop + 1e-9:
-            s = score(a)
-            if s > refined_score * (1.0 + 1e-9):
-                refined_score, refined_angle = s, a
-            a += fine_step
+    @staticmethod
+    def measure_contrast(gray: GrayImage) -> float:
+        """Contrast in ``[0, 1]`` -- specifically, ink-to-paper separation.
 
-        # A "pages are roughly straight" prior, and it earns its keep.  On a
-        # noisy scan the ink mask picks up a few pathological dense rows, and
-        # at an extreme shear those smear into a concentration that can just
-        # beat the genuine text lines -- yielding a confident 15-degree answer
-        # for a page skewed by two.  Rotating on that is far more destructive
-        # than leaving a small skew uncorrected, so an angle has to beat the
-        # straight-page hypothesis by a clear margin before it is believed.
-        if baseline > 0 and refined_score <= baseline * (1.0 + min_improvement):
+        A generic 5th-95th percentile spread is wrong for documents: a perfectly
+        crisp page that is 97% white paper has both percentiles sitting at 255 and
+        reports zero contrast.  What actually matters to a recogniser is how far
+        the ink sits from the paper, so we split on Otsu and measure the gap
+        between the two populations, using inner percentiles on each side so that
+        antialiased edge pixels do not flatter the result.
+
+        Falls back to the percentile spread when the page has too little (or too
+        much) ink for the split to mean anything.
+        """
+        np = _np()
+        g = to_gray(gray)
+        if g.size == 0:
             return 0.0
-        return refined_angle
+        mask = ink_mask(g)
+        coverage = float(mask.mean())
+        if 0.001 < coverage < 0.6:
+            ink_level = float(np.percentile(g[mask], 60))
+            paper_level = float(np.percentile(g[~mask], 40))
+            return round(float(clamp((paper_level - ink_level) / 255.0, 0.0, 1.0)), 4)
+        lo = _percentile_np(g, 5.0)
+        hi = _percentile_np(g, 95.0)
+        return round(float(clamp((hi - lo) / 255.0, 0.0, 1.0)), 4)
 
-    def by_hough() -> Optional[float]:
-        """Median angle of near-horizontal Hough segments, or ``None``.
+    @staticmethod
+    def measure_ink_coverage(gray: GrayImage) -> float:
+        """Fraction of pixels that are ink, using an illumination-aware mask."""
+        mask = ink_mask(gray)
+        return round(float(mask.mean()), 5) if mask.size else 0.0
 
-        ``None`` means "no opinion" -- OpenCV missing, no lines found, or too few
-        to be worth a median -- and the caller drops it from the consensus.
+    @staticmethod
+    def measure_noise(gray: GrayImage) -> float:
+        """Speckle estimate in ``[0, 1]``.
+
+        The high-frequency residual (image minus its median-filtered self) contains
+        both text edges and noise.  Text edges are sparse and large; sensor noise is
+        dense and small, so the *median* absolute residual tracks noise while being
+        largely blind to text.
         """
-        cv = _cv2()
-        if cv is None:
-            return None
-        edges = cv.Canny(small, 50, 150, apertureSize=3)
-        min_len = max(30, int(small.shape[1] * 0.25))
-        lines = cv.HoughLinesP(edges, 1, math.pi / 720.0, threshold=80,
-                               minLineLength=min_len, maxLineGap=12)
-        if lines is None:
-            return None
-        angles = []
-        # OpenCV has shipped both (N, 1, 4) and (N, 4) for this over the years.
-        flat = lines.reshape(-1, 4)
-        for line in flat[:600]:
-            x1, y1, x2, y2 = line
-            if x2 == x1:
-                continue
-            ang = math.degrees(math.atan2(float(y2 - y1), float(x2 - x1)))
-            if abs(ang) <= max_angle:
-                angles.append(ang)
-        if len(angles) < 3:
-            return None
-        return float(statistics.median(angles))
+        np = _np()
+        g = to_gray(gray)
+        if g.size < 64:
+            return 0.0
+        small = g if max(g.shape) <= 1200 else resize_image(g, scale=1200.0 / max(g.shape))
+        smooth = median_blur(small, 3).astype(np.float64)
+        residual = np.abs(small.astype(np.float64) - smooth)
+        mad = float(np.median(residual))
+        return round(float(clamp(mad / 12.0, 0.0, 1.0)), 4)
 
-    def by_minarearect() -> Optional[float]:
-        """Angle of the minimum-area rectangle around all ink, or ``None``.
+    @staticmethod
+    def measure_illumination(gray: GrayImage) -> float:
+        """Lighting evenness in ``[0, 1]``; 1 is flat, 0 is a hard shadow gradient.
 
-        ``None`` means "no opinion" (see ``by_hough``).
+        The page background is estimated by heavy downsampling (which averages text
+        away) and its spread measured.  This is what catches phone photos with a
+        shadow across one half -- the exact case where global binarisation destroys
+        a third of the page.
         """
-        cv = _cv2()
-        if cv is None:
-            return None
-        pts = cv.findNonZero((mask.astype(np.uint8)) * 255)
-        if pts is None or len(pts) < 50:
-            return None
-        angle = cv.minAreaRect(pts)[-1]
-        # OpenCV's convention flipped at 4.5; normalise into (-45, 45].
-        while angle > 45.0:
-            angle -= 90.0
-        while angle <= -45.0:
-            angle += 90.0
-        if abs(angle) > max_angle:
-            return None
-        return float(angle)
+        np = _np()
+        g = to_gray(gray).astype(np.float64)
+        if g.size < 256:
+            return 1.0
+        tiny = resize_image(ensure_uint8(g), size=(16, 16), interpolation="area").astype(np.float64)
+        spread = float(np.percentile(tiny, 90) - np.percentile(tiny, 10))
+        return round(float(clamp(1.0 - spread / 120.0, 0.0, 1.0)), 4)
 
-    if method in ("projection", "auto"):
-        estimates.append(by_projection())
-    if method in ("hough", "auto"):
-        v = by_hough()
-        if v is not None:
-            estimates.append(v)
-    if method in ("minarearect", "auto"):
-        v = by_minarearect()
-        if v is not None:
-            estimates.append(v)
-    if method not in ("projection", "hough", "minarearect", "auto"):
-        raise ConfigError("unknown skew method %r" % method)
-    if not estimates:
-        return 0.0
-    return round(float(clamp(statistics.median(estimates), -max_angle, max_angle)), 3)
+    @staticmethod
+    def estimate_skew(gray: GrayImage, max_angle: float = 15.0, method: str = "auto",
+                      coarse_step: float = 1.0, fine_step: float = 0.1,
+                      min_improvement: float = 0.15) -> float:
+        """Estimate the page's skew in degrees (positive = content tilted clockwise).
+
+        ``method``:
+
+        ``projection``
+            Coarse-to-fine search maximising the variance of the horizontal
+            projection profile.  Text lines align into sharp peaks only at the
+            correct angle.  Robust on sparse pages, needs no OpenCV, and is the
+            default because it degrades gracefully on forms and tables.
+        ``hough``
+            Probabilistic Hough transform over Canny edges, taking the median angle
+            of near-horizontal segments.  Excellent when ruled lines exist.
+        ``minarearect``
+            Minimum-area rectangle of all ink pixels.  Fast, but fooled by a single
+            stray margin mark, so it is only used inside ``auto``'s median.
+        ``auto``
+            Median of whichever of the above are available -- a cheap consensus
+            that avoids each method's individual failure mode.
+
+        ``min_improvement`` is how much better than the straight-page hypothesis a
+        candidate angle must score before it is believed; see ``by_projection``.
+
+        Returns ``0.0`` when the page has too little ink to judge, or when no angle
+        is convincingly better than leaving the page alone.
+        """
+        np = _np()
+        g = to_gray(gray)
+        if g.size < 1024:
+            return 0.0
+        # Work small: skew is a global property and 800px is plenty of evidence.
+        scale = 800.0 / max(g.shape)
+        small = resize_image(g, scale=scale) if scale < 1.0 else g
+        mask = ink_mask(small)
+        if mask.mean() < 0.0005 or mask.mean() > 0.9:
+            return 0.0
+
+        estimates: List[float] = []
+
+        def by_projection() -> float:
+            """Coarse-to-fine search for the angle with the sharpest projection.
+
+            Returns ``0.0`` when no angle beats the straight-page hypothesis by
+            ``min_improvement``.
+            """
+            # Only ink pixels can contribute to the profile, and they are a few
+            # percent of the page, so shifting the *coordinates* of the ink is
+            # dramatically cheaper than shearing the whole raster once per angle --
+            # and this search evaluates ~50 angles.
+            height, width = mask.shape[:2]
+            ink_y, ink_x = np.nonzero(mask)
+            if ink_y.size < 32:
+                return 0.0
+            centred_x = (ink_x - width / 2.0)
+
+            def score(angle: float) -> float:
+                """Variance of the row-projection profile after shearing by ``angle``."""
+                # Variance of the projection peaks sharply at the true angle:
+                # text lines only stack into tall, narrow bands when horizontal.
+                # Forward map, so the sign is the negative of the inverse-mapped
+                # shear in row_projection_at_angle -- the two must agree.
+                shifted = ink_y - np.round(centred_x * math.tan(math.radians(angle)))
+                # Ink sheared off the page is *discarded*, not clamped.  Clamping
+                # heaps every out-of-range pixel onto the first or last row, and
+                # since the amount sheared off grows with the angle, that artefact
+                # hands ever-larger variance to ever-more-extreme angles -- the
+                # search then reliably reports 15 degrees for a straight page.
+                inside = (shifted >= 0) & (shifted < height)
+                if not inside.any():
+                    return 0.0
+                profile = np.bincount(shifted[inside].astype(np.int64), minlength=height)
+                total = float(profile.sum())
+                if total <= 0:
+                    return 0.0
+                # Normalise to a distribution so angles that retain different
+                # amounts of ink remain comparable.
+                return float(np.var(profile / total))
+
+            # Scan outward from zero so that ties keep the smaller angle.
+            candidates = [0.0]
+            step = coarse_step
+            while step <= max_angle + 1e-9:
+                candidates.extend([-step, step])
+                step += coarse_step
+
+            baseline = score(0.0)
+            best_angle, best_score = 0.0, baseline
+            for angle in candidates:
+                s = score(angle)
+                if s > best_score:
+                    best_score, best_angle = s, angle
+
+            a = max(-max_angle, best_angle - coarse_step)
+            stop = min(max_angle, best_angle + coarse_step)
+            refined_angle, refined_score = best_angle, best_score
+            while a <= stop + 1e-9:
+                s = score(a)
+                if s > refined_score * (1.0 + 1e-9):
+                    refined_score, refined_angle = s, a
+                a += fine_step
+
+            # A "pages are roughly straight" prior, and it earns its keep.  On a
+            # noisy scan the ink mask picks up a few pathological dense rows, and
+            # at an extreme shear those smear into a concentration that can just
+            # beat the genuine text lines -- yielding a confident 15-degree answer
+            # for a page skewed by two.  Rotating on that is far more destructive
+            # than leaving a small skew uncorrected, so an angle has to beat the
+            # straight-page hypothesis by a clear margin before it is believed.
+            if baseline > 0 and refined_score <= baseline * (1.0 + min_improvement):
+                return 0.0
+            return refined_angle
+
+        def by_hough() -> Optional[float]:
+            """Median angle of near-horizontal Hough segments, or ``None``.
+
+            ``None`` means "no opinion" -- OpenCV missing, no lines found, or too few
+            to be worth a median -- and the caller drops it from the consensus.
+            """
+            cv = _cv2()
+            if cv is None:
+                return None
+            edges = cv.Canny(small, 50, 150, apertureSize=3)
+            min_len = max(30, int(small.shape[1] * 0.25))
+            lines = cv.HoughLinesP(edges, 1, math.pi / 720.0, threshold=80,
+                                   minLineLength=min_len, maxLineGap=12)
+            if lines is None:
+                return None
+            angles = []
+            # OpenCV has shipped both (N, 1, 4) and (N, 4) for this over the years.
+            flat = lines.reshape(-1, 4)
+            for line in flat[:600]:
+                x1, y1, x2, y2 = line
+                if x2 == x1:
+                    continue
+                ang = math.degrees(math.atan2(float(y2 - y1), float(x2 - x1)))
+                if abs(ang) <= max_angle:
+                    angles.append(ang)
+            if len(angles) < 3:
+                return None
+            return float(statistics.median(angles))
+
+        def by_minarearect() -> Optional[float]:
+            """Angle of the minimum-area rectangle around all ink, or ``None``.
+
+            ``None`` means "no opinion" (see ``by_hough``).
+            """
+            cv = _cv2()
+            if cv is None:
+                return None
+            pts = cv.findNonZero((mask.astype(np.uint8)) * 255)
+            if pts is None or len(pts) < 50:
+                return None
+            angle = cv.minAreaRect(pts)[-1]
+            # OpenCV's convention flipped at 4.5; normalise into (-45, 45].
+            while angle > 45.0:
+                angle -= 90.0
+            while angle <= -45.0:
+                angle += 90.0
+            if abs(angle) > max_angle:
+                return None
+            return float(angle)
+
+        if method in ("projection", "auto"):
+            estimates.append(by_projection())
+        if method in ("hough", "auto"):
+            v = by_hough()
+            if v is not None:
+                estimates.append(v)
+        if method in ("minarearect", "auto"):
+            v = by_minarearect()
+            if v is not None:
+                estimates.append(v)
+        if method not in ("projection", "hough", "minarearect", "auto"):
+            raise ConfigError("unknown skew method %r" % method)
+        if not estimates:
+            return 0.0
+        return round(float(clamp(statistics.median(estimates), -max_angle, max_angle)), 3)
+
+    @staticmethod
+    def estimate_stroke_width(gray: GrayImage) -> float:
+        """Mean ink stroke thickness in pixels, from the area-to-perimeter ratio.
+
+        For an elongated shape, ``2 * area / perimeter`` is its width.  Cheap and
+        exact on clean print -- but it *inflates under blur*, because a soft edge
+        puts the Otsu threshold outside the true stroke and the halo is counted as
+        ink.  Callers must not use it as a resolution estimate on a soft page;
+        see :func:`Quality.estimate_line_pitch`.
+        """
+        np = _np()
+        mask = ink_mask(to_gray(gray))
+        area = float(mask.sum())
+        if area < 200 or mask.mean() > 0.5:
+            return 0.0
+        m = mask.astype(np.uint8)
+        padded = np.pad(m, 1, mode="constant")
+        neighbours = (padded[:-2, 1:-1] + padded[2:, 1:-1]
+                      + padded[1:-1, :-2] + padded[1:-1, 2:])
+        perimeter = float(((m == 1) & (neighbours < 4)).sum())
+        if perimeter < 1:
+            return 0.0
+        return 2.0 * area / perimeter
+
+    @staticmethod
+    def estimate_line_pitch(gray: GrayImage, min_pitch: int = 8, max_pitch: int = 200) -> float:
+        """Dominant text-line spacing in pixels, via autocorrelation, or ``0.0``.
+
+        Blur, fading and threshold choice all move stroke width around; none of
+        them move the distance between one baseline and the next.  That makes line
+        pitch the sturdiest resolution cue a page offers, and it is what
+        :func:`Quality.estimate_effective_dpi` prefers.
+
+        Returns ``0.0`` when the projection has no convincing periodicity -- a
+        title page, a photograph, or a form with irregular row heights.
+        """
+        np = _np()
+        g = to_gray(gray)
+        mask = ink_mask(g).astype(np.float64)
+        if mask.mean() < 0.002:
+            return 0.0
+        profile = mask.sum(axis=1)
+        profile = profile - profile.mean()
+        if float(np.std(profile)) < 1e-6:
+            return 0.0
+        correlation = np.correlate(profile, profile, mode="full")[len(profile) - 1:]
+        if correlation[0] <= 0:
+            return 0.0
+        correlation = correlation / correlation[0]
+        lo = int(min_pitch)
+        hi = min(int(max_pitch), len(correlation) - 1)
+        if hi <= lo + 2:
+            return 0.0
+        window = correlation[lo:hi]
+        # Genuine local maxima only.  A mean-plus-k-sigma test does not work here:
+        # a strongly periodic profile inflates its own standard deviation with
+        # harmonics, so the truer the periodicity the harder such a test is to
+        # pass.  Prominence above the preceding trough is the right measure.
+        peaks = [i for i in range(1, len(window) - 1)
+                 if window[i] > window[i - 1] and window[i] >= window[i + 1]]
+        if not peaks:
+            return 0.0
+        highest = max(float(window[i]) for i in peaks)
+        if highest < 0.30:
+            return 0.0
+        fundamental = max(peaks, key=lambda i: float(window[i]))
+
+        # Sub-harmonic correction.  Blank lines between paragraphs make a page
+        # partly periodic at twice the line pitch, and that longer lag can
+        # correlate *more* strongly than the true one -- reporting 2x the spacing
+        # would then halve the DPI estimate.  If a real peak sits near an integer
+        # fraction of the winner and is respectably strong, it is the fundamental.
+        for divisor in (4, 3, 2):
+            target = fundamental / float(divisor)
+            tolerance = max(1.5, target * 0.15)
+            nearby = [i for i in peaks if abs(i - target) <= tolerance]
+            if nearby:
+                candidate = max(nearby, key=lambda i: float(window[i]))
+                if float(window[candidate]) >= 0.6 * highest:
+                    fundamental = candidate
+                    break
+
+        trough = float(np.min(window[:fundamental + 1]))
+        if float(window[fundamental]) - trough < 0.25:
+            return 0.0
+        return float(lo + fundamental)
+
+    @staticmethod
+    def estimate_effective_dpi(gray: GrayImage, fallback: int = 0) -> int:
+        """Estimate the *content* resolution of a page image.
+
+        A page can be rendered at 600 DPI and still carry only 120 DPI of signal,
+        because it was scanned once at 120 and upsampled by three tools since.
+        Rendering DPI is therefore not resolution, and this is the number that
+        should drive :func:`Ops.ensure_dpi` and the confidence prior.
+
+        Two independent cues are used.  Line pitch is preferred: it survives blur,
+        fading and threshold choice, all of which distort stroke width.  Stroke
+        width is the fallback for pages with no regular text lines, and the two are
+        averaged when they roughly agree, which tightens the estimate on ordinary
+        prose.
+
+        Returns ``fallback`` when the page carries too little ink to judge.
+        """
+        g = to_gray(gray)
+        pitch = estimate_line_pitch(g)
+        pitch_dpi = pitch / _INCHES_PER_TEXT_LINE if pitch else 0.0
+
+        stroke = estimate_stroke_width(g)
+        stroke_dpi = 300.0 * stroke / _STROKE_PX_AT_300 if stroke else 0.0
+
+        if pitch_dpi and stroke_dpi and 0.6 <= stroke_dpi / pitch_dpi <= 1.6:
+            estimate = (pitch_dpi + stroke_dpi) / 2.0
+        elif pitch_dpi:
+            estimate = pitch_dpi
+        elif stroke_dpi:
+            estimate = stroke_dpi
+        else:
+            return int(fallback)
+        return int(clamp(round(estimate), 30, 1200))
+
+    @staticmethod
+    def classify_quality(q: PageQuality,
+                         thresholds: Optional[QualityThresholds] = None) -> Verdict:
+        """Turn measurements into ``clean`` / ``degraded`` / ``unreadable``.
+
+        ``unreadable`` is a routing signal, not a discard: those pages get the
+        vision model and a confidence penalty rather than being dropped, because a
+        human reviewer would rather see a low-confidence guess than a blank.
+        """
+        th = thresholds or DEFAULT_THRESHOLDS
+        if q.ink_coverage < th.ink_blank:
+            return Verdict.CLEAN  # blank, but not degraded -- nothing to misread
+        fatal = (q.blur < th.blur_unreadable
+                 or q.contrast < th.contrast_unreadable
+                 or (q.effective_dpi and q.effective_dpi < th.dpi_unreadable)
+                 or q.ink_coverage > th.ink_saturated)
+        if fatal:
+            return Verdict.UNREADABLE
+        degraded = (q.blur < th.blur_floor
+                    or q.contrast < th.contrast_floor
+                    or (q.effective_dpi and q.effective_dpi < th.min_dpi)
+                    or q.noise > th.noise_ceiling
+                    or q.illumination < th.illumination_floor
+                    or abs(q.skew_deg) > th.skew_correct_deg)
+        return Verdict.DEGRADED if degraded else Verdict.CLEAN
+
+    @staticmethod
+    def measure_quality(img: ImageArray, raster_dpi: int = 0,
+                        thresholds: Optional[QualityThresholds] = None,
+                        skew_method: str = "auto", max_skew: float = 15.0) -> PageQuality:
+        """Measure every channel-degradation signal for one page image."""
+        gray = to_gray(img)
+        q = PageQuality(
+            blur=measure_blur(gray),
+            skew_deg=estimate_skew(gray, max_angle=max_skew, method=skew_method),
+            contrast=measure_contrast(gray),
+            ink_coverage=measure_ink_coverage(gray),
+            noise=measure_noise(gray),
+            illumination=measure_illumination(gray),
+            raster_dpi=int(raster_dpi),
+        )
+        q.effective_dpi = estimate_effective_dpi(gray, fallback=int(raster_dpi))
+        h, w = image_shape(gray)
+        q.extra["pixels"] = float(w * h)
+        q.verdict = classify_quality(q, thresholds)
+        return q
+
+    @staticmethod
+    def measure_page(page: Page, dpi: Optional[int] = None,
+                     thresholds: Optional[QualityThresholds] = None, **kwargs: Any) -> Page:
+        """Measure ``page`` in place and return it.  No-op for pages without rasters."""
+        if not page.has_raster():
+            return page
+        with Timer() as t:
+            img = page.raster(dpi)
+            page.quality = measure_quality(img, raster_dpi=page.raster_dpi,
+                                           thresholds=thresholds, **kwargs)
+        page.record("measure_quality", {"dpi": page.raster_dpi}, t.ms)
+        return page
+
+    @staticmethod
+    def measure_document(doc: Document, dpi: Optional[int] = None,
+                         thresholds: Optional[QualityThresholds] = None, max_workers: int = 0,
+                         **kwargs: Any) -> Document:
+        """Measure every page's quality.  Returns the same Document, mutated."""
+        _map_maybe_parallel(
+            lambda p: measure_page(p, dpi=dpi, thresholds=thresholds, **kwargs),
+            doc.pages, max_workers, "measure")
+        return doc
 
 
-def estimate_stroke_width(gray: GrayImage) -> float:
-    """Mean ink stroke thickness in pixels, from the area-to-perimeter ratio.
-
-    For an elongated shape, ``2 * area / perimeter`` is its width.  Cheap and
-    exact on clean print -- but it *inflates under blur*, because a soft edge
-    puts the Otsu threshold outside the true stroke and the halo is counted as
-    ink.  Callers must not use it as a resolution estimate on a soft page;
-    see :func:`estimate_line_pitch`.
-    """
-    np = _np()
-    mask = ink_mask(to_gray(gray))
-    area = float(mask.sum())
-    if area < 200 or mask.mean() > 0.5:
-        return 0.0
-    m = mask.astype(np.uint8)
-    padded = np.pad(m, 1, mode="constant")
-    neighbours = (padded[:-2, 1:-1] + padded[2:, 1:-1]
-                  + padded[1:-1, :-2] + padded[1:-1, 2:])
-    perimeter = float(((m == 1) & (neighbours < 4)).sum())
-    if perimeter < 1:
-        return 0.0
-    return 2.0 * area / perimeter
-
-
-def estimate_line_pitch(gray: GrayImage, min_pitch: int = 8, max_pitch: int = 200) -> float:
-    """Dominant text-line spacing in pixels, via autocorrelation, or ``0.0``.
-
-    Blur, fading and threshold choice all move stroke width around; none of
-    them move the distance between one baseline and the next.  That makes line
-    pitch the sturdiest resolution cue a page offers, and it is what
-    :func:`estimate_effective_dpi` prefers.
-
-    Returns ``0.0`` when the projection has no convincing periodicity -- a
-    title page, a photograph, or a form with irregular row heights.
-    """
-    np = _np()
-    g = to_gray(gray)
-    mask = ink_mask(g).astype(np.float64)
-    if mask.mean() < 0.002:
-        return 0.0
-    profile = mask.sum(axis=1)
-    profile = profile - profile.mean()
-    if float(np.std(profile)) < 1e-6:
-        return 0.0
-    correlation = np.correlate(profile, profile, mode="full")[len(profile) - 1:]
-    if correlation[0] <= 0:
-        return 0.0
-    correlation = correlation / correlation[0]
-    lo = int(min_pitch)
-    hi = min(int(max_pitch), len(correlation) - 1)
-    if hi <= lo + 2:
-        return 0.0
-    window = correlation[lo:hi]
-    # Genuine local maxima only.  A mean-plus-k-sigma test does not work here:
-    # a strongly periodic profile inflates its own standard deviation with
-    # harmonics, so the truer the periodicity the harder such a test is to
-    # pass.  Prominence above the preceding trough is the right measure.
-    peaks = [i for i in range(1, len(window) - 1)
-             if window[i] > window[i - 1] and window[i] >= window[i + 1]]
-    if not peaks:
-        return 0.0
-    highest = max(float(window[i]) for i in peaks)
-    if highest < 0.30:
-        return 0.0
-    fundamental = max(peaks, key=lambda i: float(window[i]))
-
-    # Sub-harmonic correction.  Blank lines between paragraphs make a page
-    # partly periodic at twice the line pitch, and that longer lag can
-    # correlate *more* strongly than the true one -- reporting 2x the spacing
-    # would then halve the DPI estimate.  If a real peak sits near an integer
-    # fraction of the winner and is respectably strong, it is the fundamental.
-    for divisor in (4, 3, 2):
-        target = fundamental / float(divisor)
-        tolerance = max(1.5, target * 0.15)
-        nearby = [i for i in peaks if abs(i - target) <= tolerance]
-        if nearby:
-            candidate = max(nearby, key=lambda i: float(window[i]))
-            if float(window[candidate]) >= 0.6 * highest:
-                fundamental = candidate
-                break
-
-    trough = float(np.min(window[:fundamental + 1]))
-    if float(window[fundamental]) - trough < 0.25:
-        return 0.0
-    return float(lo + fundamental)
+# Module-level aliases.  These are load-bearing, not merely back-compatible:
+# the staticmethods above call one another through these flat names, resolved
+# from module globals at call time.  Deleting them breaks Quality from the inside.
+# ``Quality.x`` is the documented path; ``x`` is the one that already works.
+measure_blur           = Quality.measure_blur
+measure_contrast       = Quality.measure_contrast
+measure_ink_coverage   = Quality.measure_ink_coverage
+measure_noise          = Quality.measure_noise
+measure_illumination   = Quality.measure_illumination
+estimate_skew          = Quality.estimate_skew
+estimate_stroke_width  = Quality.estimate_stroke_width
+estimate_line_pitch    = Quality.estimate_line_pitch
+estimate_effective_dpi = Quality.estimate_effective_dpi
+classify_quality       = Quality.classify_quality
+measure_quality        = Quality.measure_quality
+measure_page           = Quality.measure_page
+measure_document       = Quality.measure_document
 
 
 #: Body text is typically set with ~1/6 inch of leading (12pt on 10pt type),
@@ -2440,110 +2792,6 @@ _INCHES_PER_TEXT_LINE = 1.0 / 6.0
 
 #: Body text strokes run ~3.2px wide at 300 DPI.
 _STROKE_PX_AT_300 = 3.2
-
-
-def estimate_effective_dpi(gray: GrayImage, fallback: int = 0) -> int:
-    """Estimate the *content* resolution of a page image.
-
-    A page can be rendered at 600 DPI and still carry only 120 DPI of signal,
-    because it was scanned once at 120 and upsampled by three tools since.
-    Rendering DPI is therefore not resolution, and this is the number that
-    should drive :func:`ensure_dpi` and the confidence prior.
-
-    Two independent cues are used.  Line pitch is preferred: it survives blur,
-    fading and threshold choice, all of which distort stroke width.  Stroke
-    width is the fallback for pages with no regular text lines, and the two are
-    averaged when they roughly agree, which tightens the estimate on ordinary
-    prose.
-
-    Returns ``fallback`` when the page carries too little ink to judge.
-    """
-    g = to_gray(gray)
-    pitch = estimate_line_pitch(g)
-    pitch_dpi = pitch / _INCHES_PER_TEXT_LINE if pitch else 0.0
-
-    stroke = estimate_stroke_width(g)
-    stroke_dpi = 300.0 * stroke / _STROKE_PX_AT_300 if stroke else 0.0
-
-    if pitch_dpi and stroke_dpi and 0.6 <= stroke_dpi / pitch_dpi <= 1.6:
-        estimate = (pitch_dpi + stroke_dpi) / 2.0
-    elif pitch_dpi:
-        estimate = pitch_dpi
-    elif stroke_dpi:
-        estimate = stroke_dpi
-    else:
-        return int(fallback)
-    return int(clamp(round(estimate), 30, 1200))
-
-
-def classify_quality(q: PageQuality,
-                     thresholds: Optional[QualityThresholds] = None) -> Verdict:
-    """Turn measurements into ``clean`` / ``degraded`` / ``unreadable``.
-
-    ``unreadable`` is a routing signal, not a discard: those pages get the
-    vision model and a confidence penalty rather than being dropped, because a
-    human reviewer would rather see a low-confidence guess than a blank.
-    """
-    th = thresholds or DEFAULT_THRESHOLDS
-    if q.ink_coverage < th.ink_blank:
-        return Verdict.CLEAN  # blank, but not degraded -- nothing to misread
-    fatal = (q.blur < th.blur_unreadable
-             or q.contrast < th.contrast_unreadable
-             or (q.effective_dpi and q.effective_dpi < th.dpi_unreadable)
-             or q.ink_coverage > th.ink_saturated)
-    if fatal:
-        return Verdict.UNREADABLE
-    degraded = (q.blur < th.blur_floor
-                or q.contrast < th.contrast_floor
-                or (q.effective_dpi and q.effective_dpi < th.min_dpi)
-                or q.noise > th.noise_ceiling
-                or q.illumination < th.illumination_floor
-                or abs(q.skew_deg) > th.skew_correct_deg)
-    return Verdict.DEGRADED if degraded else Verdict.CLEAN
-
-
-def measure_quality(img: ImageArray, raster_dpi: int = 0,
-                    thresholds: Optional[QualityThresholds] = None,
-                    skew_method: str = "auto", max_skew: float = 15.0) -> PageQuality:
-    """Measure every channel-degradation signal for one page image."""
-    gray = to_gray(img)
-    q = PageQuality(
-        blur=measure_blur(gray),
-        skew_deg=estimate_skew(gray, max_angle=max_skew, method=skew_method),
-        contrast=measure_contrast(gray),
-        ink_coverage=measure_ink_coverage(gray),
-        noise=measure_noise(gray),
-        illumination=measure_illumination(gray),
-        raster_dpi=int(raster_dpi),
-    )
-    q.effective_dpi = estimate_effective_dpi(gray, fallback=int(raster_dpi))
-    h, w = image_shape(gray)
-    q.extra["pixels"] = float(w * h)
-    q.verdict = classify_quality(q, thresholds)
-    return q
-
-
-def measure_page(page: Page, dpi: Optional[int] = None,
-                 thresholds: Optional[QualityThresholds] = None, **kwargs: Any) -> Page:
-    """Measure ``page`` in place and return it.  No-op for pages without rasters."""
-    if not page.has_raster():
-        return page
-    with Timer() as t:
-        img = page.raster(dpi)
-        page.quality = measure_quality(img, raster_dpi=page.raster_dpi,
-                                       thresholds=thresholds, **kwargs)
-    page.record("measure_quality", {"dpi": page.raster_dpi}, t.ms)
-    return page
-
-
-def measure_document(doc: Document, dpi: Optional[int] = None,
-                     thresholds: Optional[QualityThresholds] = None, max_workers: int = 0,
-                     **kwargs: Any) -> Document:
-    """Measure every page's quality.  Returns the same Document, mutated."""
-    _map_maybe_parallel(
-        lambda p: measure_page(p, dpi=dpi, thresholds=thresholds, **kwargs),
-        doc.pages, max_workers, "measure")
-    return doc
 
 
 # =============================================================================
@@ -2573,50 +2821,6 @@ _MAGIC = [
 IMAGE_FORMATS = frozenset(["png", "jpeg", "tiff", "bmp", "gif", "webp", "ico"])
 
 
-def sniff_format(data: bytes, filename: str = "") -> str:
-    """Identify a document format from its bytes, falling back to its name."""
-    head = data[:64] if data else b""
-    for magic, name in _MAGIC:
-        if head.startswith(magic):
-            return name
-    if head[:4] == b"RIFF" and data[8:12] == b"WEBP":
-        return "webp"
-    # PDFs occasionally carry junk before %PDF- (mail gateways, bad scanners).
-    idx = data[:2048].find(b"%PDF-") if data else -1
-    if idx > 0:
-        return "pdf"
-    if head.lstrip()[:5].lower() in (b"from:", b"retur", b"recei", b"messa", b"mime-",
-                                     b"date:", b"subje"):
-        return "eml"
-    ext = os.path.splitext(filename)[1].lower().lstrip(".")
-    if ext in ("jpg", "jpeg"):
-        return "jpeg"
-    if ext in ("tif", "tiff"):
-        return "tiff"
-    if ext in ("pdf", "png", "bmp", "gif", "webp", "eml", "msg"):
-        return "eml" if ext == "msg" else ext
-    return "unknown"
-
-
-def _read_source(source: Source) -> Tuple[bytes, str]:
-    """Normalise a path / bytes / file-like into ``(data, uri)``."""
-    if isinstance(source, (bytes, bytearray)):
-        return (bytes(source), "<bytes>")
-    if hasattr(source, "read"):
-        data = source.read()
-        name = getattr(source, "name", "<stream>")
-        if isinstance(data, str):
-            data = data.encode("utf-8")
-        return (data, str(name))
-    path = os.fspath(source) if hasattr(os, "fspath") else str(source)
-    if not os.path.exists(path):
-        raise IngestError("no such file: %s" % path)
-    with open(path, "rb") as fh:
-        return (fh.read(), path)
-
-
-# -- native text layer -------------------------------------------------------
-
 #: A page needs at least this many extracted characters before we will believe
 #: its text layer.  Scanned pages routinely carry a handful of characters from
 #: a header stamp or a producer watermark; trusting those and skipping OCR is
@@ -2624,148 +2828,447 @@ def _read_source(source: Source) -> Tuple[bytes, str]:
 MIN_NATIVE_CHARS = 48
 
 
-def classify_page_kind(char_count: int, image_area_ratio: float, has_images: bool,
-                       min_chars: int = MIN_NATIVE_CHARS,
-                       ink_hint: Optional[float] = None) -> PageKind:
-    """Decide how a page stores its text, from cheap PDF-level evidence.
+class Ingest(object):
+    """Layer 0 -- bytes of unknown provenance to a :class:`Document`.
 
-    ``image_area_ratio`` is the fraction of the page covered by embedded raster
-    images.  The interesting case is HYBRID: a native-text page with a scanned
-    insert pasted in (a photographed bill stapled into a typed claim form).
-    Those pages need *both* paths, and treating them as native silently loses
-    the insert -- which is usually where the numbers are.
+    Ingest never rasterises eagerly.  Pages carry a lazy ``raster()``
+    provider instead, because a 300-page bundle at 400 DPI rendered up
+    front is tens of gigabytes for a job that may only need page 2.
     """
-    if char_count >= min_chars:
-        if has_images and image_area_ratio > 0.35:
-            return PageKind.HYBRID
-        return PageKind.DIGITAL_NATIVE
-    if has_images or (ink_hint is not None and ink_hint > 0.002):
-        return PageKind.SCANNED
-    if char_count > 0:
-        return PageKind.SCANNED
-    return PageKind.BLANK
 
+    @staticmethod
+    def sniff_format(data: bytes, filename: str = "") -> str:
+        """Identify a document format from its bytes, falling back to its name."""
+        head = data[:64] if data else b""
+        for magic, name in _MAGIC:
+            if head.startswith(magic):
+                return name
+        if head[:4] == b"RIFF" and data[8:12] == b"WEBP":
+            return "webp"
+        # PDFs occasionally carry junk before %PDF- (mail gateways, bad scanners).
+        idx = data[:2048].find(b"%PDF-") if data else -1
+        if idx > 0:
+            return "pdf"
+        if head.lstrip()[:5].lower() in (b"from:", b"retur", b"recei", b"messa", b"mime-",
+                                         b"date:", b"subje"):
+            return "eml"
+        ext = os.path.splitext(filename)[1].lower().lstrip(".")
+        if ext in ("jpg", "jpeg"):
+            return "jpeg"
+        if ext in ("tif", "tiff"):
+            return "tiff"
+        if ext in ("pdf", "png", "bmp", "gif", "webp", "eml", "msg"):
+            return "eml" if ext == "msg" else ext
+        return "unknown"
 
-def ingest_pdf(source: Source, password: Optional[str] = None, max_pages: int = 0,
-               page_range: Optional[Sequence[int]] = None, render_dpi: int = DEFAULT_DPI,
-               extract_text: bool = True,
-               min_native_chars: int = MIN_NATIVE_CHARS) -> Document:
-    """Open a PDF, read any native text layer, and attach lazy page renderers.
+    @staticmethod
+    def classify_page_kind(char_count: int, image_area_ratio: float, has_images: bool,
+                           min_chars: int = MIN_NATIVE_CHARS,
+                           ink_hint: Optional[float] = None) -> PageKind:
+        """Decide how a page stores its text, from cheap PDF-level evidence.
 
-    Handles the three things that break naive PDF ingest in production:
-    encrypted-but-openable files (empty owner password), files with leading
-    junk before ``%PDF-``, and structurally damaged files that PyMuPDF can
-    repair on a second pass.
-    """
-    fitz = _fitz()
-    if fitz is None:
-        return _ingest_pdf_pdfium(source, max_pages=max_pages, page_range=page_range,
-                                  render_dpi=render_dpi)
+        ``image_area_ratio`` is the fraction of the page covered by embedded raster
+        images.  The interesting case is HYBRID: a native-text page with a scanned
+        insert pasted in (a photographed bill stapled into a typed claim form).
+        Those pages need *both* paths, and treating them as native silently loses
+        the insert -- which is usually where the numbers are.
+        """
+        if char_count >= min_chars:
+            if has_images and image_area_ratio > 0.35:
+                return PageKind.HYBRID
+            return PageKind.DIGITAL_NATIVE
+        if has_images or (ink_hint is not None and ink_hint > 0.002):
+            return PageKind.SCANNED
+        if char_count > 0:
+            return PageKind.SCANNED
+        return PageKind.BLANK
 
-    data, uri = _read_source(source)
-    junk = data[:2048].find(b"%PDF-")
-    if junk > 0:
-        data = data[junk:]
+    @staticmethod
+    def ingest_pdf(source: Source, password: Optional[str] = None, max_pages: int = 0,
+                   page_range: Optional[Sequence[int]] = None, render_dpi: int = DEFAULT_DPI,
+                   extract_text: bool = True,
+                   min_native_chars: int = MIN_NATIVE_CHARS) -> Document:
+        """Open a PDF, read any native text layer, and attach lazy page renderers.
 
-    try:
-        fdoc = fitz.open(stream=data, filetype="pdf")
-    except Exception as exc:
-        raise IngestError("could not open %s as PDF: %s" % (uri, exc))
+        Handles the three things that break naive PDF ingest in production:
+        encrypted-but-openable files (empty owner password), files with leading
+        junk before ``%PDF-``, and structurally damaged files that PyMuPDF can
+        repair on a second pass.
+        """
+        fitz = _fitz()
+        if fitz is None:
+            return _ingest_pdf_pdfium(source, max_pages=max_pages, page_range=page_range,
+                                      render_dpi=render_dpi)
 
-    doc = Document(source_uri=uri)
-    if getattr(fdoc, "needs_pass", False):
-        for candidate in ([password] if password else []) + ["", "owner"]:
-            try:
-                if fdoc.authenticate(candidate or ""):
-                    break
-            except Exception:
-                continue
-        else:
-            raise IngestError("%s is encrypted and no supplied password worked" % uri)
-        if password is None:
-            doc.warn("PDF was encrypted; opened with an empty password")
+        data, uri = _read_source(source)
+        junk = data[:2048].find(b"%PDF-")
+        if junk > 0:
+            data = data[junk:]
 
-    if getattr(fdoc, "is_repaired", False):
-        doc.warn("PDF was structurally damaged and has been repaired in memory")
-
-    total = fdoc.page_count
-    indices = list(page_range) if page_range is not None else list(range(total))
-    indices = [i for i in indices if 0 <= i < total]
-    if max_pages and len(indices) > max_pages:
-        doc.warn("truncated to first %d of %d pages" % (max_pages, total))
-        indices = indices[:max_pages]
-
-    doc.meta.update({
-        "format": "pdf",
-        "page_count": total,
-        "producer": (fdoc.metadata or {}).get("producer", ""),
-        "creator": (fdoc.metadata or {}).get("creator", ""),
-        "title": (fdoc.metadata or {}).get("title", ""),
-        "encrypted": bool(getattr(fdoc, "needs_pass", False)),
-        "checksum": stable_hash(data),
-        "ingested_at": _utcnow(),
-    })
-
-    for pno in indices:
-        fpage = fdoc[pno]
-        rect = fpage.rect
-        page = Page(index=pno, width_pt=float(rect.width), height_pt=float(rect.height),
-                    rotation=int(getattr(fpage, "rotation", 0) or 0))
-        page.meta["source"] = uri
-
-        char_count = 0
-        if extract_text:
-            try:
-                for w in fpage.get_text("words"):
-                    x0, y0, x1, y1, word = w[0], w[1], w[2], w[3], w[4]
-                    if not str(word).strip():
-                        continue
-                    block_no = int(w[5]) if len(w) > 5 else None
-                    line_no = int(w[6]) if len(w) > 6 else None
-                    page.spans.append(TextSpan(
-                        text=str(word), bbox=BBox(pno, float(x0), float(y0),
-                                                  float(x1), float(y1)),
-                        source="pymupdf", confidence=None,
-                        line=line_no, block=block_no))
-                    char_count += len(str(word).strip())
-            except Exception as exc:
-                doc.warn("text extraction failed on page %d: %s" % (pno, exc))
-
-        image_area = 0.0
-        has_images = False
         try:
-            for info in fpage.get_images(full=True):
-                has_images = True
+            fdoc = fitz.open(stream=data, filetype="pdf")
+        except Exception as exc:
+            raise IngestError("could not open %s as PDF: %s" % (uri, exc))
+
+        doc = Document(source_uri=uri)
+        if getattr(fdoc, "needs_pass", False):
+            for candidate in ([password] if password else []) + ["", "owner"]:
                 try:
-                    for r in fpage.get_image_rects(info[0]):
-                        image_area += float(r.width) * float(r.height)
+                    if fdoc.authenticate(candidate or ""):
+                        break
                 except Exception:
-                    pass
-        except Exception:
-            pass
-        page_area = float(rect.width) * float(rect.height) or 1.0
-        ratio = clamp(image_area / page_area, 0.0, 1.0)
+                    continue
+            else:
+                raise IngestError("%s is encrypted and no supplied password worked" % uri)
+            if password is None:
+                doc.warn("PDF was encrypted; opened with an empty password")
 
-        page.kind = classify_page_kind(char_count, ratio, has_images,
-                                       min_chars=min_native_chars)
-        page.meta["image_area_ratio"] = round(ratio, 4)
-        page.meta["native_chars"] = char_count
-        page.quality.raster_dpi = render_dpi
-        # A native text layer is exact by construction; skip the (expensive,
-        # and here meaningless) raster measurement unless something rasterises.
-        if page.kind is PageKind.DIGITAL_NATIVE:
-            page.quality.effective_dpi = max(render_dpi, DEFAULT_DPI)
-            page.quality.verdict = Verdict.CLEAN
-            page.quality.blur = 1.0
-            page.quality.contrast = 1.0
+        if getattr(fdoc, "is_repaired", False):
+            doc.warn("PDF was structurally damaged and has been repaired in memory")
 
-        page.set_raster_provider(_pdf_raster_provider(fdoc, pno), dpi=render_dpi)
-        doc.pages.append(page)
+        total = fdoc.page_count
+        indices = list(page_range) if page_range is not None else list(range(total))
+        indices = [i for i in indices if 0 <= i < total]
+        if max_pages and len(indices) > max_pages:
+            doc.warn("truncated to first %d of %d pages" % (max_pages, total))
+            indices = indices[:max_pages]
 
-    if not doc.pages:
-        doc.warn("PDF contained no pages in the requested range")
-    return doc
+        doc.meta.update({
+            "format": "pdf",
+            "page_count": total,
+            "producer": (fdoc.metadata or {}).get("producer", ""),
+            "creator": (fdoc.metadata or {}).get("creator", ""),
+            "title": (fdoc.metadata or {}).get("title", ""),
+            "encrypted": bool(getattr(fdoc, "needs_pass", False)),
+            "checksum": stable_hash(data),
+            "ingested_at": _utcnow(),
+        })
 
+        for pno in indices:
+            fpage = fdoc[pno]
+            rect = fpage.rect
+            page = Page(index=pno, width_pt=float(rect.width), height_pt=float(rect.height),
+                        rotation=int(getattr(fpage, "rotation", 0) or 0))
+            page.meta["source"] = uri
+
+            char_count = 0
+            if extract_text:
+                try:
+                    for w in fpage.get_text("words"):
+                        x0, y0, x1, y1, word = w[0], w[1], w[2], w[3], w[4]
+                        if not str(word).strip():
+                            continue
+                        block_no = int(w[5]) if len(w) > 5 else None
+                        line_no = int(w[6]) if len(w) > 6 else None
+                        page.spans.append(TextSpan(
+                            text=str(word), bbox=BBox(pno, float(x0), float(y0),
+                                                      float(x1), float(y1)),
+                            source="pymupdf", confidence=None,
+                            line=line_no, block=block_no))
+                        char_count += len(str(word).strip())
+                except Exception as exc:
+                    doc.warn("text extraction failed on page %d: %s" % (pno, exc))
+
+            image_area = 0.0
+            has_images = False
+            try:
+                for info in fpage.get_images(full=True):
+                    has_images = True
+                    try:
+                        for r in fpage.get_image_rects(info[0]):
+                            image_area += float(r.width) * float(r.height)
+                    except Exception:
+                        pass
+            except Exception:
+                pass
+            page_area = float(rect.width) * float(rect.height) or 1.0
+            ratio = clamp(image_area / page_area, 0.0, 1.0)
+
+            page.kind = classify_page_kind(char_count, ratio, has_images,
+                                           min_chars=min_native_chars)
+            page.meta["image_area_ratio"] = round(ratio, 4)
+            page.meta["native_chars"] = char_count
+            page.quality.raster_dpi = render_dpi
+            # A native text layer is exact by construction; skip the (expensive,
+            # and here meaningless) raster measurement unless something rasterises.
+            if page.kind is PageKind.DIGITAL_NATIVE:
+                page.quality.effective_dpi = max(render_dpi, DEFAULT_DPI)
+                page.quality.verdict = Verdict.CLEAN
+                page.quality.blur = 1.0
+                page.quality.contrast = 1.0
+
+            page.set_raster_provider(_pdf_raster_provider(fdoc, pno), dpi=render_dpi)
+            doc.pages.append(page)
+
+        if not doc.pages:
+            doc.warn("PDF contained no pages in the requested range")
+        return doc
+
+    @staticmethod
+    def ingest_image(source: Source, dpi: Optional[int] = None,
+                     page_index: int = 0) -> Document:
+        """Ingest a single-page image (PNG/JPEG/BMP/WebP) as a one-page Document."""
+        data, uri = _read_source(source)
+        img = decode_image(data)
+        detected_dpi = dpi or _image_dpi_hint(data) or DEFAULT_IMAGE_DPI
+        doc = Document(source_uri=uri, meta={
+            "format": sniff_format(data, uri), "page_count": 1,
+            "checksum": stable_hash(data), "ingested_at": _utcnow(),
+            "declared_dpi": detected_dpi,
+        })
+        doc.pages.append(_page_from_array(img, page_index, detected_dpi, uri))
+        return doc
+
+    @staticmethod
+    def ingest_tiff(source: Source, dpi: Optional[int] = None) -> Document:
+        """Ingest a (possibly multi-page) TIFF.  Fax archives are full of these."""
+        pil = _try_import("PIL.Image")
+        data, uri = _read_source(source)
+        if pil is None:
+            return ingest_image(data, dpi=dpi)
+        np = _np()
+        try:
+            im = pil.open(io.BytesIO(data))
+            frames = getattr(im, "n_frames", 1)
+        except Exception as exc:
+            raise IngestError("could not open %s as TIFF: %s" % (uri, exc))
+        detected_dpi = dpi or _image_dpi_hint(data) or DEFAULT_IMAGE_DPI
+        doc = Document(source_uri=uri, meta={
+            "format": "tiff", "page_count": frames, "checksum": stable_hash(data),
+            "ingested_at": _utcnow(), "declared_dpi": detected_dpi,
+        })
+        for i in range(frames):
+            im.seek(i)
+            frame = im.convert("L" if im.mode in ("1", "L", "I;16", "I") else "RGB")
+            arr = ensure_uint8(np.array(frame))
+            doc.pages.append(_page_from_array(arr, i, detected_dpi, uri))
+        return doc
+
+    @staticmethod
+    def ingest_email(source: Source, dpi: Optional[int] = None, include_body: bool = True,
+                     max_attachments: int = 50) -> Document:
+        """Ingest an ``.eml`` message: every readable attachment becomes pages.
+
+        Inbound claim registration lives on this path.  Attachments arrive as
+        native PDFs, scans, and images pasted into the body, all in one message,
+        and each part has to be routed on its actual bytes rather than its
+        filename.  Pages carry ``meta['attachment']`` so a downstream reviewer can
+        be told *which* attachment a field came from.
+        """
+        import email
+        from email import policy as _email_policy
+
+        data, uri = _read_source(source)
+        msg = email.message_from_bytes(data, policy=_email_policy.default)
+        doc = Document(source_uri=uri, meta={
+            "format": "eml", "checksum": stable_hash(data), "ingested_at": _utcnow(),
+            "subject": str(msg.get("subject", "")), "from": str(msg.get("from", "")),
+            "to": str(msg.get("to", "")), "date": str(msg.get("date", "")),
+        })
+
+        next_index = 0
+        attachments = 0
+        body_parts: List[str] = []
+
+        for part in msg.walk():
+            if part.get_content_maintype() == "multipart":
+                continue
+            filename = part.get_filename() or ""
+            disposition = (part.get("content-disposition") or "").lower()
+            ctype = part.get_content_type()
+
+            if ctype in ("text/plain", "text/html") and "attachment" not in disposition:
+                if include_body:
+                    try:
+                        body_parts.append(part.get_content())
+                    except Exception:
+                        pass
+                continue
+
+            if attachments >= max_attachments:
+                doc.warn("stopped after %d attachments" % max_attachments)
+                break
+            try:
+                payload = part.get_payload(decode=True)
+            except Exception as exc:
+                doc.warn("undecodable attachment %r: %s" % (filename, exc))
+                continue
+            # decode=True yields bytes or None; anything else means this part
+            # was not an encoded payload at all and cannot be ingested.
+            if not isinstance(payload, (bytes, bytearray)) or not payload:
+                continue
+            attachments += 1
+            try:
+                sub = ingest(payload, filename=filename, dpi=dpi)
+            except (IngestError, MissingDependency) as exc:
+                doc.warn("skipped attachment %r: %s" % (filename or ctype, exc))
+                continue
+            for p in sub.pages:
+                p.meta["attachment"] = filename or ctype
+                p.meta["attachment_index"] = attachments
+                p = _reindex_page(p, next_index)
+                next_index += 1
+                doc.pages.append(p)
+            doc.warnings.extend(w for w in sub.warnings if w not in doc.warnings)
+
+        if include_body and body_parts:
+            text = "\n\n".join(t for t in body_parts if t and t.strip())
+            if text.strip():
+                doc.meta["body_text"] = text
+                doc.pages.append(_text_only_page(text, next_index, "email-body"))
+
+        doc.meta["page_count"] = len(doc.pages)
+        doc.meta["attachments"] = attachments
+        if not doc.pages:
+            doc.warn("email contained no readable attachments or body")
+        return doc
+
+    @staticmethod
+    def page_from_image(img: ImageArray, index: int = 0, dpi: int = DEFAULT_IMAGE_DPI) -> Page:
+        """Public helper: build a :class:`Page` from an in-memory array."""
+        return _page_from_array(ensure_uint8(img), index, dpi)
+
+    @staticmethod
+    def document_from_images(images: Sequence[ImageArray], dpi: int = DEFAULT_IMAGE_DPI,
+                             source_uri: str = "<arrays>") -> Document:
+        """Public helper: build a :class:`Document` from in-memory arrays."""
+        doc = Document(source_uri=source_uri,
+                       meta={"format": "arrays", "page_count": len(images),
+                             "ingested_at": _utcnow()})
+        for i, img in enumerate(images):
+            doc.pages.append(_page_from_array(ensure_uint8(img), i, dpi))
+        return doc
+
+    @staticmethod
+    def ingest(source: Source, filename: str = "", dpi: Optional[int] = None,
+               password: Optional[str] = None, max_pages: int = 0,
+               page_range: Optional[Sequence[int]] = None, render_dpi: int = DEFAULT_DPI,
+               min_native_chars: int = MIN_NATIVE_CHARS) -> Document:
+        """Ingest anything: PDF, image, multi-page TIFF, ``.eml``, path or bytes.
+
+        Format is decided by content, not by extension.  Returns a :class:`Document`
+        whose pages are geometry-complete but *not* rasterised.
+
+        :param source: path, bytes, or a file-like object
+        :param filename: name hint used only when ``source`` is bytes
+        :param dpi: assumed resolution for bare images (default: metadata, else 200)
+        :param render_dpi: default resolution for PDF page rendering
+        :param max_pages: stop after this many pages (0 = no limit)
+        :param page_range: explicit zero-based page indices to keep
+        """
+        data, uri = _read_source(source)
+        if filename and uri in ("<bytes>", "<stream>"):
+            uri = filename
+        if not data:
+            raise IngestError("empty input: %s" % uri)
+        kind = sniff_format(data, filename or uri)
+
+        if kind == "pdf":
+            doc = ingest_pdf(data, password=password, max_pages=max_pages,
+                             page_range=page_range, render_dpi=render_dpi,
+                             min_native_chars=min_native_chars)
+        elif kind == "tiff":
+            doc = ingest_tiff(data, dpi=dpi)
+        elif kind in IMAGE_FORMATS:
+            doc = ingest_image(data, dpi=dpi)
+        elif kind == "eml":
+            doc = ingest_email(data, dpi=dpi)
+        else:
+            # Last resort: some scanners emit headerless JPEG-in-a-wrapper.
+            try:
+                doc = ingest_image(data, dpi=dpi)
+            except Exception:
+                raise IngestError("unrecognised format for %s (first bytes: %r)"
+                                  % (uri, data[:16]))
+        doc.source_uri = uri
+        if max_pages and len(doc.pages) > max_pages:
+            doc.pages = doc.pages[:max_pages]
+        return doc
+
+    @staticmethod
+    def ingest_dir(directory: str, pattern: Optional[str] = None, recursive: bool = True,
+                   **kwargs: Any) -> List[Document]:
+        """Ingest every readable document in a directory tree.
+
+        Unreadable files are reported as warnings on an empty Document rather than
+        aborting the batch -- a 5000-file inbox with three corrupt scans should
+        still process 4997 of them.
+        """
+        out: List[Document] = []
+        regex = re.compile(pattern) if pattern else None
+        for root, _dirs, files in os.walk(directory):
+            for name in sorted(files):
+                if name.startswith("."):
+                    continue
+                if regex is not None and not regex.search(name):
+                    continue
+                path = os.path.join(root, name)
+                try:
+                    out.append(ingest(path, **kwargs))
+                except Exception as exc:
+                    bad = Document(source_uri=path)
+                    bad.warn("ingest failed: %s" % exc)
+                    out.append(bad)
+            if not recursive:
+                break
+        return out
+
+    @staticmethod
+    def merge_documents(docs: Sequence[Document], source_uri: str = "<merged>") -> Document:
+        """Concatenate documents into one, renumbering pages and their bboxes."""
+        merged = Document(source_uri=source_uri, meta={"ingested_at": _utcnow(),
+                                                       "merged_from": len(docs)})
+        idx = 0
+        for d in docs:
+            for p in d.pages:
+                merged.pages.append(_reindex_page(p, idx))
+                idx += 1
+            for w in d.warnings:
+                if w not in merged.warnings:
+                    merged.warnings.append(w)
+        merged.meta["page_count"] = len(merged.pages)
+        return merged
+
+
+# Module-level aliases.  These are load-bearing, not merely back-compatible:
+# the staticmethods above call one another through these flat names, resolved
+# from module globals at call time.  Deleting them breaks Ingest from the inside.
+# ``Ingest.x`` is the documented path; ``x`` is the one that already works.
+sniff_format         = Ingest.sniff_format
+classify_page_kind   = Ingest.classify_page_kind
+ingest_pdf           = Ingest.ingest_pdf
+ingest_image         = Ingest.ingest_image
+ingest_tiff          = Ingest.ingest_tiff
+ingest_email         = Ingest.ingest_email
+page_from_image      = Ingest.page_from_image
+document_from_images = Ingest.document_from_images
+ingest               = Ingest.ingest
+ingest_dir           = Ingest.ingest_dir
+merge_documents      = Ingest.merge_documents
+
+
+def _read_source(source: Source) -> Tuple[bytes, str]:
+    """Normalise a path / bytes / file-like into ``(data, uri)``."""
+    if isinstance(source, (bytes, bytearray)):
+        return (bytes(source), "<bytes>")
+    if hasattr(source, "read"):
+        stream = cast(IO[bytes], source)
+        data = stream.read()
+        name = getattr(stream, "name", "<stream>")
+        if isinstance(data, str):
+            data = data.encode("utf-8")
+        return (data, str(name))
+    if not isinstance(source, (str, os.PathLike)):
+        raise IngestError("cannot read from %s: expected a path, bytes or a "
+                          "file-like object" % type(source).__name__)
+    path = os.fspath(source)
+    if not os.path.exists(path):
+        raise IngestError("no such file: %s" % path)
+    with open(path, "rb") as fh:
+        return (fh.read(), path)
+
+
+# -- native text layer -------------------------------------------------------
 
 def _pdf_raster_provider(fdoc: Any, pno: int) -> RasterProvider:
     """Closure that renders page ``pno`` at a requested DPI, on demand.
@@ -2776,7 +3279,7 @@ def _pdf_raster_provider(fdoc: Any, pno: int) -> RasterProvider:
     def provider(dpi: int) -> ImageArray:
         """Render this PDF page at ``dpi`` on demand."""
         np = _np()
-        fitz = _fitz(required=True)
+        fitz: Module = _fitz(required=True)   # required=True never returns None
         matrix = fitz.Matrix(dpi / 72.0, dpi / 72.0)
         pix = fdoc[pno].get_pixmap(matrix=matrix, alpha=False)
         arr = np.frombuffer(pix.samples, dtype=np.uint8)
@@ -2830,46 +3333,6 @@ def _ingest_pdf_pdfium(source: Source, max_pages: int = 0,
     return doc
 
 
-def ingest_image(source: Source, dpi: Optional[int] = None,
-                 page_index: int = 0) -> Document:
-    """Ingest a single-page image (PNG/JPEG/BMP/WebP) as a one-page Document."""
-    data, uri = _read_source(source)
-    img = decode_image(data)
-    detected_dpi = dpi or _image_dpi_hint(data) or DEFAULT_IMAGE_DPI
-    doc = Document(source_uri=uri, meta={
-        "format": sniff_format(data, uri), "page_count": 1,
-        "checksum": stable_hash(data), "ingested_at": _utcnow(),
-        "declared_dpi": detected_dpi,
-    })
-    doc.pages.append(_page_from_array(img, page_index, detected_dpi, uri))
-    return doc
-
-
-def ingest_tiff(source: Source, dpi: Optional[int] = None) -> Document:
-    """Ingest a (possibly multi-page) TIFF.  Fax archives are full of these."""
-    pil = _try_import("PIL.Image")
-    data, uri = _read_source(source)
-    if pil is None:
-        return ingest_image(data, dpi=dpi)
-    np = _np()
-    try:
-        im = pil.open(io.BytesIO(data))
-        frames = getattr(im, "n_frames", 1)
-    except Exception as exc:
-        raise IngestError("could not open %s as TIFF: %s" % (uri, exc))
-    detected_dpi = dpi or _image_dpi_hint(data) or DEFAULT_IMAGE_DPI
-    doc = Document(source_uri=uri, meta={
-        "format": "tiff", "page_count": frames, "checksum": stable_hash(data),
-        "ingested_at": _utcnow(), "declared_dpi": detected_dpi,
-    })
-    for i in range(frames):
-        im.seek(i)
-        frame = im.convert("L" if im.mode in ("1", "L", "I;16", "I") else "RGB")
-        arr = ensure_uint8(np.array(frame))
-        doc.pages.append(_page_from_array(arr, i, detected_dpi, uri))
-    return doc
-
-
 def _image_dpi_hint(data: bytes) -> Optional[int]:
     """Read declared DPI from image metadata, if it looks plausible."""
     pil = _try_import("PIL.Image")
@@ -2899,99 +3362,6 @@ def _page_from_array(img: ImageArray, index: int, dpi: int, uri: str = "") -> Pa
     page.meta["source"] = uri
     page.meta["pixel_size"] = [w, h]
     return page
-
-
-def page_from_image(img: ImageArray, index: int = 0, dpi: int = DEFAULT_IMAGE_DPI) -> Page:
-    """Public helper: build a :class:`Page` from an in-memory array."""
-    return _page_from_array(ensure_uint8(img), index, dpi)
-
-
-def document_from_images(images: Sequence[ImageArray], dpi: int = DEFAULT_IMAGE_DPI,
-                         source_uri: str = "<arrays>") -> Document:
-    """Public helper: build a :class:`Document` from in-memory arrays."""
-    doc = Document(source_uri=source_uri,
-                   meta={"format": "arrays", "page_count": len(images),
-                         "ingested_at": _utcnow()})
-    for i, img in enumerate(images):
-        doc.pages.append(_page_from_array(ensure_uint8(img), i, dpi))
-    return doc
-
-
-def ingest_email(source: Source, dpi: Optional[int] = None, include_body: bool = True,
-                 max_attachments: int = 50) -> Document:
-    """Ingest an ``.eml`` message: every readable attachment becomes pages.
-
-    Inbound claim registration lives on this path.  Attachments arrive as
-    native PDFs, scans, and images pasted into the body, all in one message,
-    and each part has to be routed on its actual bytes rather than its
-    filename.  Pages carry ``meta['attachment']`` so a downstream reviewer can
-    be told *which* attachment a field came from.
-    """
-    import email
-    from email import policy as _email_policy
-
-    data, uri = _read_source(source)
-    msg = email.message_from_bytes(data, policy=_email_policy.default)
-    doc = Document(source_uri=uri, meta={
-        "format": "eml", "checksum": stable_hash(data), "ingested_at": _utcnow(),
-        "subject": str(msg.get("subject", "")), "from": str(msg.get("from", "")),
-        "to": str(msg.get("to", "")), "date": str(msg.get("date", "")),
-    })
-
-    next_index = 0
-    attachments = 0
-    body_parts: List[str] = []
-
-    for part in msg.walk():
-        if part.get_content_maintype() == "multipart":
-            continue
-        filename = part.get_filename() or ""
-        disposition = (part.get("content-disposition") or "").lower()
-        ctype = part.get_content_type()
-
-        if ctype in ("text/plain", "text/html") and "attachment" not in disposition:
-            if include_body:
-                try:
-                    body_parts.append(part.get_content())
-                except Exception:
-                    pass
-            continue
-
-        if attachments >= max_attachments:
-            doc.warn("stopped after %d attachments" % max_attachments)
-            break
-        try:
-            payload = part.get_payload(decode=True)
-        except Exception as exc:
-            doc.warn("undecodable attachment %r: %s" % (filename, exc))
-            continue
-        if not payload:
-            continue
-        attachments += 1
-        try:
-            sub = ingest(payload, filename=filename, dpi=dpi)
-        except (IngestError, MissingDependency) as exc:
-            doc.warn("skipped attachment %r: %s" % (filename or ctype, exc))
-            continue
-        for p in sub.pages:
-            p.meta["attachment"] = filename or ctype
-            p.meta["attachment_index"] = attachments
-            p = _reindex_page(p, next_index)
-            next_index += 1
-            doc.pages.append(p)
-        doc.warnings.extend(w for w in sub.warnings if w not in doc.warnings)
-
-    if include_body and body_parts:
-        text = "\n\n".join(t for t in body_parts if t and t.strip())
-        if text.strip():
-            doc.meta["body_text"] = text
-            doc.pages.append(_text_only_page(text, next_index, "email-body"))
-
-    doc.meta["page_count"] = len(doc.pages)
-    doc.meta["attachments"] = attachments
-    if not doc.pages:
-        doc.warn("email contained no readable attachments or body")
-    return doc
 
 
 def _reindex_page(page: Page, new_index: int) -> Page:
@@ -3031,96 +3401,6 @@ def _text_only_page(text: str, index: int, source: str) -> Page:
     return page
 
 
-def ingest(source: Source, filename: str = "", dpi: Optional[int] = None,
-           password: Optional[str] = None, max_pages: int = 0,
-           page_range: Optional[Sequence[int]] = None, render_dpi: int = DEFAULT_DPI,
-           min_native_chars: int = MIN_NATIVE_CHARS) -> Document:
-    """Ingest anything: PDF, image, multi-page TIFF, ``.eml``, path or bytes.
-
-    Format is decided by content, not by extension.  Returns a :class:`Document`
-    whose pages are geometry-complete but *not* rasterised.
-
-    :param source: path, bytes, or a file-like object
-    :param filename: name hint used only when ``source`` is bytes
-    :param dpi: assumed resolution for bare images (default: metadata, else 200)
-    :param render_dpi: default resolution for PDF page rendering
-    :param max_pages: stop after this many pages (0 = no limit)
-    :param page_range: explicit zero-based page indices to keep
-    """
-    data, uri = _read_source(source)
-    if filename and uri in ("<bytes>", "<stream>"):
-        uri = filename
-    if not data:
-        raise IngestError("empty input: %s" % uri)
-    kind = sniff_format(data, filename or uri)
-
-    if kind == "pdf":
-        doc = ingest_pdf(data, password=password, max_pages=max_pages,
-                         page_range=page_range, render_dpi=render_dpi,
-                         min_native_chars=min_native_chars)
-    elif kind == "tiff":
-        doc = ingest_tiff(data, dpi=dpi)
-    elif kind in IMAGE_FORMATS:
-        doc = ingest_image(data, dpi=dpi)
-    elif kind == "eml":
-        doc = ingest_email(data, dpi=dpi)
-    else:
-        # Last resort: some scanners emit headerless JPEG-in-a-wrapper.
-        try:
-            doc = ingest_image(data, dpi=dpi)
-        except Exception:
-            raise IngestError("unrecognised format for %s (first bytes: %r)"
-                              % (uri, data[:16]))
-    doc.source_uri = uri
-    if max_pages and len(doc.pages) > max_pages:
-        doc.pages = doc.pages[:max_pages]
-    return doc
-
-
-def ingest_dir(directory: str, pattern: Optional[str] = None, recursive: bool = True,
-               **kwargs: Any) -> List[Document]:
-    """Ingest every readable document in a directory tree.
-
-    Unreadable files are reported as warnings on an empty Document rather than
-    aborting the batch -- a 5000-file inbox with three corrupt scans should
-    still process 4997 of them.
-    """
-    out: List[Document] = []
-    regex = re.compile(pattern) if pattern else None
-    for root, _dirs, files in os.walk(directory):
-        for name in sorted(files):
-            if name.startswith("."):
-                continue
-            if regex is not None and not regex.search(name):
-                continue
-            path = os.path.join(root, name)
-            try:
-                out.append(ingest(path, **kwargs))
-            except Exception as exc:
-                bad = Document(source_uri=path)
-                bad.warn("ingest failed: %s" % exc)
-                out.append(bad)
-        if not recursive:
-            break
-    return out
-
-
-def merge_documents(docs: Sequence[Document], source_uri: str = "<merged>") -> Document:
-    """Concatenate documents into one, renumbering pages and their bboxes."""
-    merged = Document(source_uri=source_uri, meta={"ingested_at": _utcnow(),
-                                                   "merged_from": len(docs)})
-    idx = 0
-    for d in docs:
-        for p in d.pages:
-            merged.pages.append(_reindex_page(p, idx))
-            idx += 1
-        for w in d.warnings:
-            if w not in merged.warnings:
-                merged.warnings.append(w)
-    merged.meta["page_count"] = len(merged.pages)
-    return merged
-
-
 # =============================================================================
 # 7. Layer 2 -- preprocessing as composable ops
 # =============================================================================
@@ -3138,97 +3418,32 @@ def merge_documents(docs: Sequence[Document], source_uri: str = "<merged>") -> D
 # encoded once here, with an eval set behind it, instead of three times.
 
 
-def _rect_box_sum(arr: ImageArray, kh: int, kw: int) -> Tuple[FloatArray, FloatArray]:
-    """``(window_sums, window_counts)`` over a ``kh x kw`` rectangle, clamped."""
-    np = _np()
-    a = np.asarray(arr, dtype=np.float64)
-    h, w = a.shape[:2]
-    ry, rx = max(0, kh // 2), max(0, kw // 2)
-    integral = _integral(a)
-    ys = np.arange(h); xs = np.arange(w)
-    y0 = np.clip(ys - ry, 0, h); y1 = np.clip(ys + ry + 1, 0, h)
-    x0 = np.clip(xs - rx, 0, w); x1 = np.clip(xs + rx + 1, 0, w)
-    sums = (integral[np.ix_(y1, x1)] - integral[np.ix_(y0, x1)]
-            - integral[np.ix_(y1, x0)] + integral[np.ix_(y0, x0)])
-    counts = ((y1 - y0)[:, None] * (x1 - x0)[None, :]).astype(np.float64)
-    return sums, counts
-
-
-def morph_binary(mask: GrayImage, kh: int, kw: int, operation: str = "erode") -> GrayImage:
-    """Binary morphology with a rectangular structuring element.
-
-    Implemented with summed-area tables so that a 1x120 kernel (what line
-    removal needs) costs the same as a 3x3 one.
-    """
-    np = _np()
-    m = np.asarray(mask).astype(np.uint8)
-    cv = _cv2()
-    if cv is not None:
-        kernel = cv.getStructuringElement(cv.MORPH_RECT, (max(1, kw), max(1, kh)))
-        ops = {"erode": cv.MORPH_ERODE, "dilate": cv.MORPH_DILATE,
-               "open": cv.MORPH_OPEN, "close": cv.MORPH_CLOSE}
-        if operation not in ops:
-            raise ConfigError("unknown morphological operation %r" % operation)
-        return cv.morphologyEx(m * 255, ops[operation], kernel).astype(bool)
-    if operation == "open":
-        return morph_binary(morph_binary(m, kh, kw, "erode"), kh, kw, "dilate")
-    if operation == "close":
-        return morph_binary(morph_binary(m, kh, kw, "dilate"), kh, kw, "erode")
-    sums, counts = _rect_box_sum(m, kh, kw)
-    if operation == "erode":
-        return sums >= counts - 1e-6
-    if operation == "dilate":
-        return sums > 0.5
-    raise ConfigError("unknown morphological operation %r" % operation)
-
-
-def estimate_background(gray: GrayImage, radius: Optional[int] = None) -> GrayImage:
-    """Estimate the page background (paper + lighting) with the text erased.
-
-    The kernel has to be *larger than the tallest glyph*, or the middle of a
-    text line survives as background and the correction punches a hole through
-    it.  Sized at 1/12 of the shorter side and clamped: big enough for body
-    text at any sane DPI, small enough to still follow a shadow gradient.
-    """
-    np = _np()
-    g = to_gray(gray)
-    h, w = image_shape(g)
-    if radius is None:
-        radius = int(clamp(min(h, w) // 12, 15, 101))
-    radius = max(3, int(radius) | 1)
-
-    cv = _cv2()
-    if cv is not None:
-        # RECT rather than ELLIPSE: OpenCV decomposes rectangular kernels into
-        # separable passes, so a 101x101 close stays affordable on a full page.
-        kernel = cv.getStructuringElement(cv.MORPH_RECT, (radius, radius))
-        closed = cv.morphologyEx(g, cv.MORPH_CLOSE, kernel)
-        return cv.GaussianBlur(closed, (0, 0), radius / 4.0)
-
-    # Fallback: block-maximum downsampling is grayscale dilation plus
-    # subsampling, which erases dark text in one pass and costs almost nothing.
-    # A median pass first is not optional -- the maximum over a 50x50 block is
-    # the brightest noise spike in 2500 samples, so on a grainy scan the raw
-    # block max sits several sigma above the true paper level and dividing by
-    # it darkens the whole page unevenly.
-    smoothed = median_blur(g, 3)
-    block = max(2, radius // 2)
-    pad_h = (-h) % block
-    pad_w = (-w) % block
-    padded = np.pad(smoothed, ((0, pad_h), (0, pad_w)), mode="edge")
-    ph, pw = padded.shape
-    coarse = padded.reshape(ph // block, block, pw // block, block).max(axis=(1, 3))
-    if min(coarse.shape) >= 3:
-        coarse = median_blur(ensure_uint8(coarse), 3)
-    smoothed = box_blur(ensure_uint8(coarse), 1)
-    return resize_image(smoothed, size=(w, h), interpolation="linear")
-
-
 # -- op machinery ------------------------------------------------------------
 
 OpFn = Callable[..., Any]
+
+
+class OpFactory(Protocol):  # pragma: no cover - structural type only
+    """What :func:`register_op` returns: a callable that builds an :class:`Op`.
+
+    It carries the two attributes the decorator attaches, which are part of the
+    contract rather than implementation detail -- ``fn`` is how one op reuses
+    another's raster function without paying to build an :class:`Op` first (see
+    :func:`Ops.auto_orient` calling ``rotate.fn``).
+    """
+
+    #: The name the op is registered under.
+    op_name: str
+    #: The undecorated raster function, ``fn(img, page, **params)``.
+    fn: OpFn
+
+    def __call__(self, *args: Any, **kwargs: Any) -> Op:
+        """Build an :class:`Op` from positional/keyword op parameters."""
+        ...
+
+
 #: Registry of op factories by name, so a serialised policy can be rebuilt.
-OP_FACTORIES: Dict[str, Callable[..., "Op"]] = {}
+OP_FACTORIES: Dict[str, OpFactory] = {}
 
 
 class Op(object):
@@ -3249,6 +3464,9 @@ class Op(object):
         :param name: the registered name, used for history and serialisation
         :param fn: ``fn(img, page, **params) -> Optional[ImageArray]``; returning
             ``None`` means "declined, leave the raster alone"
+        :param params: keyword arguments bound now and passed to ``fn`` at every
+            application, e.g. ``{"max_angle": 10.0}``.  Copied, so the caller's
+            dict cannot change the op afterwards.
         :param geometric: True when the op changes the page's pixel dimensions, so
             that point-space geometry is recomputed afterwards
         :param needs_raster: when True the op is skipped (and says so in the
@@ -3266,6 +3484,11 @@ class Op(object):
         Timing and parameters land in the returned page's history whether or not
         the op actually changed anything, so a pipeline is reconstructable from
         its output alone.
+
+        :param page: the page to transform; it is copied, never mutated
+        :returns: a new :class:`Page`.  Identical in pixels to the input when the
+            op declined (returned ``None``) or was skipped for want of a raster --
+            but its ``history`` records the attempt either way.
         """
         out = page.copy()
         if self.needs_raster and not out.has_raster():
@@ -3284,7 +3507,12 @@ class Op(object):
         return out
 
     def then(self, other: Op) -> Op:
-        """``a.then(b)`` -- a composite that runs this op, then ``other``."""
+        """``a.then(b)`` -- a composite that runs this op, then ``other``.
+
+        :param other: the op to run second
+        :returns: a :class:`CompositeOp` of the two, equivalent to
+            ``compose(self, other)`` and chainable further
+        """
         return compose(self, other)
 
     def to_dict(self) -> Dict[str, Any]:
@@ -3331,14 +3559,32 @@ def _map_span_points(page: Page,
 
 def register_op(name: str, geometric: bool = False,
                 needs_raster: bool = True
-                ) -> Callable[[Callable[..., Any]], Callable[..., Op]]:
+                ) -> Callable[[OpFn], OpFactory]:
     """Decorator turning ``fn(img, page, **params)`` into an :class:`Op` factory.
 
     The resulting factory keeps the decorated function's signature and
     defaults, so ``deskew(max_angle=10)`` reads naturally and ``help(deskew)``
     shows the real documentation.
+
+    This is the extension point: an op registered from your own module works
+    everywhere a built-in does, including :func:`op_from_dict` round-trips, with
+    no edit to this file.
+
+    :param name: registry key, and the label recorded in ``page.history``.  Must
+        be unique -- registering an existing name replaces it, which is how you
+        override a built-in, deliberately or by accident.
+    :param geometric: ``True`` when the op moves pixels, so span and region
+        coordinates must be remapped with it.  Getting this wrong is the classic
+        silent provenance bug: the raster rotates, the boxes do not, and every
+        bbox points at the wrong place.  See :func:`Ops.deskew` for the mapping
+        pattern.
+    :param needs_raster: ``True`` (default) skips the op, recording why, on a
+        page with no raster.  Set ``False`` only for ops that work on spans or
+        metadata alone and so never touch pixels.
+    :returns: a decorator that registers the raster function and returns
+        its :class:`Op` factory
     """
-    def decorator(fn: OpFn) -> Callable[..., Op]:
+    def decorator(fn: OpFn) -> OpFactory:
         """Register ``fn`` under ``name`` and return its Op factory."""
         try:
             import inspect
@@ -3371,14 +3617,21 @@ def register_op(name: str, geometric: bool = False,
 
         factory.op_name = name  # type: ignore[attr-defined]
         factory.fn = fn  # type: ignore[attr-defined]  # raw function, for reuse
-        OP_FACTORIES[name] = factory
-        return factory
+        # The two attributes above are what make a plain function an OpFactory;
+        # they are attached after the def, so the shape is asserted here.
+        built = cast(OpFactory, factory)
+        OP_FACTORIES[name] = built
+        return built
     return decorator
 
 
-def compose(*ops: Optional[Op]) -> Op:
+def compose(*ops: Optional[Op]) -> CompositeOp:
     """Chain ops into one.  ``None`` entries are dropped, so conditional
-    policies can be written without branching noise."""
+    policies can be written without branching noise.
+
+    Returns the :class:`CompositeOp` rather than a bare :class:`Op`, so that the
+    ``.ops`` it was built from stay reachable for inspection and serialisation.
+    """
     return CompositeOp([o for o in ops if o is not None])
 
 
@@ -3388,13 +3641,22 @@ class CompositeOp(Op):
     __slots__ = ("ops",)
 
     def __init__(self, ops: Sequence[Op]) -> None:
-        """Wrap an ordered sequence of ops as a single op."""
+        """Wrap an ordered sequence of ops as a single op.
+
+        :param ops: the member ops, applied in this order.  Kept on ``.ops`` so
+            they stay reachable for inspection and serialisation.
+        """
         Op.__init__(self, "compose", lambda img, page: img,
                     {"ops": [o.name for o in ops]}, needs_raster=False)
         self.ops = list(ops)
 
     def __call__(self, page: Page) -> Page:
-        """Run every op in order, threading the page through."""
+        """Run every op in order, threading the page through.
+
+        :param page: the starting page; it is not mutated
+        :returns: the page after every member op, carrying one ``history`` entry
+            per op rather than a single entry for the composite
+        """
         out = page
         for op in self.ops:
             out = op(out)
@@ -3410,7 +3672,18 @@ class CompositeOp(Op):
 
 
 def op_from_dict(d: Mapping[str, Any]) -> Op:
-    """Rebuild an op (or a composite) from its serialised form."""
+    """Rebuild an op (or a composite) from its serialised form.
+
+    The inverse of :meth:`Op.to_dict`, which is what lets a policy be recorded in
+    an eval report and replayed later against a new build.
+
+    :param d: ``{"op": name, "params": {...}}``, or ``{"op": "compose", "ops":
+        [...]}`` for a composite.  Rebuilt recursively.
+    :returns: an :class:`Op`, or a :class:`CompositeOp` for a ``"compose"`` entry
+    :raises ConfigError: the name is not in :data:`OP_FACTORIES`; the message
+        lists what is registered, since the usual cause is a custom op whose
+        module has not been imported yet
+    """
     name = d.get("op")
     if name == "compose":
         return CompositeOp([op_from_dict(o) for o in d.get("ops", [])])
@@ -3422,7 +3695,13 @@ def op_from_dict(d: Mapping[str, Any]) -> Op:
 
 
 def apply_ops(page: Page, ops: Sequence[Op]) -> Page:
-    """Apply ops in order, returning a new page."""
+    """Apply ops in order, returning a new page.
+
+    :param page: the starting page; it is not mutated
+    :param ops: ops to run in sequence, as built by the :class:`Ops` factories.
+        An empty sequence returns the page unchanged.
+    :returns: the page after every op, with one ``history`` entry per op
+    """
     out = page
     for op in ops:
         out = op(out)
@@ -3431,78 +3710,1209 @@ def apply_ops(page: Page, ops: Sequence[Op]) -> Page:
 
 # -- colour / tone -----------------------------------------------------------
 
-@register_op("to_grayscale")
-def to_grayscale(img: ImageArray, page: Page) -> Optional[ImageArray]:
-    """Collapse to a single channel.
+class Ops(object):
+    """The preprocessing ops, as :class:`Op` factories.
 
-    Do this before classical OCR (which discards colour anyway) but *not*
-    before colour-based stamp removal, which needs hue.
+    Calling one builds an op; applying it returns a new page.  Each
+    corrects a *measured* degradation and returns ``None`` when there is
+    nothing to correct, so a clean page passes through untouched -- a fixed
+    sequence applied to every page destroys signal that was never damaged.
+
+    Registering a new op does not require editing this class:
+    :func:`register_op` adds to :data:`OP_FACTORIES` from anywhere.
+
+    **Reading these signatures.**  Each is shown as ``fn(img, page, **knobs)``,
+    which is how the raster function is written -- but :func:`register_op` strips
+    the first two, so what you call is the knobs alone.  ``img`` and ``page`` are
+    supplied by the machinery when the op runs::
+
+        op = deskew(min_angle=0.5)   # build: only the knobs
+        page = op(page)              # apply: img and page threaded in for you
+
+    Every ``:param:`` documented below is therefore a keyword you may pass at
+    build time.  Ops apply lazily in this sense: nothing is rasterised until the
+    op runs, and an op that returns ``None`` leaves the page's pixels untouched
+    while still recording the decision in ``page.history``.
     """
-    return to_gray(img)
+
+    @staticmethod
+    @register_op("to_grayscale")
+    def to_grayscale(img: ImageArray, page: Page) -> Optional[ImageArray]:
+        """Collapse to a single channel.
+
+        Do this before classical OCR (which discards colour anyway) but *not*
+        before colour-based stamp removal, which needs hue.
+        """
+        return to_gray(img)
+
+    @staticmethod
+    @register_op("invert_if_dark")
+    def invert_if_dark(img: ImageArray, page: Page,
+                       ink_threshold: float = 0.55) -> Optional[ImageArray]:
+        """Invert white-on-black pages (negative scans, some fax modes).
+
+        Every downstream measurement assumes dark ink on light paper; a negative
+        page reports 90% ink coverage and gets classified unreadable, when in fact
+        it just needs one subtraction.
+
+        :param ink_threshold: inked fraction above which the page is judged to be
+            a negative, in ``0.0..1.0``.  The default ``0.55`` sits well above any
+            real document -- dense Devanagari body text reaches about ``0.25``, a
+            solid-black form header about ``0.4`` -- so this fires on true
+            negatives and not on merely heavy pages.  Lower it towards ``0.45``
+            only if you have genuinely ink-saturated scans; below that you will
+            start inverting healthy pages.
+        """
+        np = _np()
+        gray = to_gray(img)
+        if float(ink_mask(gray).mean()) <= ink_threshold:
+            return None
+        page.meta["inverted"] = True
+        return (255 - np.asarray(img)).astype(np.uint8)
+
+    @staticmethod
+    @register_op("autocontrast")
+    def autocontrast(img: ImageArray, page: Page, low_pct: float = 1.0,
+                     high_pct: float = 99.0) -> Optional[ImageArray]:
+        """Stretch the ``[low_pct, high_pct]`` intensity range to full scale.
+
+        Percentile-based so that a punch hole or a black scan border does not eat
+        the entire dynamic range, which is what naive min/max stretching does.
+
+        :param low_pct: percentile mapped to black, in ``0.0..100.0``.  ``1.0``
+            discards the darkest 1% of pixels -- enough to absorb punch holes,
+            staple shadows and a thin scan border.  ``0.0`` is exact min/max
+            stretching and is what you want only on synthetic images.
+        :param high_pct: percentile mapped to white, in ``0.0..100.0``.  ``99.0``
+            pairs with the default ``low_pct``; widen to ``0.5``/``99.5`` for a
+            gentler stretch on pages that are already close to full range.
+        :returns: ``None`` when the two percentiles are within one grey level of
+            each other -- a blank or already-saturated page, where stretching
+            would only amplify noise.
+        """
+        np = _np()
+        gray = to_gray(img)
+        lo = _percentile_np(gray, low_pct)
+        hi = _percentile_np(gray, high_pct)
+        if hi - lo < 1.0:
+            return None
+        arr = np.asarray(img, dtype=np.float64)
+        out = (arr - lo) * (255.0 / (hi - lo))
+        return np.clip(out, 0, 255).astype(np.uint8)
+
+    @staticmethod
+    @register_op("gamma")
+    def gamma(img: ImageArray, page: Page, value: float = 1.0) -> Optional[ImageArray]:
+        """Apply gamma correction.  ``value < 1`` brightens, ``> 1`` darkens.
+
+        Non-linear, unlike :func:`Ops.autocontrast`: it moves the midtones while
+        leaving true black and true white fixed, which is what recovers faint
+        pencil or carbon-copy strokes without blowing out the paper.
+
+        :param value: gamma exponent, practically ``0.4..2.5``.  ``0.6`` lifts
+            faint grey strokes on an underexposed phone photo; ``1.4`` deepens
+            washed-out thermal-printer output; ``1.0`` is identity and returns
+            ``None`` so a no-op costs nothing.
+        :returns: ``None`` when ``value`` is 1.0 within tolerance
+        """
+        np = _np()
+        if abs(value - 1.0) < 1e-6:
+            return None
+        table = np.clip(((np.arange(256) / 255.0) ** float(value)) * 255.0, 0, 255)
+        return table.astype(np.uint8)[np.asarray(img)]
+
+    @staticmethod
+    @register_op("clahe")
+    def clahe(img: ImageArray, page: Page, clip: float = 2.0,
+              grid: int = 8) -> Optional[ImageArray]:
+        """Contrast-limited adaptive histogram equalisation.
+
+        The right tool for a page that is faded in one corner and fine elsewhere --
+        a global stretch cannot fix that by construction.  Falls back to
+        :func:`Ops.autocontrast` without OpenCV.
+
+        :param clip: contrast ceiling per tile.  ``2.0`` is the usual document
+            setting; ``1.0`` is nearly a no-op, and above ``4.0`` the noise in
+            blank paper is amplified into visible grain that OCR reads as specks.
+        :param grid: tile count along each axis, so ``8`` means an 8x8 grid.
+            Fewer, larger tiles (``4``) approach a global stretch; more, smaller
+            tiles (``16``) track tighter lighting gradients but start equalising
+            *within* a glyph, which thins strokes.
+        :returns: the equalised greyscale page; never ``None``, since the caller
+            has already decided the page needs it
+        """
+        cv = _cv2()
+        gray = to_gray(img)
+        if cv is None:
+            page.meta["clahe"] = "fell back to global autocontrast (no OpenCV)"
+            return _autocontrast_array(gray)
+        op = cv.createCLAHE(clipLimit=float(clip), tileGridSize=(int(grid), int(grid)))
+        return op.apply(gray)
+
+    @staticmethod
+    @register_op("normalize_illumination")
+    def normalize_illumination(img: ImageArray, page: Page, radius: Optional[int] = None,
+                               strength: float = 1.0) -> Optional[ImageArray]:
+        """Flatten uneven lighting by dividing out the estimated background.
+
+        This is the fix for phone photos and book scans with a shadow gradient.
+        Doing it *before* binarisation is what lets a global threshold work at all;
+        skipping it is why so many pipelines lose the shadowed third of a page.
+
+        :param radius: background-estimation window in pixels; ``None`` derives one
+            from the page size, which is right unless your text is unusually large.
+            The window must be comfortably wider than a glyph -- set it near a
+            character width and the estimator treats the text itself as background
+            and erases it.
+        :param strength: how far to move towards the flattened result, in
+            ``0.0..1.0``.  ``1.0`` applies it fully, whereas the gentler
+            vlm policy uses ``0.7`` -- vision models read the greyscale
+            gradient, and a fully flattened page discards the very cue that
+            distinguishes a faint stroke from paper.  See the
+            gentler :func:`Policies.vlm_policy`.
+        """
+        np = _np()
+        gray = to_gray(img)
+        background = estimate_background(gray, radius).astype(np.float64)
+        background = np.maximum(background, 1.0)
+        normalised = np.clip(gray.astype(np.float64) * 255.0 / background, 0, 255)
+        if strength < 1.0:
+            normalised = gray.astype(np.float64) * (1.0 - strength) + normalised * strength
+        return normalised.astype(np.uint8)
+
+    @staticmethod
+    @register_op("remove_shadow")
+    def remove_shadow(img: ImageArray, page: Page, radius: int = 21) -> Optional[ImageArray]:
+        """Remove cast shadows via dilate-then-median background subtraction.
+
+        The classic recipe: dilating with a mid-sized kernel removes text, the
+        median then removes residual structure, and the difference is the page
+        without its shadow.
+
+        Overlaps with :func:`Ops.normalize_illumination`; prefer that one for a
+        smooth lighting gradient and this one for a hard-edged cast shadow, such
+        as the photographer's hand or the spine shadow of an open book.
+
+        :param radius: dilation and median kernel in pixels, forced odd.  It must
+            exceed the thickest stroke on the page or the text survives dilation
+            and is subtracted away with the shadow.  ``21`` suits 300 DPI body
+            text; raise towards ``41`` at 600 DPI or for large print.
+        """
+        np = _np()
+        gray = to_gray(img)
+        k = int(radius) | 1
+        cv = _cv2()
+        if cv is not None:
+            dilated = cv.dilate(gray, np.ones((k, k), np.uint8))
+            background = cv.medianBlur(dilated, k)
+        else:
+            background = median_blur(box_blur(gray, k // 2), 5)
+        diff = 255 - np.abs(gray.astype(np.int16) - background.astype(np.int16))
+        return _autocontrast_array(np.clip(diff, 0, 255).astype(np.uint8))
+
+    @staticmethod
+    @register_op("rescale", geometric=True)
+    def rescale(img: ImageArray, page: Page, factor: float = 1.0,
+                interpolation: str = "auto") -> Optional[ImageArray]:
+        """Scale the raster by ``factor``, keeping physical page size constant.
+
+        Point-space coordinates are unaffected because DPI scales with the pixels;
+        that invariant is what keeps every previously-extracted bbox valid.
+
+        :param factor: linear scale.  ``2.0`` doubles each side and quadruples the
+            pixel count; ``0.5`` halves it.  ``1.0`` returns ``None``.
+        :param interpolation: ``"auto"`` picks by direction -- cubic when
+            enlarging, area when shrinking, which is the pairing that avoids
+            both softness and aliasing.  Override with ``"nearest"`` (preserves
+            hard edges on already-binarised pages), ``"linear"``, ``"cubic"``,
+            or ``"area"``.
+        :returns: ``None`` when ``factor`` is 1.0 within tolerance
+        """
+        if abs(factor - 1.0) < 1e-6:
+            return None
+        out = resize_image(img, scale=factor, interpolation=interpolation)
+        page._raster_dpi = int(round(page.raster_dpi * factor))
+        page.quality.raster_dpi = page._raster_dpi
+        return out
+
+    @staticmethod
+    @register_op("ensure_dpi", geometric=True)
+    def ensure_dpi(img: ImageArray, page: Page, min_dpi: int = 300, max_dpi: int = 600,
+                   interpolation: str = "auto") -> Optional[ImageArray]:
+        """Upsample until the page reaches ``min_dpi``, capped at ``max_dpi``.
+
+        Upsampling adds no information -- but Tesseract's and PaddleOCR's character
+        models are trained around 300 DPI glyph sizes and measurably lose accuracy
+        on smaller input, so the resample buys real recall even though it buys no
+        new signal.  The cap exists because beyond ~400 DPI you pay quadratically
+        in pixels for nothing.
+
+        Measures against ``page.quality.effective_dpi`` -- the resolution the text
+        *actually* carries -- not the nominal raster DPI, so a 600 DPI upscan of a
+        150 DPI fax is correctly seen as still needing help.
+
+        :param min_dpi: floor to reach.  ``300`` is where Tesseract and PaddleOCR
+            are trained; ``400`` measurably helps on small print and Indic scripts.
+        :param max_dpi: ceiling that overrides ``min_dpi`` when honouring it would
+            produce an unreasonably large raster.  ``600`` is already past the
+            point of accuracy returns.
+        :param interpolation: as :func:`Ops.rescale`; ``"auto"`` resolves to cubic
+            here, since this op only ever enlarges.
+        :returns: ``None`` when the page is already at or above ``min_dpi``, or
+            when the cap leaves no room to scale
+        """
+        current = page.quality.effective_dpi or page.raster_dpi or DEFAULT_IMAGE_DPI
+        if current >= min_dpi:
+            return None
+        factor = float(min_dpi) / float(current)
+        if page.raster_dpi * factor > max_dpi:
+            factor = float(max_dpi) / float(page.raster_dpi or min_dpi)
+        if factor <= 1.0 + 1e-6:
+            return None
+        out = resize_image(img, scale=factor, interpolation=interpolation)
+        page._raster_dpi = int(round(page.raster_dpi * factor))
+        page.quality.raster_dpi = page._raster_dpi
+        page.quality.effective_dpi = int(round(current * factor))
+        return out
+
+    @staticmethod
+    @register_op("resize_max_side", geometric=True)
+    def resize_max_side(img: ImageArray, page: Page, max_px: int = 2000,
+                        interpolation: str = "area") -> Optional[ImageArray]:
+        """Cap the longest side.  Vision-model cost is ~linear in pixels, and most
+        providers downscale above ~1500px anyway -- paying to upload pixels the
+        provider will discard is pure waste.
+
+        The counterpart to :func:`Ops.ensure_dpi`: that one raises resolution for
+        classical OCR, this one caps it for a VLM.  Running both is normal --
+        they clamp opposite ends.
+
+        :param max_px: ceiling for the longer side, in pixels.  ``2000`` is what
+            the vlm policy uses, comfortably above every major provider's
+            internal downscale; ``1500`` matches it more tightly and costs less;
+            below ~1000 small print stops being legible to the model.
+        :param interpolation: ``"area"`` by default, which is the correct filter
+            for downscaling -- it averages the discarded pixels instead of point
+            sampling, so thin strokes fade rather than disappear.
+        :returns: ``None`` when the page is already within ``max_px``
+        """
+        h, w = image_shape(img)
+        longest = max(h, w)
+        if longest <= max_px:
+            return None
+        factor = float(max_px) / float(longest)
+        out = resize_image(img, scale=factor, interpolation=interpolation)
+        page._raster_dpi = max(1, int(round(page.raster_dpi * factor)))
+        page.quality.raster_dpi = page._raster_dpi
+        return out
+
+    @staticmethod
+    @register_op("deskew", geometric=True)
+    def deskew(img: ImageArray, page: Page, max_angle: float = 15.0, min_angle: float = 0.4,
+               method: str = "auto", angle: Optional[float] = None) -> Optional[ImageArray]:
+        """Rotate the page so its text lines are horizontal.
+
+        Rotation is skipped below ``min_angle`` because resampling always costs a
+        little sharpness, and correcting 0.2 degrees costs more than it recovers.
+        Above ``max_angle`` the page is not skewed, it is rotated -- a different
+        problem, handled by :func:`Ops.auto_orient`.
+
+        Existing span coordinates are rotated with the image rather than discarded.
+
+        :param max_angle: refuse to correct beyond this many degrees.  A larger
+            reading almost always means the detector locked onto a table rule or
+            a page edge rather than the text baselines, and acting on it would
+            wreck a page that was fine.
+        :param min_angle: skip below this many degrees, since resampling costs
+            sharpness that 0.2 degrees of skew does not.  ``0.4`` is the default;
+            drop to ``0.2`` only if downstream is a classical OCR engine, which
+            is far more skew-sensitive than a VLM.
+        :param method: skew estimator -- ``"auto"`` (projection profile, then Hough
+            if OpenCV is present), ``"projection"``, or ``"hough"``.  Projection is
+            more robust on dense text; Hough does better on sparse forms with
+            strong rules.
+        :param angle: bypass detection and rotate by exactly this many degrees.
+            Use when you already know the skew, e.g. from a calibration target or
+            a previous page of the same batch.  Still subject to ``min_angle`` and
+            ``max_angle``.
+        :returns: ``None`` when the measured skew falls outside
+            ``[min_angle, max_angle]`` -- the page is left untouched
+        """
+        detected = float(angle) if angle is not None else page.quality.skew_deg
+        if angle is None and abs(detected) < 1e-9:
+            detected = estimate_skew(to_gray(img), max_angle=max_angle, method=method)
+        if abs(detected) < min_angle or abs(detected) > max_angle:
+            return None
+
+        before_h, before_w = image_shape(img)
+        out = rotate_image(img, detected, expand=True)
+        after_h, after_w = image_shape(out)
+        dpi = float(page.raster_dpi)
+
+        # Same affine mapping the raster underwent, expressed in points.
+        theta = math.radians(-detected)  # image rotated CCW by `detected`
+        cos_t, sin_t = math.cos(theta), math.sin(theta)
+        cx, cy = before_w / 2.0 * 72.0 / dpi, before_h / 2.0 * 72.0 / dpi
+        nx, ny = after_w / 2.0 * 72.0 / dpi, after_h / 2.0 * 72.0 / dpi
+
+        def mapper(x: float, y: float) -> Tuple[float, float]:
+            """Point-space image of ``(x, y)`` under the same rotation the raster took."""
+            dx, dy = x - cx, y - cy
+            return (cos_t * dx - sin_t * dy + nx, sin_t * dx + cos_t * dy + ny)
+
+        _map_span_points(page, mapper)
+        page.quality.skew_deg = 0.0
+        page.rotation = int(page.rotation)
+        page.meta["deskew_applied_deg"] = round(detected, 3)
+        return out
+
+    @staticmethod
+    @register_op("rotate", geometric=True)
+    def rotate(img: ImageArray, page: Page, degrees: int = 0) -> Optional[ImageArray]:
+        """Rotate by an exact multiple of 90 degrees (lossless).
+
+        Quarter-turns resample nothing, so unlike :func:`Ops.deskew` this costs no
+        sharpness and needs no threshold.  Span coordinates turn with the page.
+
+        :param degrees: clockwise rotation, rounded to the nearest multiple of 90
+            and taken modulo 360.  ``90``, ``180``, ``270`` are the useful values;
+            ``-90`` is accepted and means the same as ``270``.  ``0`` returns
+            ``None``.
+        :returns: ``None`` when the rotation is a whole number of full turns
+        """
+        np = _np()
+        turns = int(round(degrees / 90.0)) % 4
+        if turns == 0:
+            return None
+        page.rotation = (page.rotation + turns * 90) % 360
+        h, w = image_shape(img)
+        dpi = float(page.raster_dpi)
+
+        def mapper(x: float, y: float, _t: int = turns, _w: float = w * 72.0 / dpi,
+                   _h: float = h * 72.0 / dpi) -> Tuple[float, float]:
+            """Point-space image of ``(x, y)`` after ``_t`` clockwise quarter-turns."""
+            # One clockwise quarter-turn sends (x, y) -> (H - y, x) and swaps the
+            # page's width and height; apply that `turns` times.
+            for _ in range(_t):
+                x, y = _h - y, x
+                _w, _h = _h, _w
+            return (x, y)
+
+        _map_span_points(page, mapper)
+        return np.ascontiguousarray(np.rot90(np.asarray(img), k=-turns))
+
+    @staticmethod
+    @register_op("auto_orient", geometric=True)
+    def auto_orient(img: ImageArray, page: Page, use_osd: bool = True,
+                    min_confidence: float = 1.0) -> Optional[ImageArray]:
+        """Detect and correct 90/180/270-degree page rotation.
+
+        Tesseract's orientation-and-script-detection is used when available because
+        it is the only cheap method that can tell upside-down text from right-way-up
+        text.  Without it we fall back to a projection-profile test, which reliably
+        distinguishes portrait from landscape text but **cannot** detect a 180-degree
+        flip -- that limitation is reported in the page history rather than hidden.
+
+        :param use_osd: allow the Tesseract OSD path when the binary or
+            ``pytesseract`` is importable.  Set ``False`` to force the projection
+            fallback -- worth doing when OSD is present but unreliable, which it
+            is on sparse forms and on scripts it was not trained for.
+        :param min_confidence: least OSD confidence to act on.  Tesseract reports
+            roughly ``0.5..5.0`` here, and its low-confidence guesses on sparse
+            pages are close to coin flips; ``1.0`` rejects those.  Raise to
+            ``2.0`` if you would rather leave a page unrotated than risk a wrong
+            quarter-turn.
+        :returns: ``None`` when the page is already upright, or when the page has
+            too little ink to judge
+        """
+        np = _np()
+        rotation = None
+        if use_osd and (have("pytesseract") or shutil.which("tesseract")):
+            rotation = _osd_rotation(img, min_confidence)
+        if rotation is None:
+            gray = to_gray(img)
+            small = resize_image(gray, scale=min(1.0, 800.0 / max(image_shape(gray))))
+            mask = ink_mask(small).astype(np.float64)
+            if mask.mean() < 0.001:
+                return None
+            horizontal = float(np.var(mask.sum(axis=1)))
+            vertical = float(np.var(mask.sum(axis=0)))
+            rotation = 90 if vertical > horizontal * 1.6 else 0
+            page.meta["orientation_method"] = "projection (180-degree flips undetectable)"
+        else:
+            page.meta["orientation_method"] = "tesseract-osd"
+        if not rotation:
+            return None
+        # OSD reports the counter-clockwise angle that would right the page.
+        return rotate.fn(img, page, degrees=-rotation)
+
+    @staticmethod
+    @register_op("crop_to_content", geometric=True)
+    def crop_to_content(img: ImageArray, page: Page, margin_pt: float = 6.0,
+                        min_keep: float = 0.25) -> Optional[ImageArray]:
+        """Crop away empty margins, keeping ``margin_pt`` of whitespace.
+
+        Guarded by ``min_keep``: if the detected content occupies less than that
+        fraction of the page, the detection is more likely to have locked onto a
+        speck of dust than onto the content, and the crop is refused.
+
+        :param margin_pt: whitespace to keep around the content, in typographic
+            points (1/72 inch), so it means the same thing at any DPI.  ``6.0``
+            is roughly a line of leading.  Do not drop to ``0`` -- OCR layout
+            analysis degrades when glyphs touch the edge, which is precisely
+            what :func:`Ops.pad` exists to prevent.
+        :param min_keep: least fraction of the original area the crop may keep,
+            in ``0.0..1.0``.  At ``0.25`` a crop discarding more than three
+            quarters of the page is refused and the reason recorded in
+            ``page.meta["crop_refused"]``.  Lower it only for documents that
+            genuinely are a receipt on a big scan bed.
+        :returns: ``None`` when the page is blank, when the crop would be a no-op,
+            or when ``min_keep`` refuses it
+        """
+        np = _np()
+        gray = to_gray(img)
+        h, w = image_shape(gray)
+        mask = ink_mask(gray)
+        # Suppress isolated specks before deciding where the content ends.
+        mask = morph_binary(mask, 3, 3, "open")
+        rows = np.nonzero(mask.any(axis=1))[0]
+        cols = np.nonzero(mask.any(axis=0))[0]
+        if rows.size == 0 or cols.size == 0:
+            return None
+        dpi = float(page.raster_dpi)
+        margin_px = int(round(margin_pt * dpi / 72.0))
+        y0 = max(0, int(rows[0]) - margin_px); y1 = min(h, int(rows[-1]) + 1 + margin_px)
+        x0 = max(0, int(cols[0]) - margin_px); x1 = min(w, int(cols[-1]) + 1 + margin_px)
+        if (y1 - y0) * (x1 - x0) < min_keep * h * w:
+            page.meta["crop_refused"] = "content region below min_keep"
+            return None
+        if (y0, x0, y1, x1) == (0, 0, h, w):
+            return None
+        dx = -x0 * 72.0 / dpi
+        dy = -y0 * 72.0 / dpi
+        _map_span_points(page, lambda x, y: (x + dx, y + dy))
+        return np.ascontiguousarray(np.asarray(img)[y0:y1, x0:x1])
+
+    @staticmethod
+    @register_op("remove_border", geometric=True)
+    def remove_border(img: ImageArray, page: Page, max_frac: float = 0.08,
+                      dark_threshold: int = 90) -> Optional[ImageArray]:
+        """Trim the black frame a flatbed leaves when the lid is open.
+
+        Those frames wreck contrast measurement and ink coverage, and Tesseract
+        frequently reads them as a column of punctuation.
+
+        Trims only inward from the four edges, so unlike :func:`Ops.crop_to_content`
+        it cannot cut into the page when content reaches the margin.
+
+        :param max_frac: most of each dimension the trim may eat, in ``0.0..1.0``.
+            ``0.08`` allows an 8% frame, which covers the usual lid-open border
+            while making it impossible to consume a dark but legitimate header.
+        :param dark_threshold: mean grey level, ``0..255``, below which a row or
+            column counts as frame.  ``90`` clears true scanner black (near ``0``)
+            with margin to spare; raise towards ``120`` for a grey plastic lid,
+            but not so far that a dense text row qualifies.
+        :returns: ``None`` when no edge rows or columns are dark enough to trim
+        """
+        np = _np()
+        gray = to_gray(img)
+        h, w = image_shape(gray)
+        limit_y = max(1, int(h * max_frac))
+        limit_x = max(1, int(w * max_frac))
+        dark_rows = gray.mean(axis=1) < dark_threshold
+        dark_cols = gray.mean(axis=0) < dark_threshold
+
+        top = 0
+        while top < limit_y and dark_rows[top]:
+            top += 1
+        bottom = h
+        while bottom > h - limit_y and dark_rows[bottom - 1]:
+            bottom -= 1
+        left = 0
+        while left < limit_x and dark_cols[left]:
+            left += 1
+        right = w
+        while right > w - limit_x and dark_cols[right - 1]:
+            right -= 1
+        if (top, left, bottom, right) == (0, 0, h, w):
+            return None
+        dpi = float(page.raster_dpi)
+        _map_span_points(page, lambda x, y: (x - left * 72.0 / dpi, y - top * 72.0 / dpi))
+        return np.ascontiguousarray(np.asarray(img)[top:bottom, left:right])
+
+    @staticmethod
+    @register_op("pad", geometric=True)
+    def pad(img: ImageArray, page: Page, margin_px: int = 16,
+            value: int = 255) -> Optional[ImageArray]:
+        """Add a quiet margin.  Tesseract's layout analysis degrades noticeably
+        when glyphs touch the image edge.
+
+        The usual last step of an OCR policy, after cropping and binarisation have
+        both had the chance to leave text flush against the border.
+
+        :param margin_px: border width in pixels, applied to all four sides.
+            ``16`` is enough for Tesseract at 300 DPI; scale it with your DPI if
+            you render higher.  ``0`` or negative returns ``None``.
+        :param value: fill level, ``0..255``.  ``255`` (white) is right for a
+            normal page; use ``0`` after :func:`Ops.invert_if_dark` has left you
+            with light ink on dark paper, so the margin matches the paper rather
+            than framing it.
+        :returns: ``None`` when ``margin_px`` is not positive
+        """
+        np = _np()
+        m = int(margin_px)
+        if m <= 0:
+            return None
+        arr = np.asarray(img)
+        width = ((m, m), (m, m)) + (((0, 0),) if arr.ndim == 3 else ())
+        dpi = float(page.raster_dpi)
+        _map_span_points(page, lambda x, y: (x + m * 72.0 / dpi, y + m * 72.0 / dpi))
+        return np.pad(arr, width, mode="constant", constant_values=int(value))
+
+    @staticmethod
+    @register_op("perspective_correct", geometric=True)
+    def perspective_correct(img: ImageArray, page: Page, min_area_ratio: float = 0.35,
+                            epsilon_frac: float = 0.02) -> Optional[ImageArray]:
+        """Flatten a photographed page by warping its detected quadrilateral.
+
+        Only fires when a convincing four-sided contour covering most of the frame
+        is found, because warping on a bad quad is far worse than not warping:
+        it shears the text irrecoverably.  Requires OpenCV.
+
+        :param min_area_ratio: least fraction of the frame the detected quad must
+            cover, in ``0.0..1.0``.  ``0.35`` rejects the small quadrilaterals that
+            table borders and photo frames produce.  Raise towards ``0.6`` when
+            every photo is known to be page-filling; lowering it is how you get
+            a page warped to the shape of a table.
+        :param epsilon_frac: contour simplification tolerance as a fraction of the
+            perimeter.  ``0.02`` is the standard value that collapses a slightly
+            wavy page outline to four corners; too small and the contour keeps
+            more than four vertices and is rejected, too large and unrelated
+            shapes collapse into plausible-looking quads.
+        :returns: ``None`` when OpenCV is missing, or when no quad passes both
+            guards -- an unwarped page beats a sheared one
+        """
+        np = _np()
+        cv = _cv2()
+        if cv is None:
+            page.meta["perspective_correct"] = "skipped: OpenCV unavailable"
+            return None
+        gray = to_gray(img)
+        h, w = image_shape(gray)
+        blurred = cv.GaussianBlur(gray, (5, 5), 0)
+        edges = cv.Canny(blurred, 60, 180)
+        edges = cv.dilate(edges, np.ones((3, 3), np.uint8), iterations=1)
+        contours, _ = cv.findContours(edges, cv.RETR_EXTERNAL, cv.CHAIN_APPROX_SIMPLE)[-2:]
+        best = None
+        best_area = min_area_ratio * h * w
+        for contour in contours:
+            area = cv.contourArea(contour)
+            if area < best_area:
+                continue
+            approx = cv.approxPolyDP(contour, epsilon_frac * cv.arcLength(contour, True), True)
+            if len(approx) == 4 and cv.isContourConvex(approx):
+                best, best_area = approx.reshape(4, 2).astype(np.float32), area
+        if best is None:
+            return None
+
+        # Order corners tl, tr, br, bl.
+        s = best.sum(axis=1)
+        d = np.diff(best, axis=1).ravel()
+        quad = np.array([best[np.argmin(s)], best[np.argmin(d)],
+                         best[np.argmax(s)], best[np.argmax(d)]], dtype=np.float32)
+        widths = [np.linalg.norm(quad[0] - quad[1]), np.linalg.norm(quad[3] - quad[2])]
+        heights = [np.linalg.norm(quad[0] - quad[3]), np.linalg.norm(quad[1] - quad[2])]
+        tw = int(max(widths)); th = int(max(heights))
+        if tw < 32 or th < 32:
+            return None
+        dst = np.array([[0, 0], [tw - 1, 0], [tw - 1, th - 1], [0, th - 1]], dtype=np.float32)
+        matrix = cv.getPerspectiveTransform(quad, dst)
+        page.meta["perspective_corrected"] = True
+        page.spans = []  # a projective warp cannot be applied to axis-aligned bboxes
+        return cv.warpPerspective(np.asarray(img), matrix, (tw, th),
+                                  flags=cv.INTER_LINEAR, borderMode=cv.BORDER_REPLICATE)
+
+    @staticmethod
+    @register_op("denoise")
+    def denoise(img: ImageArray, page: Page, strength: str = "light",
+                method: str = "auto") -> Optional[ImageArray]:
+        """Suppress scanner noise.
+
+        ``method="auto"`` picks bilateral filtering, which smooths flat paper while
+        preserving stroke edges -- ordinary Gaussian blur removes noise and glyph
+        detail in equal measure, which is why "denoise then OCR" so often scores
+        *worse* than doing nothing.
+
+        :param strength: one of ``"light"``, ``"medium"``, ``"aggressive"``.
+            ``"light"`` is the only safe default: each step up also erodes
+            diacritics, Devanagari matras and thin CJK strokes, so
+            ``"aggressive"`` is for genuinely filthy fax output and nothing else.
+        :param method: ``"auto"`` (bilateral with OpenCV, median without),
+            ``"bilateral"``, ``"nlmeans"``, ``"median"``, or ``"gaussian"``.
+            ``"nlmeans"`` is the highest quality and by far the slowest;
+            ``"gaussian"`` is the one to avoid, since it blurs strokes and noise
+            alike.  ``"bilateral"`` and ``"nlmeans"`` fall through to a
+            non-OpenCV path when OpenCV is missing.
+        :raises ConfigError: ``strength`` or ``method`` is not one of the above --
+            a typo here silently disabling denoising would be worse
+        """
+        np = _np()
+        levels = {"light": 1, "medium": 2, "aggressive": 3}
+        if strength not in levels:
+            raise ConfigError("strength must be one of %s" % sorted(levels))
+        level = levels[strength]
+        cv = _cv2()
+        gray = to_gray(img) if not is_color(img) else np.asarray(img)
+
+        if method in ("auto", "bilateral") and cv is not None:
+            diameter = 5 + 2 * level
+            return cv.bilateralFilter(gray, diameter, 25 * level, 25 * level)
+        if method == "nlmeans" and cv is not None:
+            if is_color(gray):
+                return cv.fastNlMeansDenoisingColored(gray, None, 3 * level, 3 * level, 7, 21)
+            return cv.fastNlMeansDenoising(gray, None, 3 * level, 7, 21)
+        if method in ("median", "auto"):
+            return median_blur(gray, 3 if level < 3 else 5)
+        if method == "gaussian":
+            return gaussian_blur(gray, 0.5 * level)
+        raise ConfigError("unknown denoise method %r" % method)
+
+    @staticmethod
+    @register_op("despeckle")
+    def despeckle(img: ImageArray, page: Page, min_area_px: int = 6) -> Optional[ImageArray]:
+        """Remove ink blobs smaller than ``min_area_px``.
+
+        Dust, fax speckle and JPEG mosquito noise become spurious punctuation
+        otherwise -- which then poisons amount parsing (``1.234`` vs ``1,234``).
+
+        :param min_area_px: connected ink components smaller than this many pixels
+            are painted back to the local paper colour.  ``6`` is tuned for 300
+            DPI, where a full stop covers roughly 12-20 pixels -- so the default
+            leaves real punctuation alone.  Scale it with the square of your DPI
+            (about ``24`` at 600 DPI); leave it low if the script carries small
+            marks, since Devanagari matras and Arabic dots are legitimately tiny.
+        :returns: ``None`` when the page has no ink, or nothing is small enough
+            to remove
+        """
+        np = _np()
+        gray = to_gray(img)
+        mask = ink_mask(gray)
+        if not mask.any():
+            return None
+        cv = _cv2()
+        if cv is not None:
+            count, labels, stats, _ = cv.connectedComponentsWithStats(
+                mask.astype(np.uint8), connectivity=8)
+            small = np.zeros(count, dtype=bool)
+            for i in range(1, count):
+                if stats[i, cv.CC_STAT_AREA] < min_area_px:
+                    small[i] = True
+            remove = small[labels]
+        else:
+            # Density proxy: ink whose 5x5 neighbourhood holds too little ink.
+            sums, _ = _rect_box_sum(mask.astype(np.float64), 5, 5)
+            remove = mask & (sums < float(min_area_px))
+        if not remove.any():
+            return None
+        out = np.array(gray, copy=True)
+        background = int(np.percentile(gray[~mask], 50)) if (~mask).any() else 255
+        out[remove] = background
+        return out
+
+    @staticmethod
+    @register_op("unsharp")
+    def unsharp(img: ImageArray, page: Page, amount: float = 1.0, radius: float = 2.0,
+                threshold: int = 0) -> Optional[ImageArray]:
+        """Unsharp masking: ``img + amount * (img - blur(img))``.
+
+        The one operation that genuinely recovers readability on soft scans.
+        ``threshold`` suppresses sharpening of low-contrast areas so that paper
+        grain is not amplified along with the strokes.
+
+        :param amount: how much of the high-frequency difference to add back.
+            ``1.0`` is a normal correction, and ``1.2`` is what the default
+            policy applies to a page measured as blurred.  Past about ``2.0``
+            strokes gain white halos that OCR segments as extra characters --
+            oversharpening reads worse than the soft original.
+        :param radius: Gaussian radius in pixels defining "detail".  ``2.0`` suits
+            300 DPI body text; raise it for large print, lower it towards ``1.0``
+            for dense small type, where a wide radius sharpens the gaps between
+            glyphs rather than the glyphs.
+        :param threshold: least absolute difference, ``0..255``, that gets
+            sharpened at all.  ``0`` sharpens everything including paper grain;
+            ``5``-``10`` leaves flat paper alone and is worth setting on any noisy
+            scan.
+        """
+        np = _np()
+        base = to_gray(img) if not is_color(img) else np.asarray(img)
+        blurred = gaussian_blur(base, radius)
+        diff = base.astype(np.float64) - blurred.astype(np.float64)
+        if threshold:
+            diff = np.where(np.abs(diff) < float(threshold), 0.0, diff)
+        return np.clip(base.astype(np.float64) + amount * diff, 0, 255).astype(np.uint8)
+
+    @staticmethod
+    @register_op("morphology")
+    def morphology(img: ImageArray, page: Page, operation: str = "open", ksize: int = 3,
+                   iterations: int = 1) -> Optional[ImageArray]:
+        """Grayscale morphology.  ``close`` fills broken strokes in faded thermal
+        print; ``open`` thins bleed-through from the reverse side.
+
+        Named from the point of view of the *ink*, not the pixel values.  Because
+        ink is dark, an OCR-sense "dilate the text" is a greyscale erosion, and
+        this op flips the operation for you -- so ``"dilate"`` thickens strokes,
+        as the name suggests.
+
+        :param operation: one of ``"open"``, ``"close"``, ``"erode"``,
+            ``"dilate"``, ``"tophat"``, ``"blackhat"``.  Use ``"close"`` for
+            broken strokes, ``"open"`` for speckle and show-through,
+            ``"dilate"`` to thicken hairline print before OCR, and ``"tophat"``
+            to pull small bright detail off an uneven background.  Without
+            OpenCV only the first four are meaningful, as the fallback runs on a
+            binary ink mask.
+        :param ksize: structuring element side in pixels, forced odd.  ``3`` is a
+            one-pixel nudge; ``5`` and ``7`` act fast, and anything larger tends
+            to merge adjacent glyphs into blobs.
+        :param iterations: how many times to apply it.  Two passes of ``3`` are
+            gentler and more controllable than one pass of ``5``.
+        :raises ConfigError: ``operation`` is not one of the six listed (OpenCV
+            path only)
+        """
+        np = _np()
+        gray = to_gray(img)
+        cv = _cv2()
+        k = max(1, int(ksize)) | 1
+        if cv is None:
+            mask = ink_mask(gray)
+            for _ in range(max(1, int(iterations))):
+                mask = morph_binary(mask, k, k, operation)
+            out = np.full_like(gray, 255)
+            out[mask] = 0
+            return out
+        kernel = cv.getStructuringElement(cv.MORPH_RECT, (k, k))
+        ops = {"open": cv.MORPH_OPEN, "close": cv.MORPH_CLOSE,
+               "erode": cv.MORPH_ERODE, "dilate": cv.MORPH_DILATE,
+               "tophat": cv.MORPH_TOPHAT, "blackhat": cv.MORPH_BLACKHAT}
+        if operation not in ops:
+            raise ConfigError("unknown morphological operation %r" % operation)
+        # Ink is dark, so an OCR-sense "dilate the text" is a grayscale erosion.
+        flipped = {"erode": cv.MORPH_DILATE, "dilate": cv.MORPH_ERODE,
+                   "open": cv.MORPH_CLOSE, "close": cv.MORPH_OPEN}
+        code = flipped.get(operation, ops[operation])
+        return cv.morphologyEx(gray, code, kernel, iterations=max(1, int(iterations)))
+
+    @staticmethod
+    def binarize_array(gray: GrayImage, method: str = "sauvola", window: int = 31,
+                       k: Optional[float] = None, offset: float = 10,
+                       min_std: float = 8.0) -> GrayImage:
+        """Binarise a grayscale array to a 0/255 image.
+
+        ``otsu``
+            One global threshold from between-class variance.  Fast and excellent
+            on evenly-lit print; catastrophic under a shadow gradient.
+        ``adaptive``
+            Local mean minus ``offset``.  Cheap, robust, slightly noisy.
+        ``sauvola`` *(default)*
+            ``T = m * (1 + k * (s / R - 1))``.  Designed for degraded documents:
+            it lowers the threshold where local contrast is low, so faint strokes
+            survive without dragging the background in with them.
+        ``niblack``
+            ``T = m + k * s`` (``k`` negative).  Sauvola's predecessor; keeps more
+            faint text, at the cost of needing the ``min_std`` guard below.
+        ``wolf``
+            Niblack normalised by the global minimum and maximum local deviation.
+            Better than Sauvola when contrast varies wildly across the page.
+        ``nick``
+            ``T = m + k * sqrt(var + m^2)``.  Tuned for very low-contrast scans --
+            the faded thermal-printer case.
+        ``bradley``
+            Integral-image mean with a percentage offset.  Very fast, and the most
+            forgiving of a badly chosen window.
+
+        ``window`` should be a little larger than one text line's height.  Too
+        small and glyph interiors get their own threshold (hollow letters); too
+        large and it degenerates to Otsu.
+
+        ``min_std`` guards Niblack, and only Niblack.  In a uniform patch of paper
+        the local deviation is ~0, so Niblack's threshold collapses onto the local
+        mean and half the blank page comes out black -- its notorious failure mode.
+        Where the local deviation is below ``min_std`` there is no local evidence
+        to use, so the global Otsu decision is taken instead.  The other local
+        methods need no such guard: Sauvola's ``(s/R - 1)`` term, Wolf's
+        normalisation and NICK's ``sqrt(var + m^2)`` all drive the threshold well
+        below the mean when deviation vanishes.
+
+        :param gray: the page as a greyscale array; colour input is converted
+        :param method: one of ``"otsu"``, ``"adaptive"``, ``"sauvola"``,
+            ``"niblack"``, ``"wolf"``, ``"nick"``, ``"bradley"``, each described
+            above.  ``"sauvola"`` is the default because it degrades most
+            gracefully across the widest range of real scans.
+        :param window: local window side in pixels, forced odd, minimum ``3``.
+            ``31`` suits 300 DPI body text; use ``51``-``61`` at 600 DPI.  Ignored
+            by ``"otsu"``, which is global.
+        :param k: method-specific sensitivity; ``None`` selects the published
+            default for the chosen method -- ``0.2`` for Sauvola, ``-0.2`` for
+            Niblack, ``0.5`` for Wolf, ``-0.14`` for NICK, ``0.15`` for Bradley.
+            Raising Sauvola's ``k`` keeps less faint ink; lowering it keeps more
+            background.  Ignored by ``"otsu"`` and ``"adaptive"``.
+        :param offset: grey levels subtracted from the local mean.  Used only by
+            ``"adaptive"``, where ``10`` is a mild bias towards keeping ink.
+        :param min_std: local deviation below which ``"niblack"`` falls back to
+            the global Otsu threshold.  Guards Niblack, and only Niblack, against
+            turning blank paper black.
+        :returns: an array of the same shape holding only ``0`` and ``255``
+        :raises ConfigError: ``method`` is not one of the seven listed
+        """
+        np = _np()
+        g = to_gray(gray).astype(np.float64)
+        win = max(3, int(window) | 1)
+
+        if method == "otsu":
+            binary = g > otsu_threshold(gray)
+        elif method == "adaptive":
+            mean, _ = window_stats(g, win)
+            binary = g > (mean - float(offset))
+        elif method == "bradley":
+            mean, _ = window_stats(g, win)
+            binary = g > mean * (1.0 - (0.15 if k is None else float(k)))
+        elif method == "sauvola":
+            kk = 0.2 if k is None else float(k)
+            mean, std = window_stats(g, win)
+            binary = g > mean * (1.0 + kk * (std / 128.0 - 1.0))
+        elif method == "niblack":
+            kk = -0.2 if k is None else float(k)
+            mean, std = window_stats(g, win)
+            binary = g > (mean + kk * std)
+            flat = std < float(min_std)
+            if flat.any():
+                binary = np.where(flat, g > otsu_threshold(gray), binary)
+        elif method == "wolf":
+            kk = 0.5 if k is None else float(k)
+            mean, std = window_stats(g, win)
+            max_std = float(std.max()) or 1.0
+            min_gray = float(g.min())
+            binary = g > (mean - kk * (1.0 - std / max_std) * (mean - min_gray))
+        elif method == "nick":
+            kk = -0.14 if k is None else float(k)
+            mean, std = window_stats(g, win)
+            binary = g > (mean + kk * np.sqrt(std ** 2 + mean ** 2))
+        else:
+            raise ConfigError("unknown binarisation method %r" % method)
+        return (binary.astype(np.uint8)) * 255
+
+    @staticmethod
+    @register_op("binarize")
+    def binarize(img: ImageArray, page: Page, method: str = "sauvola", window: int = 31,
+                 k: Optional[float] = None, offset: int = 10,
+                 min_std: float = 8.0) -> Optional[ImageArray]:
+        """Binarise the page.
+
+        Deliberately *not* part of :func:`Policies.default_policy`.  Binarisation reliably
+        lifts classical OCR accuracy and reliably degrades vision-language model
+        accuracy, because VLMs use greyscale gradient to disambiguate faint strokes
+        that a threshold has already destroyed.  Apply it in an OCR-bound branch
+        only -- see :func:`Policies.ocr_policy` versus :func:`Policies.vlm_policy`.
+
+        The op wrapper around :func:`Ops.binarize_array`; every parameter has the
+        same meaning and defaults there, where each method is described in full.
+
+        :param method: ``"sauvola"`` (default), ``"otsu"``, ``"adaptive"``,
+            ``"niblack"``, ``"wolf"``, ``"nick"``, or ``"bradley"``
+        :param window: local window side in pixels, forced odd; ``31`` at 300 DPI
+        :param k: method sensitivity; ``None`` takes each method's published default
+        :param offset: grey levels below the local mean, ``"adaptive"`` only
+        :param min_std: flat-region guard for ``"niblack"`` only
+        :raises ConfigError: ``method`` is not one of the seven listed
+        """
+        return binarize_array(img, method=method, window=window, k=k, offset=offset,
+                              min_std=min_std)
+
+    @staticmethod
+    @register_op("remove_lines")
+    def remove_lines(img: ImageArray, page: Page, direction: str = "both",
+                     min_len_ratio: float = 0.4, thickness: int = 2,
+                     keep_text: bool = True) -> Optional[ImageArray]:
+        """Erase long ruled lines (table borders, form rules, underlines).
+
+        Ruled lines merge with glyphs during OCR line segmentation and turn
+        ``|1,234|`` into ``11,2341``.  Removing them costs nothing on prose pages
+        and buys a lot on the ruled tables that dominate hospital bills.
+        ``keep_text`` restores pixels where a line crossed a glyph, so struck-through
+        or underlined text is not punched full of holes.
+
+        :param direction: ``"both"``, ``"horizontal"``, or ``"vertical"``.  Use
+            ``"horizontal"`` alone on statements ruled only between rows, which
+            avoids mistaking a tall bracket or a devanagari shirorekha stem for a
+            vertical rule.
+        :param min_len_ratio: least run length for a line to count, as a fraction
+            of the page dimension, in ``0.0..1.0``.  ``0.4`` means a horizontal
+            rule must span 40% of the width.  Lower it towards ``0.25`` for
+            narrow-column tables; raising it protects underlines from removal.
+        :param thickness: dilation in pixels applied to the detected run, so that
+            the anti-aliased edges of a rule are erased along with its core.
+            ``2`` suits 300 DPI; ``3``-``4`` for heavier print or higher DPI.
+        :param keep_text: restore pixels that also look like glyph, so a rule
+            crossing a digit does not punch a hole in it.  Leave this ``True``
+            unless you are removing rules from a page with no text on them.
+        :returns: ``None`` when the page has no ink, or no run is long enough to
+            count as a rule
+        :raises ConfigError: ``direction`` is not one of the three listed
+        """
+        np = _np()
+        if direction not in ("both", "horizontal", "vertical"):
+            raise ConfigError("direction must be both/horizontal/vertical")
+        gray = to_gray(img)
+        h, w = image_shape(gray)
+        mask = ink_mask(gray)
+        if not mask.any():
+            return None
+
+        removal = np.zeros_like(mask)
+        if direction in ("both", "horizontal"):
+            length = max(10, int(w * min_len_ratio))
+            opened = morph_binary(mask, 1, length, "open")
+            removal |= morph_binary(opened, max(1, int(thickness)), 3, "dilate")
+        if direction in ("both", "vertical"):
+            length = max(10, int(h * min_len_ratio))
+            opened = morph_binary(mask, length, 1, "open")
+            removal |= morph_binary(opened, 3, max(1, int(thickness)), "dilate")
+        removal &= mask
+        if not removal.any():
+            return None
+        if keep_text:
+            # A pixel that is part of a thick vertical run is glyph, not rule.
+            text_like = morph_binary(mask & ~removal, 3, 3, "dilate")
+            removal &= ~text_like
+        out = np.array(gray, copy=True)
+        background = int(np.percentile(gray[~mask], 50)) if (~mask).any() else 255
+        out[removal] = background
+        page.meta["lines_removed_px"] = int(removal.sum())
+        return out
+
+    @staticmethod
+    @register_op("remove_stamps")
+    def remove_stamps(img: ImageArray, page: Page, saturation_min: int = 70,
+                      value_min: int = 40, coverage_max: float = 0.25) -> Optional[ImageArray]:
+        """Suppress coloured stamps, seals and signatures, keeping black print.
+
+        Purple "PAID" stamps and blue ink signatures land on top of the numbers
+        that matter, and OCR reads the overlap as garbage.  Detection is by
+        saturation: black toner is unsaturated by definition, so anything strongly
+        coloured is an overlay.  ``coverage_max`` aborts the removal on genuinely
+        colourful documents (a colour brochure) where the premise does not hold.
+        Requires a colour raster; on grayscale input this is a no-op.
+
+        Order matters: run this *before* :func:`Ops.to_grayscale`, which throws
+        away the hue this op detects with.
+
+        :param saturation_min: least HSV saturation, ``0..255``, for a pixel to
+            count as coloured.  ``70`` clears black and grey toner, which sit near
+            ``0``, while catching blue and purple ink.  Lower it towards ``50``
+            for faded stamps, at the risk of eating colour-tinted paper.
+        :param value_min: least HSV value (brightness), ``0..255``.  ``40``
+            excludes near-black pixels whose hue is meaningless noise -- without
+            it, dark toner gets classified by whatever hue the sensor guessed.
+        :param coverage_max: abort if more than this fraction of the page is
+            coloured, in ``0.0..1.0``.  At ``0.25`` a colour brochure or a
+            coloured-paper form is left alone, because there the premise "colour
+            means overlay" is simply false.  The reason lands in
+            ``page.meta["remove_stamps"]``.
+        :returns: ``None`` on greyscale input, when nothing is coloured, or when
+            ``coverage_max`` aborts the removal
+        """
+        np = _np()
+        if not is_color(img):
+            page.meta["remove_stamps"] = "skipped: grayscale input"
+            return None
+        cv = _cv2()
+        rgb = to_rgb(img)
+        if cv is not None:
+            hsv = cv.cvtColor(rgb, cv.COLOR_RGB2HSV)
+            sat = hsv[:, :, 1].astype(np.float64)
+            val = hsv[:, :, 2].astype(np.float64)
+        else:
+            arr = rgb.astype(np.float64)
+            mx = arr.max(axis=2)
+            mn = arr.min(axis=2)
+            val = mx
+            sat = np.where(mx > 0, (mx - mn) / np.maximum(mx, 1.0) * 255.0, 0.0)
+        coloured = (sat >= float(saturation_min)) & (val >= float(value_min))
+        coverage = float(coloured.mean())
+        if coverage > coverage_max:
+            page.meta["remove_stamps"] = "skipped: %.0f%% of page is coloured" % (coverage * 100)
+            return None
+        if coverage <= 0.0:
+            return None
+        coloured = morph_binary(coloured, 3, 3, "close")
+        gray = to_gray(rgb)
+        out = np.array(gray, copy=True)
+        ink = ink_mask(gray)
+        background = int(np.percentile(gray[~ink], 50)) if (~ink).any() else 255
+        out[coloured] = background
+        page.meta["stamp_pixels_removed"] = int(coloured.sum())
+        return out
+
+    @staticmethod
+    def split_multi_bill_page(page: Page, axis: str = "auto", min_gap_frac: float = 0.06,
+                              max_parts: int = 3, min_part_frac: float = 0.2) -> List[Page]:
+        """Split a page carrying several documents into one page per document.
+
+        Two bills photocopied side by side onto one A4 is routine, and every
+        downstream assumption (one header, one total) breaks on it.  Splitting is
+        by wide whitespace gutters in the ink projection profile.
+
+        Returns ``[page]`` unchanged when no confident split is found -- a false
+        split is much more damaging than a missed one, so the thresholds are
+        deliberately conservative.
+
+        Not an :class:`Op`: ops map one page to one page, and this changes the
+        page count.  Reach for it through ``Pipeline(split_pages=True)``, or apply
+        it document-wide with :func:`Ops.split_document`.
+
+        :param page: a page with a raster; a page without one is returned as-is
+        :param axis: ``"auto"``, ``"vertical"``, or ``"horizontal"``.  ``"auto"``
+            prefers whichever axis yields more gutters, which handles both
+            side-by-side and stacked layouts.  Name the axis when you know it --
+            forcing ``"vertical"`` on side-by-side bills stops a wide gap between
+            table sections being read as a horizontal split.
+        :param min_gap_frac: least whitespace-gutter width for a split, as a
+            fraction of the page dimension, in ``0.0..1.0``.  ``0.06`` is about
+            half an inch on A4.  Raise it if inter-column spacing is being read
+            as a document boundary.
+        :param max_parts: refuse the split entirely if it would produce more than
+            this many pages.  ``3`` reflects what fits on a sheet; a result of
+            eight parts means the detector found text columns, not documents.
+        :param min_part_frac: least fraction of the page each part must occupy,
+            in ``0.0..1.0``.  At ``0.2`` a cut near the edge -- a margin note, a
+            punch-hole strip -- cannot become its own document.
+        :returns: one page per detected document, each with ``split_from`` and
+            ``split_part`` in ``page.meta`` and spans remapped into its own
+            coordinate space; or ``[page]`` when no confident split was found
+        :raises ConfigError: ``axis`` is not one of the three listed
+        """
+        np = _np()
+        if not page.has_raster():
+            return [page]
+        img = page.raster()
+        gray = to_gray(img)
+        h, w = image_shape(gray)
+        mask = ink_mask(gray)
+        if mask.mean() < 0.005:
+            return [page]
+
+        def gutters(profile: FloatArray, length: int, min_gap: int) -> List[int]:
+            """Midpoints of runs of near-empty rows/columns at least ``min_gap`` long.
+
+            :param profile: the ink projection profile along the splitting axis
+            :param length: the page's extent along that axis, in pixels
+            """
+            empty = profile < (profile.max() * 0.02)
+            cuts = []
+            start = None
+            for i, is_empty in enumerate(empty):
+                if is_empty and start is None:
+                    start = i
+                elif not is_empty and start is not None:
+                    if i - start >= min_gap and start > length * min_part_frac \
+                            and i < length * (1 - min_part_frac):
+                        cuts.append((start + i) // 2)
+                    start = None
+            return cuts
+
+        col_profile = mask.sum(axis=0).astype(np.float64)
+        row_profile = mask.sum(axis=1).astype(np.float64)
+        vertical_cuts = gutters(col_profile, w, int(w * min_gap_frac))
+        horizontal_cuts = gutters(row_profile, h, int(h * min_gap_frac))
+
+        if axis == "auto":
+            use_vertical = len(vertical_cuts) >= len(horizontal_cuts) and vertical_cuts
+        elif axis == "vertical":
+            use_vertical = bool(vertical_cuts)
+        elif axis == "horizontal":
+            use_vertical = False
+        else:
+            raise ConfigError("axis must be auto/vertical/horizontal")
+
+        cuts = vertical_cuts if use_vertical else horizontal_cuts
+        if not cuts or len(cuts) + 1 > max_parts:
+            return [page]
+
+        bounds = [0] + sorted(cuts) + [w if use_vertical else h]
+        parts: List[Page] = []
+        dpi = float(page.raster_dpi)
+        for i in range(len(bounds) - 1):
+            lo, hi = bounds[i], bounds[i + 1]
+            crop = np.asarray(img)[:, lo:hi] if use_vertical else np.asarray(img)[lo:hi, :]
+            part = page.copy()
+            part.set_raster(np.ascontiguousarray(crop), dpi=page.raster_dpi)
+            part.meta = dict(page.meta)
+            part.meta["split_from"] = page.index
+            part.meta["split_part"] = i
+            dx = -lo * 72.0 / dpi if use_vertical else 0.0
+            dy = 0.0 if use_vertical else -lo * 72.0 / dpi
+            _map_span_points(part, lambda x, y, _dx=dx, _dy=dy: (x + _dx, y + _dy))
+            _sync_page_geometry(part)
+            part.record("split_multi_bill_page",
+                        {"axis": "vertical" if use_vertical else "horizontal", "part": i})
+            parts.append(part)
+        return parts
+
+    @staticmethod
+    def split_document(doc: Document, **kwargs: Any) -> Document:
+        """Apply :func:`Ops.split_multi_bill_page` across a document, renumbering pages.
+
+        Renumbering matters: every span's ``bbox.page`` and every provenance
+        reference is keyed by page index, so the new pages are reindexed
+        contiguously rather than inheriting the index they were split from.
+
+        :param doc: the document to split; it is not mutated
+        :param kwargs: forwarded per page to :func:`Ops.split_multi_bill_page` --
+            ``axis``, ``min_gap_frac``, ``max_parts``, ``min_part_frac``
+        :returns: a new :class:`Document` whose pages are numbered from ``0``;
+            pages that did not split carry through unchanged
+        """
+        out = Document(source_uri=doc.source_uri, meta=dict(doc.meta),
+                       warnings=list(doc.warnings))
+        index = 0
+        for page in doc.pages:
+            for part in split_multi_bill_page(page, **kwargs):
+                out.pages.append(_reindex_page(part, index))
+                index += 1
+        out.meta["page_count"] = len(out.pages)
+        return out
 
 
-@register_op("invert_if_dark")
-def invert_if_dark(img: ImageArray, page: Page,
-                   ink_threshold: float = 0.55) -> Optional[ImageArray]:
-    """Invert white-on-black pages (negative scans, some fax modes).
-
-    Every downstream measurement assumes dark ink on light paper; a negative
-    page reports 90% ink coverage and gets classified unreadable, when in fact
-    it just needs one subtraction.
-    """
-    np = _np()
-    gray = to_gray(img)
-    if float(ink_mask(gray).mean()) <= ink_threshold:
-        return None
-    page.meta["inverted"] = True
-    return (255 - np.asarray(img)).astype(np.uint8)
-
-
-@register_op("autocontrast")
-def autocontrast(img: ImageArray, page: Page, low_pct: float = 1.0,
-                 high_pct: float = 99.0) -> Optional[ImageArray]:
-    """Stretch the ``[low_pct, high_pct]`` intensity range to full scale.
-
-    Percentile-based so that a punch hole or a black scan border does not eat
-    the entire dynamic range, which is what naive min/max stretching does.
-    """
-    np = _np()
-    gray = to_gray(img)
-    lo = _percentile_np(gray, low_pct)
-    hi = _percentile_np(gray, high_pct)
-    if hi - lo < 1.0:
-        return None
-    arr = np.asarray(img, dtype=np.float64)
-    out = (arr - lo) * (255.0 / (hi - lo))
-    return np.clip(out, 0, 255).astype(np.uint8)
-
-
-@register_op("gamma")
-def gamma(img: ImageArray, page: Page, value: float = 1.0) -> Optional[ImageArray]:
-    """Apply gamma correction.  ``value < 1`` brightens, ``> 1`` darkens."""
-    np = _np()
-    if abs(value - 1.0) < 1e-6:
-        return None
-    table = np.clip(((np.arange(256) / 255.0) ** float(value)) * 255.0, 0, 255)
-    return table.astype(np.uint8)[np.asarray(img)]
-
-
-@register_op("clahe")
-def clahe(img: ImageArray, page: Page, clip: float = 2.0,
-          grid: int = 8) -> Optional[ImageArray]:
-    """Contrast-limited adaptive histogram equalisation.
-
-    The right tool for a page that is faded in one corner and fine elsewhere --
-    a global stretch cannot fix that by construction.  Falls back to
-    :func:`autocontrast` without OpenCV.
-    """
-    cv = _cv2()
-    gray = to_gray(img)
-    if cv is None:
-        page.meta["clahe"] = "fell back to global autocontrast (no OpenCV)"
-        return _autocontrast_array(gray)
-    op = cv.createCLAHE(clipLimit=float(clip), tileGridSize=(int(grid), int(grid)))
-    return op.apply(gray)
+# Module-level aliases.  These are load-bearing, not merely back-compatible:
+# the staticmethods above call one another through these flat names, resolved
+# from module globals at call time.  Deleting them breaks Ops from the inside.
+# ``Ops.x`` is the documented path; ``x`` is the one that already works.
+to_grayscale           = Ops.to_grayscale
+invert_if_dark         = Ops.invert_if_dark
+autocontrast           = Ops.autocontrast
+gamma                  = Ops.gamma
+clahe                  = Ops.clahe
+normalize_illumination = Ops.normalize_illumination
+remove_shadow          = Ops.remove_shadow
+rescale                = Ops.rescale
+ensure_dpi             = Ops.ensure_dpi
+resize_max_side        = Ops.resize_max_side
+deskew                 = Ops.deskew
+rotate                 = Ops.rotate
+auto_orient            = Ops.auto_orient
+crop_to_content        = Ops.crop_to_content
+remove_border          = Ops.remove_border
+pad                    = Ops.pad
+perspective_correct    = Ops.perspective_correct
+denoise                = Ops.denoise
+despeckle              = Ops.despeckle
+unsharp                = Ops.unsharp
+morphology             = Ops.morphology
+binarize_array         = Ops.binarize_array
+binarize               = Ops.binarize
+remove_lines           = Ops.remove_lines
+remove_stamps          = Ops.remove_stamps
+split_multi_bill_page  = Ops.split_multi_bill_page
+split_document         = Ops.split_document
 
 
 def _autocontrast_array(gray: GrayImage, low_pct: float = 1.0,
@@ -3520,205 +4930,7 @@ def _autocontrast_array(gray: GrayImage, low_pct: float = 1.0,
     return np.clip((gray.astype(np.float64) - lo) * (255.0 / (hi - lo)), 0, 255).astype(np.uint8)
 
 
-@register_op("normalize_illumination")
-def normalize_illumination(img: ImageArray, page: Page, radius: Optional[int] = None,
-                           strength: float = 1.0) -> Optional[ImageArray]:
-    """Flatten uneven lighting by dividing out the estimated background.
-
-    This is the fix for phone photos and book scans with a shadow gradient.
-    Doing it *before* binarisation is what lets a global threshold work at all;
-    skipping it is why so many pipelines lose the shadowed third of a page.
-    """
-    np = _np()
-    gray = to_gray(img)
-    background = estimate_background(gray, radius).astype(np.float64)
-    background = np.maximum(background, 1.0)
-    normalised = np.clip(gray.astype(np.float64) * 255.0 / background, 0, 255)
-    if strength < 1.0:
-        normalised = gray.astype(np.float64) * (1.0 - strength) + normalised * strength
-    return normalised.astype(np.uint8)
-
-
-@register_op("remove_shadow")
-def remove_shadow(img: ImageArray, page: Page, radius: int = 21) -> Optional[ImageArray]:
-    """Remove cast shadows via dilate-then-median background subtraction.
-
-    The classic recipe: dilating with a mid-sized kernel removes text, the
-    median then removes residual structure, and the difference is the page
-    without its shadow.
-    """
-    np = _np()
-    gray = to_gray(img)
-    k = int(radius) | 1
-    cv = _cv2()
-    if cv is not None:
-        dilated = cv.dilate(gray, np.ones((k, k), np.uint8))
-        background = cv.medianBlur(dilated, k)
-    else:
-        background = median_blur(box_blur(gray, k // 2), 5)
-    diff = 255 - np.abs(gray.astype(np.int16) - background.astype(np.int16))
-    return _autocontrast_array(np.clip(diff, 0, 255).astype(np.uint8))
-
-
 # -- geometry ----------------------------------------------------------------
-
-@register_op("rescale", geometric=True)
-def rescale(img: ImageArray, page: Page, factor: float = 1.0,
-            interpolation: str = "auto") -> Optional[ImageArray]:
-    """Scale the raster by ``factor``, keeping physical page size constant.
-
-    Point-space coordinates are unaffected because DPI scales with the pixels;
-    that invariant is what keeps every previously-extracted bbox valid.
-    """
-    if abs(factor - 1.0) < 1e-6:
-        return None
-    out = resize_image(img, scale=factor, interpolation=interpolation)
-    page._raster_dpi = int(round(page.raster_dpi * factor))
-    page.quality.raster_dpi = page._raster_dpi
-    return out
-
-
-@register_op("ensure_dpi", geometric=True)
-def ensure_dpi(img: ImageArray, page: Page, min_dpi: int = 300, max_dpi: int = 600,
-               interpolation: str = "auto") -> Optional[ImageArray]:
-    """Upsample until the page reaches ``min_dpi``, capped at ``max_dpi``.
-
-    Upsampling adds no information -- but Tesseract's and PaddleOCR's character
-    models are trained around 300 DPI glyph sizes and measurably lose accuracy
-    on smaller input, so the resample buys real recall even though it buys no
-    new signal.  The cap exists because beyond ~400 DPI you pay quadratically
-    in pixels for nothing.
-    """
-    current = page.quality.effective_dpi or page.raster_dpi or DEFAULT_IMAGE_DPI
-    if current >= min_dpi:
-        return None
-    factor = float(min_dpi) / float(current)
-    if page.raster_dpi * factor > max_dpi:
-        factor = float(max_dpi) / float(page.raster_dpi or min_dpi)
-    if factor <= 1.0 + 1e-6:
-        return None
-    out = resize_image(img, scale=factor, interpolation=interpolation)
-    page._raster_dpi = int(round(page.raster_dpi * factor))
-    page.quality.raster_dpi = page._raster_dpi
-    page.quality.effective_dpi = int(round(current * factor))
-    return out
-
-
-@register_op("resize_max_side", geometric=True)
-def resize_max_side(img: ImageArray, page: Page, max_px: int = 2000,
-                    interpolation: str = "area") -> Optional[ImageArray]:
-    """Cap the longest side.  Vision-model cost is ~linear in pixels, and most
-    providers downscale above ~1500px anyway -- paying to upload pixels the
-    provider will discard is pure waste."""
-    h, w = image_shape(img)
-    longest = max(h, w)
-    if longest <= max_px:
-        return None
-    factor = float(max_px) / float(longest)
-    out = resize_image(img, scale=factor, interpolation=interpolation)
-    page._raster_dpi = max(1, int(round(page.raster_dpi * factor)))
-    page.quality.raster_dpi = page._raster_dpi
-    return out
-
-
-@register_op("deskew", geometric=True)
-def deskew(img: ImageArray, page: Page, max_angle: float = 15.0, min_angle: float = 0.4,
-           method: str = "auto", angle: Optional[float] = None) -> Optional[ImageArray]:
-    """Rotate the page so its text lines are horizontal.
-
-    Rotation is skipped below ``min_angle`` because resampling always costs a
-    little sharpness, and correcting 0.2 degrees costs more than it recovers.
-    Above ``max_angle`` the page is not skewed, it is rotated -- a different
-    problem, handled by :func:`auto_orient`.
-
-    Existing span coordinates are rotated with the image rather than discarded.
-    """
-    detected = float(angle) if angle is not None else page.quality.skew_deg
-    if angle is None and abs(detected) < 1e-9:
-        detected = estimate_skew(to_gray(img), max_angle=max_angle, method=method)
-    if abs(detected) < min_angle or abs(detected) > max_angle:
-        return None
-
-    before_h, before_w = image_shape(img)
-    out = rotate_image(img, detected, expand=True)
-    after_h, after_w = image_shape(out)
-    dpi = float(page.raster_dpi)
-
-    # Same affine mapping the raster underwent, expressed in points.
-    theta = math.radians(-detected)  # image rotated CCW by `detected`
-    cos_t, sin_t = math.cos(theta), math.sin(theta)
-    cx, cy = before_w / 2.0 * 72.0 / dpi, before_h / 2.0 * 72.0 / dpi
-    nx, ny = after_w / 2.0 * 72.0 / dpi, after_h / 2.0 * 72.0 / dpi
-
-    def mapper(x: float, y: float) -> Tuple[float, float]:
-        """Point-space image of ``(x, y)`` under the same rotation the raster took."""
-        dx, dy = x - cx, y - cy
-        return (cos_t * dx - sin_t * dy + nx, sin_t * dx + cos_t * dy + ny)
-
-    _map_span_points(page, mapper)
-    page.quality.skew_deg = 0.0
-    page.rotation = int(page.rotation)
-    page.meta["deskew_applied_deg"] = round(detected, 3)
-    return out
-
-
-@register_op("rotate", geometric=True)
-def rotate(img: ImageArray, page: Page, degrees: int = 0) -> Optional[ImageArray]:
-    """Rotate by an exact multiple of 90 degrees (lossless)."""
-    np = _np()
-    turns = int(round(degrees / 90.0)) % 4
-    if turns == 0:
-        return None
-    page.rotation = (page.rotation + turns * 90) % 360
-    h, w = image_shape(img)
-    dpi = float(page.raster_dpi)
-
-    def mapper(x: float, y: float, _t: int = turns, _w: float = w * 72.0 / dpi,
-               _h: float = h * 72.0 / dpi) -> Tuple[float, float]:
-        """Point-space image of ``(x, y)`` after ``_t`` clockwise quarter-turns."""
-        # One clockwise quarter-turn sends (x, y) -> (H - y, x) and swaps the
-        # page's width and height; apply that `turns` times.
-        for _ in range(_t):
-            x, y = _h - y, x
-            _w, _h = _h, _w
-        return (x, y)
-
-    _map_span_points(page, mapper)
-    return np.ascontiguousarray(np.rot90(np.asarray(img), k=-turns))
-
-
-@register_op("auto_orient", geometric=True)
-def auto_orient(img: ImageArray, page: Page, use_osd: bool = True,
-                min_confidence: float = 1.0) -> Optional[ImageArray]:
-    """Detect and correct 90/180/270-degree page rotation.
-
-    Tesseract's orientation-and-script-detection is used when available because
-    it is the only cheap method that can tell upside-down text from right-way-up
-    text.  Without it we fall back to a projection-profile test, which reliably
-    distinguishes portrait from landscape text but **cannot** detect a 180-degree
-    flip -- that limitation is reported in the page history rather than hidden.
-    """
-    np = _np()
-    rotation = None
-    if use_osd and (have("pytesseract") or shutil.which("tesseract")):
-        rotation = _osd_rotation(img, min_confidence)
-    if rotation is None:
-        gray = to_gray(img)
-        small = resize_image(gray, scale=min(1.0, 800.0 / max(image_shape(gray))))
-        mask = ink_mask(small).astype(np.float64)
-        if mask.mean() < 0.001:
-            return None
-        horizontal = float(np.var(mask.sum(axis=1)))
-        vertical = float(np.var(mask.sum(axis=0)))
-        rotation = 90 if vertical > horizontal * 1.6 else 0
-        page.meta["orientation_method"] = "projection (180-degree flips undetectable)"
-    else:
-        page.meta["orientation_method"] = "tesseract-osd"
-    if not rotation:
-        return None
-    # OSD reports the counter-clockwise angle that would right the page.
-    return rotate.fn(img, page, degrees=-rotation)
-
 
 def _osd_rotation(img: ImageArray, min_confidence: float = 1.0) -> Optional[int]:
     """Ask Tesseract which way is up.  Returns clockwise degrees, or ``None``."""
@@ -3738,625 +4950,188 @@ def _osd_rotation(img: ImageArray, min_confidence: float = 1.0) -> Optional[int]
         return None
 
 
-@register_op("crop_to_content", geometric=True)
-def crop_to_content(img: ImageArray, page: Page, margin_pt: float = 6.0,
-                    min_keep: float = 0.25) -> Optional[ImageArray]:
-    """Crop away empty margins, keeping ``margin_pt`` of whitespace.
-
-    Guarded by ``min_keep``: if the detected content occupies less than that
-    fraction of the page, the detection is more likely to have locked onto a
-    speck of dust than onto the content, and the crop is refused.
-    """
-    np = _np()
-    gray = to_gray(img)
-    h, w = image_shape(gray)
-    mask = ink_mask(gray)
-    # Suppress isolated specks before deciding where the content ends.
-    mask = morph_binary(mask, 3, 3, "open")
-    rows = np.nonzero(mask.any(axis=1))[0]
-    cols = np.nonzero(mask.any(axis=0))[0]
-    if rows.size == 0 or cols.size == 0:
-        return None
-    dpi = float(page.raster_dpi)
-    margin_px = int(round(margin_pt * dpi / 72.0))
-    y0 = max(0, int(rows[0]) - margin_px); y1 = min(h, int(rows[-1]) + 1 + margin_px)
-    x0 = max(0, int(cols[0]) - margin_px); x1 = min(w, int(cols[-1]) + 1 + margin_px)
-    if (y1 - y0) * (x1 - x0) < min_keep * h * w:
-        page.meta["crop_refused"] = "content region below min_keep"
-        return None
-    if (y0, x0, y1, x1) == (0, 0, h, w):
-        return None
-    dx = -x0 * 72.0 / dpi
-    dy = -y0 * 72.0 / dpi
-    _map_span_points(page, lambda x, y: (x + dx, y + dy))
-    return np.ascontiguousarray(np.asarray(img)[y0:y1, x0:x1])
-
-
-@register_op("remove_border", geometric=True)
-def remove_border(img: ImageArray, page: Page, max_frac: float = 0.08,
-                  dark_threshold: int = 90) -> Optional[ImageArray]:
-    """Trim the black frame a flatbed leaves when the lid is open.
-
-    Those frames wreck contrast measurement and ink coverage, and Tesseract
-    frequently reads them as a column of punctuation.
-    """
-    np = _np()
-    gray = to_gray(img)
-    h, w = image_shape(gray)
-    limit_y = max(1, int(h * max_frac))
-    limit_x = max(1, int(w * max_frac))
-    dark_rows = gray.mean(axis=1) < dark_threshold
-    dark_cols = gray.mean(axis=0) < dark_threshold
-
-    top = 0
-    while top < limit_y and dark_rows[top]:
-        top += 1
-    bottom = h
-    while bottom > h - limit_y and dark_rows[bottom - 1]:
-        bottom -= 1
-    left = 0
-    while left < limit_x and dark_cols[left]:
-        left += 1
-    right = w
-    while right > w - limit_x and dark_cols[right - 1]:
-        right -= 1
-    if (top, left, bottom, right) == (0, 0, h, w):
-        return None
-    dpi = float(page.raster_dpi)
-    _map_span_points(page, lambda x, y: (x - left * 72.0 / dpi, y - top * 72.0 / dpi))
-    return np.ascontiguousarray(np.asarray(img)[top:bottom, left:right])
-
-
-@register_op("pad", geometric=True)
-def pad(img: ImageArray, page: Page, margin_px: int = 16,
-        value: int = 255) -> Optional[ImageArray]:
-    """Add a quiet margin.  Tesseract's layout analysis degrades noticeably
-    when glyphs touch the image edge."""
-    np = _np()
-    m = int(margin_px)
-    if m <= 0:
-        return None
-    arr = np.asarray(img)
-    width = ((m, m), (m, m)) + (((0, 0),) if arr.ndim == 3 else ())
-    dpi = float(page.raster_dpi)
-    _map_span_points(page, lambda x, y: (x + m * 72.0 / dpi, y + m * 72.0 / dpi))
-    return np.pad(arr, width, mode="constant", constant_values=int(value))
-
-
-@register_op("perspective_correct", geometric=True)
-def perspective_correct(img: ImageArray, page: Page, min_area_ratio: float = 0.35,
-                        epsilon_frac: float = 0.02) -> Optional[ImageArray]:
-    """Flatten a photographed page by warping its detected quadrilateral.
-
-    Only fires when a convincing four-sided contour covering most of the frame
-    is found, because warping on a bad quad is far worse than not warping:
-    it shears the text irrecoverably.  Requires OpenCV.
-    """
-    np = _np()
-    cv = _cv2()
-    if cv is None:
-        page.meta["perspective_correct"] = "skipped: OpenCV unavailable"
-        return None
-    gray = to_gray(img)
-    h, w = image_shape(gray)
-    blurred = cv.GaussianBlur(gray, (5, 5), 0)
-    edges = cv.Canny(blurred, 60, 180)
-    edges = cv.dilate(edges, np.ones((3, 3), np.uint8), iterations=1)
-    contours, _ = cv.findContours(edges, cv.RETR_EXTERNAL, cv.CHAIN_APPROX_SIMPLE)[-2:]
-    best = None
-    best_area = min_area_ratio * h * w
-    for contour in contours:
-        area = cv.contourArea(contour)
-        if area < best_area:
-            continue
-        approx = cv.approxPolyDP(contour, epsilon_frac * cv.arcLength(contour, True), True)
-        if len(approx) == 4 and cv.isContourConvex(approx):
-            best, best_area = approx.reshape(4, 2).astype(np.float32), area
-    if best is None:
-        return None
-
-    # Order corners tl, tr, br, bl.
-    s = best.sum(axis=1)
-    d = np.diff(best, axis=1).ravel()
-    quad = np.array([best[np.argmin(s)], best[np.argmin(d)],
-                     best[np.argmax(s)], best[np.argmax(d)]], dtype=np.float32)
-    widths = [np.linalg.norm(quad[0] - quad[1]), np.linalg.norm(quad[3] - quad[2])]
-    heights = [np.linalg.norm(quad[0] - quad[3]), np.linalg.norm(quad[1] - quad[2])]
-    tw = int(max(widths)); th = int(max(heights))
-    if tw < 32 or th < 32:
-        return None
-    dst = np.array([[0, 0], [tw - 1, 0], [tw - 1, th - 1], [0, th - 1]], dtype=np.float32)
-    matrix = cv.getPerspectiveTransform(quad, dst)
-    page.meta["perspective_corrected"] = True
-    page.spans = []  # a projective warp cannot be applied to axis-aligned bboxes
-    return cv.warpPerspective(np.asarray(img), matrix, (tw, th),
-                              flags=cv.INTER_LINEAR, borderMode=cv.BORDER_REPLICATE)
-
-
 # -- noise and sharpness -----------------------------------------------------
-
-@register_op("denoise")
-def denoise(img: ImageArray, page: Page, strength: str = "light",
-            method: str = "auto") -> Optional[ImageArray]:
-    """Suppress scanner noise.
-
-    ``method="auto"`` picks bilateral filtering, which smooths flat paper while
-    preserving stroke edges -- ordinary Gaussian blur removes noise and glyph
-    detail in equal measure, which is why "denoise then OCR" so often scores
-    *worse* than doing nothing.
-    """
-    np = _np()
-    levels = {"light": 1, "medium": 2, "aggressive": 3}
-    if strength not in levels:
-        raise ConfigError("strength must be one of %s" % sorted(levels))
-    level = levels[strength]
-    cv = _cv2()
-    gray = to_gray(img) if not is_color(img) else np.asarray(img)
-
-    if method in ("auto", "bilateral") and cv is not None:
-        diameter = 5 + 2 * level
-        return cv.bilateralFilter(gray, diameter, 25 * level, 25 * level)
-    if method == "nlmeans" and cv is not None:
-        if is_color(gray):
-            return cv.fastNlMeansDenoisingColored(gray, None, 3 * level, 3 * level, 7, 21)
-        return cv.fastNlMeansDenoising(gray, None, 3 * level, 7, 21)
-    if method in ("median", "auto"):
-        return median_blur(gray, 3 if level < 3 else 5)
-    if method == "gaussian":
-        return gaussian_blur(gray, 0.5 * level)
-    raise ConfigError("unknown denoise method %r" % method)
-
-
-@register_op("despeckle")
-def despeckle(img: ImageArray, page: Page, min_area_px: int = 6) -> Optional[ImageArray]:
-    """Remove ink blobs smaller than ``min_area_px``.
-
-    Dust, fax speckle and JPEG mosquito noise become spurious punctuation
-    otherwise -- which then poisons amount parsing (``1.234`` vs ``1,234``).
-    """
-    np = _np()
-    gray = to_gray(img)
-    mask = ink_mask(gray)
-    if not mask.any():
-        return None
-    cv = _cv2()
-    if cv is not None:
-        count, labels, stats, _ = cv.connectedComponentsWithStats(
-            mask.astype(np.uint8), connectivity=8)
-        small = np.zeros(count, dtype=bool)
-        for i in range(1, count):
-            if stats[i, cv.CC_STAT_AREA] < min_area_px:
-                small[i] = True
-        remove = small[labels]
-    else:
-        # Density proxy: ink whose 5x5 neighbourhood holds too little ink.
-        sums, _ = _rect_box_sum(mask.astype(np.float64), 5, 5)
-        remove = mask & (sums < float(min_area_px))
-    if not remove.any():
-        return None
-    out = np.array(gray, copy=True)
-    background = int(np.percentile(gray[~mask], 50)) if (~mask).any() else 255
-    out[remove] = background
-    return out
-
-
-@register_op("unsharp")
-def unsharp(img: ImageArray, page: Page, amount: float = 1.0, radius: float = 2.0,
-            threshold: int = 0) -> Optional[ImageArray]:
-    """Unsharp masking: ``img + amount * (img - blur(img))``.
-
-    The one operation that genuinely recovers readability on soft scans.
-    ``threshold`` suppresses sharpening of low-contrast areas so that paper
-    grain is not amplified along with the strokes.
-    """
-    np = _np()
-    base = to_gray(img) if not is_color(img) else np.asarray(img)
-    blurred = gaussian_blur(base, radius)
-    diff = base.astype(np.float64) - blurred.astype(np.float64)
-    if threshold:
-        diff = np.where(np.abs(diff) < float(threshold), 0.0, diff)
-    return np.clip(base.astype(np.float64) + amount * diff, 0, 255).astype(np.uint8)
-
-
-@register_op("morphology")
-def morphology(img: ImageArray, page: Page, operation: str = "open", ksize: int = 3,
-               iterations: int = 1) -> Optional[ImageArray]:
-    """Grayscale morphology.  ``close`` fills broken strokes in faded thermal
-    print; ``open`` thins bleed-through from the reverse side."""
-    np = _np()
-    gray = to_gray(img)
-    cv = _cv2()
-    k = max(1, int(ksize)) | 1
-    if cv is None:
-        mask = ink_mask(gray)
-        for _ in range(max(1, int(iterations))):
-            mask = morph_binary(mask, k, k, operation)
-        out = np.full_like(gray, 255)
-        out[mask] = 0
-        return out
-    kernel = cv.getStructuringElement(cv.MORPH_RECT, (k, k))
-    ops = {"open": cv.MORPH_OPEN, "close": cv.MORPH_CLOSE,
-           "erode": cv.MORPH_ERODE, "dilate": cv.MORPH_DILATE,
-           "tophat": cv.MORPH_TOPHAT, "blackhat": cv.MORPH_BLACKHAT}
-    if operation not in ops:
-        raise ConfigError("unknown morphological operation %r" % operation)
-    # Ink is dark, so an OCR-sense "dilate the text" is a grayscale erosion.
-    flipped = {"erode": cv.MORPH_DILATE, "dilate": cv.MORPH_ERODE,
-               "open": cv.MORPH_CLOSE, "close": cv.MORPH_OPEN}
-    code = flipped.get(operation, ops[operation])
-    return cv.morphologyEx(gray, code, kernel, iterations=max(1, int(iterations)))
-
 
 # -- binarisation ------------------------------------------------------------
 
-def binarize_array(gray: GrayImage, method: str = "sauvola", window: int = 31,
-                   k: Optional[float] = None, offset: float = 10,
-                   min_std: float = 8.0) -> GrayImage:
-    """Binarise a grayscale array to a 0/255 image.
-
-    ``otsu``
-        One global threshold from between-class variance.  Fast and excellent
-        on evenly-lit print; catastrophic under a shadow gradient.
-    ``adaptive``
-        Local mean minus ``offset``.  Cheap, robust, slightly noisy.
-    ``sauvola`` *(default)*
-        ``T = m * (1 + k * (s / R - 1))``.  Designed for degraded documents:
-        it lowers the threshold where local contrast is low, so faint strokes
-        survive without dragging the background in with them.
-    ``niblack``
-        ``T = m + k * s`` (``k`` negative).  Sauvola's predecessor; keeps more
-        faint text, at the cost of needing the ``min_std`` guard below.
-    ``wolf``
-        Niblack normalised by the global minimum and maximum local deviation.
-        Better than Sauvola when contrast varies wildly across the page.
-    ``nick``
-        ``T = m + k * sqrt(var + m^2)``.  Tuned for very low-contrast scans --
-        the faded thermal-printer case.
-    ``bradley``
-        Integral-image mean with a percentage offset.  Very fast, and the most
-        forgiving of a badly chosen window.
-
-    ``window`` should be a little larger than one text line's height.  Too
-    small and glyph interiors get their own threshold (hollow letters); too
-    large and it degenerates to Otsu.
-
-    ``min_std`` guards Niblack, and only Niblack.  In a uniform patch of paper
-    the local deviation is ~0, so Niblack's threshold collapses onto the local
-    mean and half the blank page comes out black -- its notorious failure mode.
-    Where the local deviation is below ``min_std`` there is no local evidence
-    to use, so the global Otsu decision is taken instead.  The other local
-    methods need no such guard: Sauvola's ``(s/R - 1)`` term, Wolf's
-    normalisation and NICK's ``sqrt(var + m^2)`` all drive the threshold well
-    below the mean when deviation vanishes.
-    """
-    np = _np()
-    g = to_gray(gray).astype(np.float64)
-    win = max(3, int(window) | 1)
-
-    if method == "otsu":
-        binary = g > otsu_threshold(gray)
-    elif method == "adaptive":
-        mean, _ = window_stats(g, win)
-        binary = g > (mean - float(offset))
-    elif method == "bradley":
-        mean, _ = window_stats(g, win)
-        binary = g > mean * (1.0 - (0.15 if k is None else float(k)))
-    elif method == "sauvola":
-        kk = 0.2 if k is None else float(k)
-        mean, std = window_stats(g, win)
-        binary = g > mean * (1.0 + kk * (std / 128.0 - 1.0))
-    elif method == "niblack":
-        kk = -0.2 if k is None else float(k)
-        mean, std = window_stats(g, win)
-        binary = g > (mean + kk * std)
-        flat = std < float(min_std)
-        if flat.any():
-            binary = np.where(flat, g > otsu_threshold(gray), binary)
-    elif method == "wolf":
-        kk = 0.5 if k is None else float(k)
-        mean, std = window_stats(g, win)
-        max_std = float(std.max()) or 1.0
-        min_gray = float(g.min())
-        binary = g > (mean - kk * (1.0 - std / max_std) * (mean - min_gray))
-    elif method == "nick":
-        kk = -0.14 if k is None else float(k)
-        mean, std = window_stats(g, win)
-        binary = g > (mean + kk * np.sqrt(std ** 2 + mean ** 2))
-    else:
-        raise ConfigError("unknown binarisation method %r" % method)
-    return (binary.astype(np.uint8)) * 255
-
-
-@register_op("binarize")
-def binarize(img: ImageArray, page: Page, method: str = "sauvola", window: int = 31,
-             k: Optional[float] = None, offset: int = 10,
-             min_std: float = 8.0) -> Optional[ImageArray]:
-    """Binarise the page.
-
-    Deliberately *not* part of :func:`default_policy`.  Binarisation reliably
-    lifts classical OCR accuracy and reliably degrades vision-language model
-    accuracy, because VLMs use greyscale gradient to disambiguate faint strokes
-    that a threshold has already destroyed.  Apply it in an OCR-bound branch
-    only -- see :func:`ocr_policy` versus :func:`vlm_policy`.
-    """
-    return binarize_array(img, method=method, window=window, k=k, offset=offset,
-                          min_std=min_std)
-
-
-@register_op("remove_lines")
-def remove_lines(img: ImageArray, page: Page, direction: str = "both",
-                 min_len_ratio: float = 0.4, thickness: int = 2,
-                 keep_text: bool = True) -> Optional[ImageArray]:
-    """Erase long ruled lines (table borders, form rules, underlines).
-
-    Ruled lines merge with glyphs during OCR line segmentation and turn
-    ``|1,234|`` into ``11,2341``.  Removing them costs nothing on prose pages
-    and buys a lot on the ruled tables that dominate hospital bills.
-    ``keep_text`` restores pixels where a line crossed a glyph, so struck-through
-    or underlined text is not punched full of holes.
-    """
-    np = _np()
-    if direction not in ("both", "horizontal", "vertical"):
-        raise ConfigError("direction must be both/horizontal/vertical")
-    gray = to_gray(img)
-    h, w = image_shape(gray)
-    mask = ink_mask(gray)
-    if not mask.any():
-        return None
-
-    removal = np.zeros_like(mask)
-    if direction in ("both", "horizontal"):
-        length = max(10, int(w * min_len_ratio))
-        opened = morph_binary(mask, 1, length, "open")
-        removal |= morph_binary(opened, max(1, int(thickness)), 3, "dilate")
-    if direction in ("both", "vertical"):
-        length = max(10, int(h * min_len_ratio))
-        opened = morph_binary(mask, length, 1, "open")
-        removal |= morph_binary(opened, 3, max(1, int(thickness)), "dilate")
-    removal &= mask
-    if not removal.any():
-        return None
-    if keep_text:
-        # A pixel that is part of a thick vertical run is glyph, not rule.
-        text_like = morph_binary(mask & ~removal, 3, 3, "dilate")
-        removal &= ~text_like
-    out = np.array(gray, copy=True)
-    background = int(np.percentile(gray[~mask], 50)) if (~mask).any() else 255
-    out[removal] = background
-    page.meta["lines_removed_px"] = int(removal.sum())
-    return out
-
-
-@register_op("remove_stamps")
-def remove_stamps(img: ImageArray, page: Page, saturation_min: int = 70,
-                  value_min: int = 40, coverage_max: float = 0.25) -> Optional[ImageArray]:
-    """Suppress coloured stamps, seals and signatures, keeping black print.
-
-    Purple "PAID" stamps and blue ink signatures land on top of the numbers
-    that matter, and OCR reads the overlap as garbage.  Detection is by
-    saturation: black toner is unsaturated by definition, so anything strongly
-    coloured is an overlay.  ``coverage_max`` aborts the removal on genuinely
-    colourful documents (a colour brochure) where the premise does not hold.
-    Requires a colour raster; on grayscale input this is a no-op.
-    """
-    np = _np()
-    if not is_color(img):
-        page.meta["remove_stamps"] = "skipped: grayscale input"
-        return None
-    cv = _cv2()
-    rgb = to_rgb(img)
-    if cv is not None:
-        hsv = cv.cvtColor(rgb, cv.COLOR_RGB2HSV)
-        sat = hsv[:, :, 1].astype(np.float64)
-        val = hsv[:, :, 2].astype(np.float64)
-    else:
-        arr = rgb.astype(np.float64)
-        mx = arr.max(axis=2)
-        mn = arr.min(axis=2)
-        val = mx
-        sat = np.where(mx > 0, (mx - mn) / np.maximum(mx, 1.0) * 255.0, 0.0)
-    coloured = (sat >= float(saturation_min)) & (val >= float(value_min))
-    coverage = float(coloured.mean())
-    if coverage > coverage_max:
-        page.meta["remove_stamps"] = "skipped: %.0f%% of page is coloured" % (coverage * 100)
-        return None
-    if coverage <= 0.0:
-        return None
-    coloured = morph_binary(coloured, 3, 3, "close")
-    gray = to_gray(rgb)
-    out = np.array(gray, copy=True)
-    ink = ink_mask(gray)
-    background = int(np.percentile(gray[~ink], 50)) if (~ink).any() else 255
-    out[coloured] = background
-    page.meta["stamp_pixels_removed"] = int(coloured.sum())
-    return out
-
-
 # -- page splitting ----------------------------------------------------------
-
-def split_multi_bill_page(page: Page, axis: str = "auto", min_gap_frac: float = 0.06,
-                          max_parts: int = 3, min_part_frac: float = 0.2) -> List[Page]:
-    """Split a page carrying several documents into one page per document.
-
-    Two bills photocopied side by side onto one A4 is routine, and every
-    downstream assumption (one header, one total) breaks on it.  Splitting is
-    by wide whitespace gutters in the ink projection profile.
-
-    Returns ``[page]`` unchanged when no confident split is found -- a false
-    split is much more damaging than a missed one, so the thresholds are
-    deliberately conservative.
-    """
-    np = _np()
-    if not page.has_raster():
-        return [page]
-    img = page.raster()
-    gray = to_gray(img)
-    h, w = image_shape(gray)
-    mask = ink_mask(gray)
-    if mask.mean() < 0.005:
-        return [page]
-
-    def gutters(profile: FloatArray, length: int, min_gap: int) -> List[int]:
-        """Midpoints of runs of near-empty rows/columns at least ``min_gap`` long.
-
-        :param profile: the ink projection profile along the splitting axis
-        :param length: the page's extent along that axis, in pixels
-        """
-        empty = profile < (profile.max() * 0.02)
-        cuts = []
-        start = None
-        for i, is_empty in enumerate(empty):
-            if is_empty and start is None:
-                start = i
-            elif not is_empty and start is not None:
-                if i - start >= min_gap and start > length * min_part_frac \
-                        and i < length * (1 - min_part_frac):
-                    cuts.append((start + i) // 2)
-                start = None
-        return cuts
-
-    col_profile = mask.sum(axis=0).astype(np.float64)
-    row_profile = mask.sum(axis=1).astype(np.float64)
-    vertical_cuts = gutters(col_profile, w, int(w * min_gap_frac))
-    horizontal_cuts = gutters(row_profile, h, int(h * min_gap_frac))
-
-    if axis == "auto":
-        use_vertical = len(vertical_cuts) >= len(horizontal_cuts) and vertical_cuts
-    elif axis == "vertical":
-        use_vertical = bool(vertical_cuts)
-    elif axis == "horizontal":
-        use_vertical = False
-    else:
-        raise ConfigError("axis must be auto/vertical/horizontal")
-
-    cuts = vertical_cuts if use_vertical else horizontal_cuts
-    if not cuts or len(cuts) + 1 > max_parts:
-        return [page]
-
-    bounds = [0] + sorted(cuts) + [w if use_vertical else h]
-    parts: List[Page] = []
-    dpi = float(page.raster_dpi)
-    for i in range(len(bounds) - 1):
-        lo, hi = bounds[i], bounds[i + 1]
-        crop = np.asarray(img)[:, lo:hi] if use_vertical else np.asarray(img)[lo:hi, :]
-        part = page.copy()
-        part.set_raster(np.ascontiguousarray(crop), dpi=page.raster_dpi)
-        part.meta = dict(page.meta)
-        part.meta["split_from"] = page.index
-        part.meta["split_part"] = i
-        dx = -lo * 72.0 / dpi if use_vertical else 0.0
-        dy = 0.0 if use_vertical else -lo * 72.0 / dpi
-        _map_span_points(part, lambda x, y, _dx=dx, _dy=dy: (x + _dx, y + _dy))
-        _sync_page_geometry(part)
-        part.record("split_multi_bill_page",
-                    {"axis": "vertical" if use_vertical else "horizontal", "part": i})
-        parts.append(part)
-    return parts
-
-
-def split_document(doc: Document, **kwargs: Any) -> Document:
-    """Apply :func:`split_multi_bill_page` across a document, renumbering pages."""
-    out = Document(source_uri=doc.source_uri, meta=dict(doc.meta),
-                   warnings=list(doc.warnings))
-    index = 0
-    for page in doc.pages:
-        for part in split_multi_bill_page(page, **kwargs):
-            out.pages.append(_reindex_page(part, index))
-            index += 1
-    out.meta["page_count"] = len(out.pages)
-    return out
-
 
 # -- policies ----------------------------------------------------------------
 
 PolicyFn = Callable[[Page], List[Op]]
 
 
-def default_policy(page: Page, thresholds: Optional[QualityThresholds] = None) -> List[Op]:
-    """Correct the distortions this page actually has, and nothing else.
+class Policies(object):
+    """Policies -- functions from a measured page to the ops it needs.
 
-    Reads only from ``page.quality``, so it is pure, testable, and cheap to
-    audit.  Every branch here corresponds to a measured degradation; there is
-    no unconditional step, because a clean 400 DPI native render needs nothing
-    done to it and every op applied to it can only remove signal.
+    A policy is the adaptive half of preprocessing: it reads
+    :class:`PageQuality` and reaches only for the ops that page warrants.
+    Note what :func:`Policies.default_policy` deliberately omits -- unconditional
+    binarisation, which reliably helps classical OCR and reliably hurts
+    vision-language models that use greyscale gradient.
     """
-    th = thresholds or DEFAULT_THRESHOLDS
-    q = page.quality
-    ops: List[Op] = []
 
-    if q.ink_coverage > th.ink_saturated:
-        ops.append(invert_if_dark())
-    if q.illumination < th.illumination_floor:
-        ops.append(normalize_illumination())
-    if q.noise > th.noise_ceiling:
-        ops.append(denoise("light"))
-    if q.effective_dpi and q.effective_dpi < th.min_dpi:
-        ops.append(ensure_dpi(th.min_dpi))
-    if abs(q.skew_deg) > th.skew_correct_deg:
-        ops.append(deskew(min_angle=th.skew_correct_deg))
-    if q.blur < th.blur_floor:
-        ops.append(unsharp(amount=1.2))
-    if q.contrast < th.contrast_floor:
-        ops.append(autocontrast())
-    return ops
+    @staticmethod
+    def default_policy(page: Page, thresholds: Optional[QualityThresholds] = None) -> List[Op]:
+        """Correct the distortions this page actually has, and nothing else.
+
+        Reads only from ``page.quality``, so it is pure, testable, and cheap to
+        audit.  Every branch here corresponds to a measured degradation; there is
+        no unconditional step, because a clean 400 DPI native render needs nothing
+        done to it and every op applied to it can only remove signal.
+
+        Reader-agnostic by design, which is why it omits binarisation -- that
+        helps classical OCR and hurts VLMs, so it belongs in
+        :func:`Policies.ocr_policy`, not here.
+
+        :param page: a page whose quality :func:`Quality.measure_page` has
+            already filled in.  On an unmeasured page every reading is zero and
+            this returns an empty list.
+        :param thresholds: the cut-offs each branch compares against; ``None``
+            uses :data:`DEFAULT_THRESHOLDS`.  Pass a
+            modified :class:`QualityThresholds` to retune the whole policy
+            without rewriting it -- e.g. ``dataclasses.replace(
+            DEFAULT_THRESHOLDS, min_dpi=400)`` to upsample more eagerly.
+        :returns: the ops this page warrants, in application order; empty for a
+            page that needs nothing
+        """
+        th = thresholds or DEFAULT_THRESHOLDS
+        q = page.quality
+        ops: List[Op] = []
+
+        if q.ink_coverage > th.ink_saturated:
+            ops.append(invert_if_dark())
+        if q.illumination < th.illumination_floor:
+            ops.append(normalize_illumination())
+        if q.noise > th.noise_ceiling:
+            ops.append(denoise("light"))
+        if q.effective_dpi and q.effective_dpi < th.min_dpi:
+            ops.append(ensure_dpi(th.min_dpi))
+        if abs(q.skew_deg) > th.skew_correct_deg:
+            ops.append(deskew(min_angle=th.skew_correct_deg))
+        if q.blur < th.blur_floor:
+            ops.append(unsharp(amount=1.2))
+        if q.contrast < th.contrast_floor:
+            ops.append(autocontrast())
+        return ops
+
+    @staticmethod
+    def ocr_policy(page: Page, thresholds: Optional[QualityThresholds] = None,
+                   binarization: str = "sauvola") -> List[Op]:
+        """Policy for classical OCR engines (Tesseract, Paddle, docTR).
+
+        Everything :func:`Policies.default_policy` does, plus the steps that only make sense
+        when a threshold-based recogniser is downstream: line removal, ruled-form
+        cleanup, and binarisation.
+
+        Line removal is conditional on the page looking tabular, but greyscale
+        conversion, binarisation, despeckling and padding are unconditional --
+        every classical engine wants them, so there is no measurement to gate on.
+
+        :param page: a page whose quality has been measured
+        :param thresholds: as :func:`Policies.default_policy`; ``None``
+            uses :data:`DEFAULT_THRESHOLDS`
+        :param binarization: method passed to :func:`Ops.binarize` -- ``"sauvola"``
+            (default), ``"otsu"``, ``"adaptive"``, ``"niblack"``, ``"wolf"``,
+            ``"nick"``, or ``"bradley"``.  Try ``"otsu"`` on evenly-lit laser
+            print, where it is faster and marginally cleaner; stay on
+            ``"sauvola"`` for anything photographed or faded.
+        :returns: the ops for this page, ending with the binarise-despeckle-pad
+            sequence that classical OCR expects
+        """
+        ops = default_policy(page, thresholds)
+        ops.append(to_grayscale())
+        if page.layout.is_tabular or page.meta.get("ruled"):
+            ops.append(remove_lines())
+        ops.append(binarize(method=binarization))
+        ops.append(despeckle())
+        ops.append(pad(margin_px=16))
+        return ops
+
+    @staticmethod
+    def vlm_policy(page: Page, thresholds: Optional[QualityThresholds] = None,
+                   max_side: int = 2000) -> List[Op]:
+        """Policy for vision-language models.
+
+        Gentler on purpose.  No binarisation (it destroys the greyscale gradient
+        the model reads faint strokes from), no aggressive denoising (it removes
+        diacritics and thin Devanagari strokes), and a hard pixel cap because cost
+        scales with image size while accuracy stops improving well before the
+        provider's limit.
+
+        Its skew tolerance is also twice :func:`Policies.default_policy`'s, since
+        vision models read moderately tilted text without help and the resampling
+        would cost more sharpness than the tilt costs accuracy.
+
+        :param page: a page whose quality has been measured
+        :param thresholds: as :func:`Policies.default_policy`; ``None``
+            uses :data:`DEFAULT_THRESHOLDS`.  Note the skew branch here
+            compares against *twice* ``skew_correct_deg``.
+        :param max_side: pixel cap for the longer side, handed
+            to :func:`Ops.resize_max_side`.  ``2000`` is comfortably above every
+            major provider's internal downscale; ``1500`` cuts cost with no
+            measurable accuracy loss on ordinary print.
+        :returns: a short op list -- often empty for a clean page, which is the
+            intended behaviour
+        """
+        th = thresholds or DEFAULT_THRESHOLDS
+        q = page.quality
+        ops: List[Op] = []
+        if q.ink_coverage > th.ink_saturated:
+            ops.append(invert_if_dark())
+        if q.illumination < th.illumination_floor:
+            ops.append(normalize_illumination(strength=0.7))
+        if abs(q.skew_deg) > th.skew_correct_deg * 2:
+            ops.append(deskew(min_angle=th.skew_correct_deg * 2))
+        if q.blur < th.blur_floor:
+            ops.append(unsharp(amount=0.8))
+        if q.contrast < th.contrast_floor:
+            ops.append(autocontrast())
+        ops.append(resize_max_side(max_side))
+        return ops
+
+    @staticmethod
+    def no_policy(page: Page) -> List[Op]:
+        """Apply nothing.  Useful as an eval baseline.
+
+        Distinct from ``policy=None`` in intent only -- both skip preprocessing.
+        Use this one when you want a *named* policy in the eval report, so the
+        baseline row reads ``no_policy`` rather than ``None``.
+
+        :param page: ignored; the signature exists to satisfy ``PolicyFn``
+        :returns: always an empty list
+        """
+        return []
+
+    @staticmethod
+    def fixed_policy(*ops: Op) -> PolicyFn:
+        """Turn a fixed op list into a policy, for A/B against adaptive ones.
+
+        The honest way to test the library's central claim.  Pit a fixed sequence
+        against :func:`Policies.default_policy` in an :class:`EvalSuite` and see
+        whether adapting to measured quality actually wins on your documents::
+
+            fixed = fixed_policy(deskew(), binarize(), despeckle())
+
+        :param ops: the ops to apply to every page, in order.  A fresh copy of
+            the list is returned per page, so callers cannot mutate it.
+        :returns: a ``PolicyFn`` ignoring page quality entirely
+        """
+        def policy(page: Page) -> List[Op]:
+            """Return the same op list for every page."""
+            return list(ops)
+        return policy
 
 
-def ocr_policy(page: Page, thresholds: Optional[QualityThresholds] = None,
-               binarization: str = "sauvola") -> List[Op]:
-    """Policy for classical OCR engines (Tesseract, Paddle, docTR).
-
-    Everything :func:`default_policy` does, plus the steps that only make sense
-    when a threshold-based recogniser is downstream: line removal, ruled-form
-    cleanup, and binarisation.
-    """
-    ops = default_policy(page, thresholds)
-    ops.append(to_grayscale())
-    if page.layout.is_tabular or page.meta.get("ruled"):
-        ops.append(remove_lines())
-    ops.append(binarize(method=binarization))
-    ops.append(despeckle())
-    ops.append(pad(margin_px=16))
-    return ops
-
-
-def vlm_policy(page: Page, thresholds: Optional[QualityThresholds] = None,
-               max_side: int = 2000) -> List[Op]:
-    """Policy for vision-language models.
-
-    Gentler on purpose.  No binarisation (it destroys the greyscale gradient
-    the model reads faint strokes from), no aggressive denoising (it removes
-    diacritics and thin Devanagari strokes), and a hard pixel cap because cost
-    scales with image size while accuracy stops improving well before the
-    provider's limit.
-    """
-    th = thresholds or DEFAULT_THRESHOLDS
-    q = page.quality
-    ops: List[Op] = []
-    if q.ink_coverage > th.ink_saturated:
-        ops.append(invert_if_dark())
-    if q.illumination < th.illumination_floor:
-        ops.append(normalize_illumination(strength=0.7))
-    if abs(q.skew_deg) > th.skew_correct_deg * 2:
-        ops.append(deskew(min_angle=th.skew_correct_deg * 2))
-    if q.blur < th.blur_floor:
-        ops.append(unsharp(amount=0.8))
-    if q.contrast < th.contrast_floor:
-        ops.append(autocontrast())
-    ops.append(resize_max_side(max_side))
-    return ops
-
-
-def no_policy(page: Page) -> List[Op]:
-    """Apply nothing.  Useful as an eval baseline."""
-    return []
-
-
-def fixed_policy(*ops: Op) -> PolicyFn:
-    """Turn a fixed op list into a policy, for A/B against adaptive ones."""
-    def policy(page: Page) -> List[Op]:
-        """Return the same op list for every page."""
-        return list(ops)
-    return policy
+# Module-level aliases.  These are load-bearing, not merely back-compatible:
+# the staticmethods above call one another through these flat names, resolved
+# from module globals at call time.  Deleting them breaks Policies from the inside.
+# ``Policies.x`` is the documented path; ``x`` is the one that already works.
+default_policy = Policies.default_policy
+ocr_policy     = Policies.ocr_policy
+vlm_policy     = Policies.vlm_policy
+no_policy      = Policies.no_policy
+fixed_policy   = Policies.fixed_policy
 
 
 def preprocess(doc: Document, policy: Optional[PolicyFn] = default_policy,
@@ -4366,13 +5141,42 @@ def preprocess(doc: Document, policy: Optional[PolicyFn] = default_policy,
                in_place: bool = False) -> Document:
     """Measure and correct every page in a document.
 
-    :param policy: called per page to choose ops (ignored when ``ops`` is given)
-    :param ops: a fixed op list applied to every page
-    :param measure: measure quality first -- required for an adaptive policy
-    :param in_place: mutate ``doc`` instead of returning a processed copy
+    Layer 2 in one call: measure each page, ask the policy what that page needs,
+    apply it, then re-measure so downstream routing and the confidence prior see
+    the page as it will actually be read.
 
-    Returns a Document.  Pages that carry no raster (an email body, a
-    native-text page that never rendered) pass through untouched.
+    :param doc: an ingested document.  Rasters are pulled lazily per page, so a
+        300-page bundle is not materialised all at once.
+    :param policy: called per page to choose ops.  Defaults
+        to :func:`default_policy`; also :func:`Policies.ocr_policy`, or
+        else :func:`Policies.vlm_policy`, or any ``Callable[[Page], List[Op]]``.
+        Ignored when ``ops`` is given, and ``None`` means apply nothing.
+    :param ops: a fixed op list applied to every page, bypassing the policy
+        entirely.  For debugging and ablations -- ``ops=[deskew(), binarize()]``
+        -- not for production, where a fixed sequence destroys signal on the
+        pages that did not need it.
+    :param dpi: override the DPI assumed when measuring, for images whose
+        metadata lies or is missing.  ``None`` trusts ``page.raster_dpi``.
+    :param max_workers: threads for per-page work.  ``0`` runs serially, which is
+        what you want while debugging, since op errors then surface in order.
+        The ops are IO- and NumPy-bound, so threads do help despite the GIL.
+    :param measure: measure quality before choosing ops.  Required for any
+        adaptive policy -- with ``False`` every reading stays zero, and
+        so :func:`default_policy` sees a perfect page and picks nothing.  Set
+        it ``False`` only alongside an explicit ``ops`` list.
+    :param thresholds: cut-offs for measurement and policy; ``None``
+        uses :data:`DEFAULT_THRESHOLDS`.
+    :param in_place: mutate ``doc`` rather than working on a copy.  The copy is
+        the safe default; ``True`` saves memory on large bundles, at the cost of
+        being unable to compare against the original.
+    :returns: the processed :class:`Document`.  Pages carrying no raster -- an
+        email body, a native-text page that never rendered -- pass through
+        untouched, and every op applied is recorded in ``page.history``.
+
+    Measure the no-preprocessing baseline, then the adaptive one::
+
+        base = preprocess(doc, policy=None)
+        tuned = preprocess(doc, policy=Policies.ocr_policy, max_workers=4)
     """
     target = doc if in_place else doc.copy()
 
@@ -4437,18 +5241,53 @@ class ReadResult(object):
 class TextBackend(Protocol):  # pragma: no cover - structural type only
     """Structural type for anything that can read text off a page."""
 
-    name = ""
+    name: str
 
     def supports(self, page: Page) -> bool:
-        """Whether this backend can read ``page`` at all."""
+        """Whether this backend can read ``page`` at all.
+
+        Asked per page, so the answer may legitimately differ across a document:
+        a text-layer backend supports the digital pages of a mixed PDF and not
+        the scanned ones.
+
+        :param page: the page in question
+        :returns: ``False`` when this backend needs a raster the page lacks, when
+            its dependencies are missing, or when the page is otherwise outside
+            what it handles
+        """
+        ...
+
+    def is_available(self) -> bool:
+        """Whether this backend's dependencies are importable right now.
+
+        Part of the protocol, not just of :class:`BaseBackend`: the routers call
+        it to skip a backend whose engine is not installed, so a custom backend
+        that omits it breaks routing rather than merely failing to read.
+        """
         ...
 
     def estimate_cost(self, page: Page) -> Cost:
-        """Predicted cost of reading ``page``, before doing it."""
+        """Predicted cost of reading ``page``, before doing it.
+
+        Consulted by :class:`BudgetRouter` to decide whether a page can afford
+        this backend, so it must not read the page or call the provider.
+
+        :param page: the page that would be read
+        :returns: a :class:`Cost`; ``Cost.zero()`` for local engines.  Money is
+            ``0.00`` until :func:`Pricing.set_pricing` is called, though token
+            counts are always real.
+        """
         ...
 
     def read(self, page: Page) -> ReadResult:
-        """Read ``page`` and return its spans, cost and timing."""
+        """Read ``page`` and return its spans, cost and timing.
+
+        :param page: the page to read; implementations must not mutate it
+        :returns: a :class:`ReadResult` whose spans carry text, geometry and
+            per-span confidence.  A page the backend could not read yields an
+            empty span list and a warning, not an exception -- one bad page must
+            not cost the document.
+        """
         ...
 
 
@@ -4475,7 +5314,13 @@ class BaseBackend(object):
 
     # -- protocol ---------------------------------------------------------
     def supports(self, page: Page) -> bool:
-        """Whether this backend can read ``page`` at all."""
+        """Whether this backend can read ``page`` at all.
+
+        :param page: the page in question
+        :returns: ``True`` unless the page lacks a raster this backend needs,
+            or :meth:`is_available` is ``False``.  Override to add
+            engine-specific limits, such as a script or a page-size ceiling.
+        """
         if self.needs_raster and not page.has_raster():
             return False
         return self.is_available()
@@ -4485,11 +5330,26 @@ class BaseBackend(object):
         return True
 
     def estimate_cost(self, page: Page) -> Cost:
-        """Predicted cost of reading ``page``.  Free by default (local engines)."""
+        """Predicted cost of reading ``page``.  Free by default (local engines).
+
+        :param page: the page that would be read
+        :returns: ``Cost.zero()``.  Vision backends override this; see the
+            per-token estimate in :meth:`VisionBackend.estimate_cost`.
+        """
         return Cost.zero()
 
     def read(self, page: Page) -> ReadResult:
-        """Read ``page``, timing the call and tagging spans with this backend."""
+        """Read ``page``, timing the call and tagging spans with this backend.
+
+        Do not override this; implement :meth:`_read` instead.  This wrapper is
+        what fills in latency, stamps ``span.source`` with the backend name, and
+        detects the script of each span -- three things every backend would
+        otherwise have to remember.
+
+        :param page: the page to read
+        :returns: the :class:`ReadResult` from :meth:`_read`, with ``latency_ms``,
+            ``backend``, and each span's ``source`` and ``script`` filled in
+        """
         with Timer() as t:
             result = self._read(page)
         result.latency_ms = t.ms
@@ -4542,8 +5402,21 @@ class BackendRegistry(object):
                  replace: bool = False) -> None:
         """Register a backend under ``name``.
 
-        ``factory`` may be a backend instance or a zero-argument callable
-        returning one.
+        Prefer a callable: instantiating PaddleOCR or Surya loads hundreds of
+        megabytes of weights, and a document that never routes there must not
+        pay for it.  Passing an instance is supported for cheap backends and
+        test doubles, and constructs eagerly by definition::
+
+            registry.register("myocr", lambda: MyOCRBackend(lang="hi"))
+
+        :param name: the routing key, as used by ``backend="myocr"`` and by
+            any :class:`RuleRouter` rule
+        :param factory: a zero-argument callable returning a backend, or a
+            backend instance (wrapped in a callable for you)
+        :param replace: allow overwriting an existing registration.  Off by
+            default so a name collision is an error rather than a backend that
+            silently stops being used; any cached instance is dropped.
+        :raises ConfigError: ``name`` is taken and ``replace`` is ``False``
         """
         if name in self._factories and not replace:
             raise ConfigError("backend %r is already registered (pass replace=True)" % name)
@@ -4552,7 +5425,16 @@ class BackendRegistry(object):
             self._instances.pop(name, None)
 
     def get(self, name: str) -> Any:
-        """Instantiate (once) and return the backend registered as ``name``."""
+        """Instantiate (once) and return the backend registered as ``name``.
+
+        The instance is cached under the lock, so the weights load once even if
+        several pages race for the same backend.
+
+        :param name: a registered name, e.g. ``"tesseract"`` or ``"anthropic"``
+        :returns: the shared backend instance
+        :raises ConfigError: nothing is registered under ``name``; the message
+            lists what is
+        """
         if name in self._instances:
             return self._instances[name]
         with self._lock:
@@ -4567,11 +5449,23 @@ class BackendRegistry(object):
             return instance
 
     def __contains__(self, name: str) -> bool:
-        """``"tesseract" in registry`` -- true if registered, available or not."""
+        """``"tesseract" in registry`` -- true if registered, available or not.
+
+        Registered is not the same as usable: use :meth:`available` to ask
+        whether the engine's dependencies are actually importable.
+
+        :param name: the name to look for
+        :returns: whether a factory exists under that name
+        """
         return name in self._factories
 
     def __getitem__(self, name: str) -> Any:
-        """``registry["tesseract"]`` -- alias for :meth:`get`."""
+        """``registry["tesseract"]`` -- alias for :meth:`get`.
+
+        :param name: a registered name
+        :returns: the shared backend instance
+        :raises ConfigError: nothing is registered under ``name``
+        """
         return self.get(name)
 
     def names(self) -> List[str]:
@@ -5058,16 +5952,16 @@ class SuryaBackend(BaseBackend):
             return self._predictors
 
     @staticmethod
-    def _build_with_manager(cls: Any) -> Any:
+    def _build_with_manager(predictor_cls: Any) -> Any:
         """Construct a predictor via the older ``SuryaInferenceManager`` API."""
         inference = require("surya.inference", "Surya backend")
-        return cls(inference.SuryaInferenceManager())
+        return predictor_cls(inference.SuryaInferenceManager())
 
     @staticmethod
-    def _build_with_foundation(cls: Any) -> Any:
+    def _build_with_foundation(predictor_cls: Any) -> Any:
         """Construct a predictor via the newer ``FoundationPredictor`` API."""
         foundation = require("surya.foundation", "Surya backend")
-        return cls(foundation.FoundationPredictor())
+        return predictor_cls(foundation.FoundationPredictor())
 
     def _read(self, page: Page) -> ReadResult:
         """Run Surya and convert its text lines into spans."""
@@ -5110,44 +6004,63 @@ PRICING: Dict[str, Tuple[float, float]] = {}
 _UNPRICED_WARNED: Set[str] = set()
 
 
-def set_pricing(model: str, input_per_mtok: float, output_per_mtok: float) -> None:
-    """Register token prices (USD per million tokens) for ``model``.
+class Pricing(object):
+    """Token accounting and the optional price table.
 
-    Until a model is priced, :class:`Cost` reports token counts with a zero
-    amount and warns once, so a missing price is visible rather than silently
-    reported as free.
+    Token counts are always tracked.  Money reads ``0.00`` and warns until
+    a consumer calls :func:`Pricing.set_pricing`, because :data:`PRICING`
+    ships empty on purpose: a stale hard-coded rate silently produces
+    confidently wrong numbers, which is worse than an obvious zero.
     """
-    PRICING[model] = (float(input_per_mtok), float(output_per_mtok))
-    _UNPRICED_WARNED.discard(model)
 
+    @staticmethod
+    def set_pricing(model: str, input_per_mtok: float, output_per_mtok: float) -> None:
+        """Register token prices (USD per million tokens) for ``model``.
 
-def price_tokens(model: str, input_tokens: int, output_tokens: int) -> Cost:
-    """Convert token counts to a :class:`Cost` using the registered pricing."""
-    prices = PRICING.get(model)
-    if prices is None:
-        if model not in _UNPRICED_WARNED:
-            _UNPRICED_WARNED.add(model)
-            logger.warning(
-                "no pricing registered for model %r: token counts will be tracked "
-                "but cost will read 0.00.  Call docpipe.set_pricing(%r, in, out).",
-                model, model)
-        return Cost(amount=0.0, input_tokens=input_tokens,
+        Until a model is priced, :class:`Cost` reports token counts with a zero
+        amount and warns once, so a missing price is visible rather than silently
+        reported as free.
+        """
+        PRICING[model] = (float(input_per_mtok), float(output_per_mtok))
+        _UNPRICED_WARNED.discard(model)
+
+    @staticmethod
+    def price_tokens(model: str, input_tokens: int, output_tokens: int) -> Cost:
+        """Convert token counts to a :class:`Cost` using the registered pricing."""
+        prices = PRICING.get(model)
+        if prices is None:
+            if model not in _UNPRICED_WARNED:
+                _UNPRICED_WARNED.add(model)
+                logger.warning(
+                    "no pricing registered for model %r: token counts will be tracked "
+                    "but cost will read 0.00.  Call docpipe.set_pricing(%r, in, out).",
+                    model, model)
+            return Cost(amount=0.0, input_tokens=input_tokens,
+                        output_tokens=output_tokens, calls=1)
+        amount = (input_tokens * prices[0] + output_tokens * prices[1]) / 1e6
+        return Cost(amount=amount, input_tokens=input_tokens,
                     output_tokens=output_tokens, calls=1)
-    amount = (input_tokens * prices[0] + output_tokens * prices[1]) / 1e6
-    return Cost(amount=amount, input_tokens=input_tokens,
-                output_tokens=output_tokens, calls=1)
+
+    @staticmethod
+    def estimate_image_tokens(img: ImageArray, divisor: float = 750.0) -> int:
+        """Approximate the token cost of an image for a vision model.
+
+        Providers bill images roughly by area; ``width * height / 750`` is the
+        documented approximation for Claude and is close enough for OpenAI's
+        high-detail mode to be useful for *budgeting*.  It is an estimate, and the
+        reconciled figure from the response's usage block always wins.
+        """
+        h, w = image_shape(img)
+        return int(math.ceil(w * h / float(divisor)))
 
 
-def estimate_image_tokens(img: ImageArray, divisor: float = 750.0) -> int:
-    """Approximate the token cost of an image for a vision model.
-
-    Providers bill images roughly by area; ``width * height / 750`` is the
-    documented approximation for Claude and is close enough for OpenAI's
-    high-detail mode to be useful for *budgeting*.  It is an estimate, and the
-    reconciled figure from the response's usage block always wins.
-    """
-    h, w = image_shape(img)
-    return int(math.ceil(w * h / float(divisor)))
+# Module-level aliases.  These are load-bearing, not merely back-compatible:
+# the staticmethods above call one another through these flat names, resolved
+# from module globals at call time.  Deleting them breaks Pricing from the inside.
+# ``Pricing.x`` is the documented path; ``x`` is the one that already works.
+set_pricing           = Pricing.set_pricing
+price_tokens          = Pricing.price_tokens
+estimate_image_tokens = Pricing.estimate_image_tokens
 
 
 #: The instruction given to vision models when transcribing a page.  Written to
@@ -5371,6 +6284,158 @@ class OpenAIVisionBackend(VisionBackend):
         return text, cost
 
 
+class GeminiVisionBackend(VisionBackend):
+    """Read a page with a Google Gemini vision model.
+
+    Uses the unified ``google-genai`` SDK (``from google import genai``), which
+    reaches both the Gemini Developer API and Vertex AI.  The legacy
+    ``google-generativeai`` package is a different, incompatible API and is not
+    supported; for Vertex, build the client yourself and pass it as ``client``,
+    since Vertex authenticates by project and location rather than by API key.
+
+    Gemini bills images by tile rather than by area, which is why
+    :meth:`estimate_cost` is overridden -- see there.
+    """
+
+    name = "vlm:gemini"
+    #: Gemini crops a large image into tiles of this size, billing each one.
+    tile_px = 768
+    #: Tokens per tile, and the flat cost of an image small enough not to be tiled.
+    tokens_per_tile = 258
+    #: An image with both sides under this is sent whole, at one tile's price.
+    untiled_max_px = 384
+
+    def __init__(self, model: str = "gemini-2.5-flash", api_key: Optional[str] = None,
+                 client: Any = None, thinking_budget: Optional[int] = 0,
+                 **options: Any) -> None:
+        """Configure the Gemini vision call.
+
+        :param api_key: falls back to ``GOOGLE_API_KEY``, then ``GEMINI_API_KEY``
+        :param client: a pre-built ``genai.Client``, e.g. one pointed at Vertex AI
+        :param thinking_budget: reasoning tokens allowed before the answer.
+            Defaults to 0, which disables thinking: transcription is recall, not
+            reasoning, and thinking tokens bill at the output rate for output the
+            page never needed.  Pass ``None`` to omit the setting altogether,
+            which is required for models that do not support thinking at all.
+        :param options: merged into the generation config, so ``safety_settings``
+            or ``top_p`` need no subclass
+        """
+        VisionBackend.__init__(self, model=model, **options)
+        self._api_key = api_key
+        self._client = client
+        self.thinking_budget = thinking_budget
+
+    def is_available(self) -> bool:
+        """True with an injected client, or with the SDK plus an API key.
+
+        Probes ``google.genai`` rather than ``google``: the latter is a namespace
+        package that a dozen unrelated Google libraries populate, so its
+        importability would say nothing about whether this SDK is installed.
+        """
+        if self._client is not None:
+            return True
+        return have("google.genai") and bool(
+            self._api_key or os.environ.get("GOOGLE_API_KEY")
+            or os.environ.get("GEMINI_API_KEY"))
+
+    def _get_client(self) -> Any:
+        """Construct the SDK client once, under the lock."""
+        if self._client is None:
+            with self._lock:
+                if self._client is None:
+                    module = require("google.genai", "Gemini vision backend")
+                    self._client = module.Client(api_key=self._api_key) \
+                        if self._api_key else module.Client()
+        return self._client
+
+    def estimate_cost(self, page: Page) -> Cost:
+        """Price the call before making it, using Gemini's tiling rule.
+
+        The base class's area/750 approximation is Claude's rule and is wrong
+        here by enough to matter to :class:`BudgetRouter`: Gemini charges a flat
+        :attr:`tokens_per_tile` for a small image and the same again for every
+        :attr:`tile_px` tile of a large one, so cost is a step function of size,
+        not a line.  Still an estimate -- the response's usage block always wins.
+        """
+        if not page.has_raster():
+            return Cost.zero()
+        h, w = image_shape(self._image_for(page))
+        if max(h, w) <= self.untiled_max_px:
+            tiles = 1
+        else:
+            tiles = (int(math.ceil(w / float(self.tile_px)))
+                     * int(math.ceil(h / float(self.tile_px))))
+        tokens = self.tokens_per_tile * max(1, tiles) + len(self.prompt) // 4
+        output = max(256, page.char_count // 3 or 800)
+        return price_tokens(self.model, tokens, output)
+
+    def _config(self) -> Dict[str, Any]:
+        """The generation config for one transcription call.
+
+        ``self.options`` is applied last, so a consumer can override anything
+        here -- including the thinking budget -- without subclassing.
+        """
+        config: Dict[str, Any] = {"temperature": self.temperature,
+                                  "max_output_tokens": self.max_tokens}
+        if self.thinking_budget is not None:
+            config["thinking_config"] = {"thinking_budget": self.thinking_budget}
+        config.update(self.options)
+        return config
+
+    @staticmethod
+    def _text_of(response: Any) -> str:
+        """The transcription, or :class:`BackendError` explaining its absence.
+
+        Gemini reports a refused or truncated generation as an empty candidate
+        with a reason attached, not as an exception, so ``response.text`` is
+        simply ``None``.  Reading that as "this page had no text" would put a
+        silently blank page into the document, which is the one outcome nobody
+        catches in review.  Raising instead is safe at document scale:
+        :func:`read` records the failure against the page and keeps going, so
+        one refusal costs one page rather than the whole bundle.
+
+        An empty response with *no* reason given is passed through as empty --
+        a genuinely blank page is a legitimate answer, and inventing a failure
+        for it would be as wrong in the other direction.
+        """
+        text = getattr(response, "text", None)
+        candidates = list(getattr(response, "candidates", None) or [])
+        finish = getattr(candidates[0], "finish_reason", None) if candidates else None
+        if text:
+            if finish is not None and "MAX_TOKENS" in str(finish):
+                logger.warning("Gemini hit max_output_tokens; the transcription is "
+                               "truncated.  Raise max_tokens or split the page.")
+            return text
+        feedback = getattr(response, "prompt_feedback", None)
+        reason = getattr(feedback, "block_reason", None)
+        if reason is None and finish is not None and "STOP" not in str(finish):
+            reason = finish
+        if reason is not None:
+            raise BackendError("Gemini returned no transcription (%s)" % (reason,))
+        return ""
+
+    def _call_model(self, image_bytes: bytes, media_type: str,
+                    prompt: str) -> Tuple[str, Cost]:
+        """One ``generate_content`` call; returns the text and its billed cost."""
+        client = self._get_client()
+        response = client.models.generate_content(
+            model=self.model,
+            contents=[{"role": "user", "parts": [
+                {"inline_data": {"mime_type": media_type, "data": image_bytes}},
+                {"text": prompt},
+            ]}],
+            config=self._config())
+        usage = getattr(response, "usage_metadata", None)
+        # Thinking tokens bill at the output rate but are counted separately from
+        # the candidate, so charging candidates_token_count alone understates it.
+        output = (int(getattr(usage, "candidates_token_count", 0) or 0)
+                  + int(getattr(usage, "thoughts_token_count", 0) or 0))
+        cost = price_tokens(self.model,
+                            int(getattr(usage, "prompt_token_count", 0) or 0),
+                            output)
+        return self._text_of(response), cost
+
+
 # -- backend wrappers --------------------------------------------------------
 
 class CachingBackend(BaseBackend):
@@ -5512,7 +6577,7 @@ class EnsembleBackend(BaseBackend):
     which is the argument for it living here.
 
     The primary backend's spans are returned (they carry the better geometry);
-    the secondary's are attached to the result for :func:`cross_read_agreement`.
+    the secondary's are attached to the result for :func:`Confidence.cross_read_agreement`.
     """
 
     def __init__(self, primary: TextBackend, secondary: TextBackend,
@@ -5589,7 +6654,7 @@ def default_router(page: Page) -> Optional[str]:
 
     available = set(registry.available())
     local_order = ["paddle", "rapidocr", "doctr", "tesseract", "easyocr"]
-    vision_order = ["vlm:claude", "vlm:openai"]
+    vision_order = ["vlm:claude", "vlm:openai", "vlm:gemini"]
     surya_ok = "surya" in available
 
     needs_vision = (page.quality.verdict is Verdict.UNREADABLE
@@ -5719,6 +6784,7 @@ def _register_default_backends() -> None:
     registry.register("surya", SuryaBackend, replace=True)
     registry.register("vlm:claude", AnthropicVisionBackend, replace=True)
     registry.register("vlm:openai", OpenAIVisionBackend, replace=True)
+    registry.register("vlm:gemini", GeminiVisionBackend, replace=True)
 
 
 _register_default_backends()
@@ -5728,19 +6794,24 @@ def read_page(page: Page, backend: Optional[Union[str, TextBackend]] = None,
               router: Optional[RouterFn] = default_router,
               replace_spans: bool = True) -> ReadResult:
     """Read one page with an explicit backend, or one chosen by ``router``."""
+    # Resolved into its own name rather than reassigning the parameter: the
+    # parameter admits a name or an instance, the local is always an instance.
+    chosen: TextBackend
     if backend is None:
         name = router(page) if router else None
         if name is None:
             return ReadResult(backend="none",
                               warnings=["no backend selected for page %d" % page.index])
-        backend = registry.get(name) if isinstance(name, str) else name
+        chosen = registry.get(name) if isinstance(name, str) else name
     elif isinstance(backend, str):
-        backend = registry.get(backend)
+        chosen = registry.get(backend)
+    else:
+        chosen = backend
 
-    if not backend.supports(page):
-        return ReadResult(backend=backend.name,
-                          warnings=["%s cannot read page %d" % (backend.name, page.index)])
-    result = backend.read(page)
+    if not chosen.supports(page):
+        return ReadResult(backend=chosen.name,
+                          warnings=["%s cannot read page %d" % (chosen.name, page.index)])
+    result = chosen.read(page)
     if replace_spans:
         page.spans = result.spans
     page.record("read", {"backend": result.backend, "spans": len(result.spans)},
@@ -5835,28 +6906,282 @@ _SCRIPT_RANGES = [
 ]
 
 
-def detect_script(text: str, minimum: int = 1) -> Optional[str]:
-    """Dominant ISO 15924 script code of ``text``, or ``None``.
+class Text(object):
+    """Script detection, text normalisation and value parsing.
 
-    Per-span rather than per-document, because a hospital letterhead in
-    Devanagari over a table of Latin numerals is one page with two scripts, and
-    routing a recogniser at the page level would get one of them wrong.
+    These run *after* reading and before extraction, on the theory that an
+    OCR engine's mistakes are systematic: full-width digits, Devanagari
+    numerals, ``O`` for ``0`` in a numeric field.  Parsing is locale-aware
+    by necessity -- ``1,23,456.78`` and ``1.234,56`` are both real.
     """
-    if not text:
+
+    @staticmethod
+    def detect_script(text: str, minimum: int = 1) -> Optional[str]:
+        """Dominant ISO 15924 script code of ``text``, or ``None``.
+
+        Per-span rather than per-document, because a hospital letterhead in
+        Devanagari over a table of Latin numerals is one page with two scripts, and
+        routing a recogniser at the page level would get one of them wrong.
+        """
+        if not text:
+            return None
+        counts: Dict[str, int] = {}
+        for ch in text:
+            code = ord(ch)
+            if code < 0x0041 or ch.isspace() or ch.isdigit():
+                continue
+            for name, lo, hi in _SCRIPT_RANGES:
+                if lo <= code <= hi:
+                    counts[name] = counts.get(name, 0) + 1
+                    break
+        if not counts:
+            return None
+        best = max(counts.items(), key=lambda kv: kv[1])
+        return best[0] if best[1] >= minimum else None
+
+    @staticmethod
+    def normalize_digits(text: str) -> str:
+        """Convert every Unicode decimal digit to ASCII ``0-9``.
+
+        A Devanagari ``४८२५०`` and an ASCII ``48250`` are the same amount, and every
+        validator downstream should only ever have to handle one of them.
+        """
+        return text.translate(_DIGIT_MAP) if text else text
+
+    @staticmethod
+    def normalize_unicode(text: str,
+                          form: Literal["NFC", "NFD", "NFKC", "NFKD"] = "NFKC") -> str:
+        """Normalise Unicode form, collapsing ligatures and compatibility variants.
+
+        The four forms are spelled out in the annotation because they are the
+        only values :mod:`unicodedata` accepts; anything else is a ``ValueError``
+        from the standard library rather than a docpipe error.
+        """
+        return unicodedata.normalize(form, text) if text else text
+
+    @staticmethod
+    def normalize_whitespace(text: str, collapse_newlines: bool = False) -> str:
+        """Collapse runs of whitespace, preserving line structure by default."""
+        if not text:
+            return text
+        out = _WHITESPACE_RE.sub(" ", text)
+        if collapse_newlines:
+            out = re.sub(r"\s*\n\s*", " ", out)
+        else:
+            out = re.sub(r"[ \t]*\n[ \t]*", "\n", out)
+            out = re.sub(r"\n{3,}", "\n\n", out)
+        return out.strip()
+
+    @staticmethod
+    def normalize_text(text: str) -> str:
+        """The standard cleanup: Unicode form, ASCII digits, tidy whitespace."""
+        return normalize_whitespace(normalize_digits(normalize_unicode(text or "")))
+
+    @staticmethod
+    def fix_ocr_confusions(text: str, expect: str = "numeric") -> str:
+        """Repair classic OCR character confusions for a *known-type* field.
+
+        Never apply this to free text.  ``expect="numeric"`` on a field declared as
+        an amount is safe and recovers a lot of otherwise-lost values; the same
+        substitution on a patient's name turns "Sonia" into "50nia".
+        """
+        if not text:
+            return text
+        table = _NUMERIC_CONFUSIONS if expect == "numeric" else _ALPHA_CONFUSIONS
+        if expect not in ("numeric", "alpha"):
+            raise ConfigError("expect must be 'numeric' or 'alpha'")
+        return "".join(table.get(ch, ch) for ch in text)
+
+    @staticmethod
+    def parse_amount(text: Optional[str], decimal_separator: str = "auto",
+                     allow_negative: bool = True) -> Optional[decimal.Decimal]:
+        """Parse a monetary amount, handling Indian and Western digit grouping.
+
+        Indian grouping (``1,23,456.78`` -- two digits per group above the
+        hundreds) breaks any parser that assumes groups of three, and it is the
+        default on every document this library was written for.  Grouping is
+        therefore *inferred* rather than assumed:
+
+        * ``1,234.56`` -> 1234.56    (comma groups, dot decimal)
+        * ``1,23,456.78`` -> 123456.78  (Indian grouping)
+        * ``1.234,56`` -> 1234.56    (European convention, detected by position)
+        * ``(1,234)`` -> -1234       (accounting negative)
+        * ``1,234 CR`` / ``1,234 DR`` -> credit/debit sign
+
+        Returns a :class:`decimal.Decimal` -- never a float, because money and
+        binary floating point should not meet.  Returns ``None`` when no number is
+        present.
+        """
+        if text is None:
+            return None
+        # Strip typographic group separators *before* NFKC, which would otherwise
+        # fold them into ordinary spaces and make them indistinguishable from the
+        # space between two unrelated numbers in a table row.
+        raw = re.sub("[%s]" % _GROUP_SPACES, "", str(text))
+        raw = normalize_digits(normalize_unicode(raw)).strip()
+        if not raw:
+            return None
+
+        negative = False
+        if allow_negative and raw.startswith("(") and raw.endswith(")"):
+            negative = True
+            raw = raw[1:-1]
+        upper = raw.upper()
+        if re.search(r"\bCR\b", upper):
+            negative = False
+        elif re.search(r"\bDR\b", upper):
+            negative = True
+
+        match = _AMOUNT_RE.search(raw)
+        if not match:
+            return None
+        body = match.group(0)
+        if body.startswith("-"):
+            negative = True
+        body = body.lstrip("+-")
+        body = re.sub(r"['%s]" % _GROUP_SPACES, "", body)
+
+        if decimal_separator == "comma":
+            body = body.replace(".", "").replace(",", ".")
+        elif decimal_separator == "dot":
+            body = body.replace(",", "")
+        else:
+            has_dot = "." in body
+            has_comma = "," in body
+            if has_dot and has_comma:
+                # Whichever separator comes last is the decimal one.
+                body = (body.replace(",", "") if body.rfind(".") > body.rfind(",")
+                        else body.replace(".", "").replace(",", "."))
+            elif has_comma:
+                tail = body.split(",")[-1]
+                # A trailing group of exactly 2 digits with a single comma is
+                # ambiguous ("1,50" is 1.50 in Europe, 150 in India); grouping wins,
+                # because these documents group and do not use comma decimals.
+                body = body.replace(",", "") if len(tail) in (2, 3) else body.replace(",", ".")
+            # A lone dot is already the decimal separator.
+
+        try:
+            value = decimal.Decimal(body)
+        except (decimal.InvalidOperation, ValueError):
+            return None
+        return -value if negative else value
+
+    @staticmethod
+    def detect_currency(text: str) -> Optional[str]:
+        """ISO currency code implied by ``text``, or ``None``."""
+        if not text:
+            return None
+        lowered = normalize_unicode(text).lower()
+        for token, code in _CURRENCY_SYMBOLS.items():
+            if token in lowered:
+                return code
         return None
-    counts: Dict[str, int] = {}
-    for ch in text:
-        code = ord(ch)
-        if code < 0x0041 or ch.isspace() or ch.isdigit():
-            continue
-        for name, lo, hi in _SCRIPT_RANGES:
-            if lo <= code <= hi:
-                counts[name] = counts.get(name, 0) + 1
-                break
-    if not counts:
+
+    @staticmethod
+    def parse_date(text: Optional[str], dayfirst: bool = True, min_year: int = 1900,
+                   max_year: int = 2100) -> Optional[_dt.date]:
+        """Parse a date from noisy OCR text.
+
+        ``dayfirst=True`` by default because DD-MM-YYYY is the convention in the
+        document classes this library targets, and an ambiguous ``03/04/2024``
+        silently read as March 4th is the kind of error that reaches a claims
+        reviewer looking entirely plausible.  Unambiguous inputs (a day above 12, a
+        named month, an ISO date) always win over the flag.
+
+        Returns ``None`` rather than guessing when the text holds no date.
+        """
+        if not text:
+            return None
+        cleaned = normalize_digits(normalize_unicode(str(text)))
+        for pattern, order in _DATE_PATTERNS:
+            match = pattern.search(cleaned)
+            if not match:
+                continue
+            groups = match.groups()
+            try:
+                if order == "ymd":
+                    year, month, day = int(groups[0]), int(groups[1]), int(groups[2])
+                elif order == "ddmmyyyy":
+                    day, month, year = int(groups[0]), int(groups[1]), int(groups[2])
+                elif order == "dMy":
+                    month = _MONTHS.get(groups[1].lower()[:9]) or _MONTHS.get(groups[1].lower()[:3])
+                    if not month:
+                        continue
+                    day, year = int(groups[0]), _expand_year(int(groups[2]))
+                elif order == "Mdy":
+                    month = _MONTHS.get(groups[0].lower()[:9]) or _MONTHS.get(groups[0].lower()[:3])
+                    if not month:
+                        continue
+                    day, year = int(groups[1]), _expand_year(int(groups[2]))
+                else:  # dmy_or_mdy
+                    first, second = int(groups[0]), int(groups[1])
+                    year = _expand_year(int(groups[2]))
+                    if first > 12 >= second:
+                        day, month = first, second
+                    elif second > 12 >= first:
+                        day, month = second, first
+                    else:
+                        day, month = (first, second) if dayfirst else (second, first)
+                if not (min_year <= year <= max_year):
+                    continue
+                return _dt.date(year, month, day)
+            except (ValueError, TypeError):
+                continue
         return None
-    best = max(counts.items(), key=lambda kv: kv[1])
-    return best[0] if best[1] >= minimum else None
+
+    @staticmethod
+    def parse_bool(text: Optional[str]) -> Optional[bool]:
+        """Parse a checkbox-ish value from a form."""
+        if text is None:
+            return None
+        token = str(text).strip().lower()
+        if token in ("yes", "y", "true", "1", "x", "✓", "✔", "checked"):
+            return True
+        if token in ("no", "n", "false", "0", "", "-", "unchecked"):
+            return False
+        return None
+
+    @staticmethod
+    def normalize_spans(spans: Sequence[TextSpan], digits: bool = True,
+                        unicode_form: Optional[Literal["NFC", "NFD", "NFKC", "NFKD"]]
+                        = "NFKC") -> List[TextSpan]:
+        """Return normalised copies of ``spans``, tagging each with its script."""
+        out = []
+        for span in spans:
+            text = span.text
+            if unicode_form:
+                text = normalize_unicode(text, unicode_form)
+            if digits:
+                text = normalize_digits(text)
+            out.append(dataclasses.replace(span, text=text,
+                                           script=span.script or detect_script(text)))
+        return out
+
+    @staticmethod
+    def normalize_document(doc: Document, in_place: bool = False, **kwargs: Any) -> Document:
+        """Normalise every span in a document."""
+        target = doc if in_place else doc.copy()
+        for page in target.pages:
+            page.spans = normalize_spans(page.spans, **kwargs)
+        return target
+
+
+# Module-level aliases.  These are load-bearing, not merely back-compatible:
+# the staticmethods above call one another through these flat names, resolved
+# from module globals at call time.  Deleting them breaks Text from the inside.
+# ``Text.x`` is the documented path; ``x`` is the one that already works.
+detect_script        = Text.detect_script
+normalize_digits     = Text.normalize_digits
+normalize_unicode    = Text.normalize_unicode
+normalize_whitespace = Text.normalize_whitespace
+normalize_text       = Text.normalize_text
+fix_ocr_confusions   = Text.fix_ocr_confusions
+parse_amount         = Text.parse_amount
+detect_currency      = Text.detect_currency
+parse_date           = Text.parse_date
+parse_bool           = Text.parse_bool
+normalize_spans      = Text.normalize_spans
+normalize_document   = Text.normalize_document
 
 
 #: Non-ASCII decimal digits seen on Indian and Arabic documents.
@@ -5876,46 +7201,12 @@ _DIGIT_BLOCKS = [
     0xFF10,  # Fullwidth
 ]
 
-_DIGIT_MAP: Dict[int, str] = {}
-for _base in _DIGIT_BLOCKS:
-    for _i in range(10):
-        _DIGIT_MAP[_base + _i] = str(_i)
-del _base, _i
-
-
-def normalize_digits(text: str) -> str:
-    """Convert every Unicode decimal digit to ASCII ``0-9``.
-
-    A Devanagari ``४८२५०`` and an ASCII ``48250`` are the same amount, and every
-    validator downstream should only ever have to handle one of them.
-    """
-    return text.translate(_DIGIT_MAP) if text else text
-
-
-def normalize_unicode(text: str, form: str = "NFKC") -> str:
-    """Normalise Unicode form, collapsing ligatures and compatibility variants."""
-    return unicodedata.normalize(form, text) if text else text
+_DIGIT_MAP: Dict[int, str] = dict(
+    (base + offset, str(offset))
+    for base in _DIGIT_BLOCKS for offset in range(10))
 
 
 _WHITESPACE_RE = re.compile(r"[ \t  -​]+")
-
-
-def normalize_whitespace(text: str, collapse_newlines: bool = False) -> str:
-    """Collapse runs of whitespace, preserving line structure by default."""
-    if not text:
-        return text
-    out = _WHITESPACE_RE.sub(" ", text)
-    if collapse_newlines:
-        out = re.sub(r"\s*\n\s*", " ", out)
-    else:
-        out = re.sub(r"[ \t]*\n[ \t]*", "\n", out)
-        out = re.sub(r"\n{3,}", "\n\n", out)
-    return out.strip()
-
-
-def normalize_text(text: str) -> str:
-    """The standard cleanup: Unicode form, ASCII digits, tidy whitespace."""
-    return normalize_whitespace(normalize_digits(normalize_unicode(text or "")))
 
 
 #: Character confusions that classical OCR makes constantly.  Applied only
@@ -5928,21 +7219,6 @@ _NUMERIC_CONFUSIONS = {
     "B": "8", "b": "6", "G": "6", "g": "9", "T": "7",
 }
 _ALPHA_CONFUSIONS = {"0": "O", "1": "I", "5": "S", "8": "B", "2": "Z", "6": "G"}
-
-
-def fix_ocr_confusions(text: str, expect: str = "numeric") -> str:
-    """Repair classic OCR character confusions for a *known-type* field.
-
-    Never apply this to free text.  ``expect="numeric"`` on a field declared as
-    an amount is safe and recovers a lot of otherwise-lost values; the same
-    substitution on a patient's name turns "Sonia" into "50nia".
-    """
-    if not text:
-        return text
-    table = _NUMERIC_CONFUSIONS if expect == "numeric" else _ALPHA_CONFUSIONS
-    if expect not in ("numeric", "alpha"):
-        raise ConfigError("expect must be 'numeric' or 'alpha'")
-    return "".join(table.get(ch, ch) for ch in text)
 
 
 _CURRENCY_SYMBOLS = {
@@ -5962,100 +7238,14 @@ _GROUP_SPACES = "\u2009\u202f\u00a0"
 _AMOUNT_RE = re.compile(r"[-+]?\d[\d.,'%s]*\d|[-+]?\d" % _GROUP_SPACES)
 
 
-def parse_amount(text: str, decimal_separator: str = "auto",
-                 allow_negative: bool = True) -> Optional[decimal.Decimal]:
-    """Parse a monetary amount, handling Indian and Western digit grouping.
-
-    Indian grouping (``1,23,456.78`` -- two digits per group above the
-    hundreds) breaks any parser that assumes groups of three, and it is the
-    default on every document this library was written for.  Grouping is
-    therefore *inferred* rather than assumed:
-
-    * ``1,234.56`` -> 1234.56    (comma groups, dot decimal)
-    * ``1,23,456.78`` -> 123456.78  (Indian grouping)
-    * ``1.234,56`` -> 1234.56    (European convention, detected by position)
-    * ``(1,234)`` -> -1234       (accounting negative)
-    * ``1,234 CR`` / ``1,234 DR`` -> credit/debit sign
-
-    Returns a :class:`decimal.Decimal` -- never a float, because money and
-    binary floating point should not meet.  Returns ``None`` when no number is
-    present.
-    """
-    if text is None:
-        return None
-    # Strip typographic group separators *before* NFKC, which would otherwise
-    # fold them into ordinary spaces and make them indistinguishable from the
-    # space between two unrelated numbers in a table row.
-    raw = re.sub("[%s]" % _GROUP_SPACES, "", str(text))
-    raw = normalize_digits(normalize_unicode(raw)).strip()
-    if not raw:
-        return None
-
-    negative = False
-    if allow_negative and raw.startswith("(") and raw.endswith(")"):
-        negative = True
-        raw = raw[1:-1]
-    upper = raw.upper()
-    if re.search(r"\bCR\b", upper):
-        negative = False
-    elif re.search(r"\bDR\b", upper):
-        negative = True
-
-    match = _AMOUNT_RE.search(raw)
-    if not match:
-        return None
-    body = match.group(0)
-    if body.startswith("-"):
-        negative = True
-    body = body.lstrip("+-")
-    body = re.sub(r"['%s]" % _GROUP_SPACES, "", body)
-
-    if decimal_separator == "comma":
-        body = body.replace(".", "").replace(",", ".")
-    elif decimal_separator == "dot":
-        body = body.replace(",", "")
-    else:
-        has_dot = "." in body
-        has_comma = "," in body
-        if has_dot and has_comma:
-            # Whichever separator comes last is the decimal one.
-            body = (body.replace(",", "") if body.rfind(".") > body.rfind(",")
-                    else body.replace(".", "").replace(",", "."))
-        elif has_comma:
-            tail = body.split(",")[-1]
-            # A trailing group of exactly 2 digits with a single comma is
-            # ambiguous ("1,50" is 1.50 in Europe, 150 in India); grouping wins,
-            # because these documents group and do not use comma decimals.
-            body = body.replace(",", "") if len(tail) in (2, 3) else body.replace(",", ".")
-        # A lone dot is already the decimal separator.
-
-    try:
-        value = decimal.Decimal(body)
-    except (decimal.InvalidOperation, ValueError):
-        return None
-    return -value if negative else value
-
-
-def detect_currency(text: str) -> Optional[str]:
-    """ISO currency code implied by ``text``, or ``None``."""
-    if not text:
-        return None
-    lowered = normalize_unicode(text).lower()
-    for token, code in _CURRENCY_SYMBOLS.items():
-        if token in lowered:
-            return code
-    return None
-
-
-_MONTHS: Dict[str, int] = {}
-for _i, _names in enumerate([
+_MONTHS: Dict[str, int] = dict(
+    (name, number)
+    for number, names in enumerate([
         ("jan", "january"), ("feb", "february"), ("mar", "march"),
         ("apr", "april"), ("may",), ("jun", "june"), ("jul", "july"),
         ("aug", "august"), ("sep", "sept", "september"), ("oct", "october"),
-        ("nov", "november"), ("dec", "december")], start=1):
-    for _n in _names:
-        _MONTHS[_n] = _i
-del _i, _names, _n
+        ("nov", "november"), ("dec", "december")], start=1)
+    for name in names)
 
 _DATE_PATTERNS = [
     # (regex, field order)
@@ -6078,98 +7268,11 @@ def _expand_year(value: int) -> int:
     return candidate - 100 if candidate > current + 5 else candidate
 
 
-def parse_date(text: str, dayfirst: bool = True, min_year: int = 1900,
-               max_year: int = 2100) -> Optional[_dt.date]:
-    """Parse a date from noisy OCR text.
-
-    ``dayfirst=True`` by default because DD-MM-YYYY is the convention in the
-    document classes this library targets, and an ambiguous ``03/04/2024``
-    silently read as March 4th is the kind of error that reaches a claims
-    reviewer looking entirely plausible.  Unambiguous inputs (a day above 12, a
-    named month, an ISO date) always win over the flag.
-
-    Returns ``None`` rather than guessing when the text holds no date.
-    """
-    if not text:
-        return None
-    cleaned = normalize_digits(normalize_unicode(str(text)))
-    for pattern, order in _DATE_PATTERNS:
-        match = pattern.search(cleaned)
-        if not match:
-            continue
-        groups = match.groups()
-        try:
-            if order == "ymd":
-                year, month, day = int(groups[0]), int(groups[1]), int(groups[2])
-            elif order == "ddmmyyyy":
-                day, month, year = int(groups[0]), int(groups[1]), int(groups[2])
-            elif order == "dMy":
-                month = _MONTHS.get(groups[1].lower()[:9]) or _MONTHS.get(groups[1].lower()[:3])
-                if not month:
-                    continue
-                day, year = int(groups[0]), _expand_year(int(groups[2]))
-            elif order == "Mdy":
-                month = _MONTHS.get(groups[0].lower()[:9]) or _MONTHS.get(groups[0].lower()[:3])
-                if not month:
-                    continue
-                day, year = int(groups[1]), _expand_year(int(groups[2]))
-            else:  # dmy_or_mdy
-                first, second = int(groups[0]), int(groups[1])
-                year = _expand_year(int(groups[2]))
-                if first > 12 >= second:
-                    day, month = first, second
-                elif second > 12 >= first:
-                    day, month = second, first
-                else:
-                    day, month = (first, second) if dayfirst else (second, first)
-            if not (min_year <= year <= max_year):
-                continue
-            return _dt.date(year, month, day)
-        except (ValueError, TypeError):
-            continue
-    return None
-
-
 #: Text that *looks* like a date: two separators, or a named month.
 _DATE_SHAPED_RE = re.compile(
     r"\d{1,4}[-/.]\d{1,2}[-/.]\d{1,4}"
     r"|\d{1,2}[\s-]*[A-Za-z]{3,9}[\s,-]*\d{2,4}"
     r"|[A-Za-z]{3,9}[\s-]*\d{1,2}[\s,-]*\d{2,4}")
-
-
-def parse_bool(text: str) -> Optional[bool]:
-    """Parse a checkbox-ish value from a form."""
-    if text is None:
-        return None
-    token = str(text).strip().lower()
-    if token in ("yes", "y", "true", "1", "x", "✓", "✔", "checked"):
-        return True
-    if token in ("no", "n", "false", "0", "", "-", "unchecked"):
-        return False
-    return None
-
-
-def normalize_spans(spans: Sequence[TextSpan], digits: bool = True,
-                    unicode_form: Optional[str] = "NFKC") -> List[TextSpan]:
-    """Return normalised copies of ``spans``, tagging each with its script."""
-    out = []
-    for span in spans:
-        text = span.text
-        if unicode_form:
-            text = normalize_unicode(text, unicode_form)
-        if digits:
-            text = normalize_digits(text)
-        out.append(dataclasses.replace(span, text=text,
-                                       script=span.script or detect_script(text)))
-    return out
-
-
-def normalize_document(doc: Document, in_place: bool = False, **kwargs: Any) -> Document:
-    """Normalise every span in a document."""
-    target = doc if in_place else doc.copy()
-    for page in target.pages:
-        page.spans = normalize_spans(page.spans, **kwargs)
-    return target
 
 
 # =============================================================================
@@ -6318,7 +7421,7 @@ class Tracer(object):
             """Give the block the :class:`TraceSpan` itself, for attributes."""
             return self.span
 
-        def __exit__(self, *exc) -> bool:
+        def __exit__(self, *exc: Any) -> Literal[False]:
             """Close the span and pop it.  Never swallows an exception."""
             self.span.end = time.time()
             with self.tracer._lock:
@@ -6356,7 +7459,7 @@ class _NullContext(object):
         """Yield nothing."""
         return None
 
-    def __exit__(self, *exc) -> bool:
+    def __exit__(self, *exc: Any) -> Literal[False]:
         """Do nothing.  Never swallows an exception."""
         return False
 
@@ -6415,18 +7518,294 @@ class CostTracker(object):
 # calibration set is decoration -- which is why Layer 5 exists.
 
 
-def logit(p: float, eps: float = 1e-6) -> float:
-    """Log-odds of ``p``, clamped away from the infinities."""
-    p = clamp(p, eps, 1.0 - eps)
-    return math.log(p / (1.0 - p))
+class Confidence(object):
+    """Confidence fusion and the metrics that check it.
+
+    Fusion combines *independent* signals -- page quality, backend
+    confidence, cross-read agreement, logprob, validation, format match --
+    in log-odds space.  A model's self-reported confidence is one input
+    among several and never the answer: it measures fluency, not
+    correctness.  Calibrators live alongside as classes.
+    """
+
+    @staticmethod
+    def logit(p: float, eps: float = 1e-6) -> float:
+        """Log-odds of ``p``, clamped away from the infinities."""
+        p = clamp(p, eps, 1.0 - eps)
+        return math.log(p / (1.0 - p))
+
+    @staticmethod
+    def sigmoid(z: float) -> float:
+        """Inverse of :func:`Confidence.logit`, numerically safe at both tails."""
+        if z >= 0:
+            return 1.0 / (1.0 + math.exp(-z))
+        e = math.exp(z)
+        return e / (1.0 + e)
+
+    @staticmethod
+    def fuse_confidence(signals: Mapping[str, Optional[float]],
+                        weights: Optional[Mapping[str, float]] = None,
+                        prior: float = 0.5) -> float:
+        """Fuse independent evidence into one calibrated-shaped score in ``[0, 1]``.
+
+        Fusion happens in log-odds space (a log-linear opinion pool), not as a
+        weighted average of probabilities.  That matters: averaging lets one
+        confident-but-wrong signal of 0.99 drag a field up, whereas in log-odds a
+        single strong disagreement pulls the result down hard, which is the
+        behaviour you want when a validator says the line items do not sum to the
+        total.
+
+        Signals set to ``None`` are *absent*, not zero, and are dropped with their
+        weight renormalised away.  Encoding "the backend reported no confidence" as
+        0.0 would quietly punish every engine that declines to guess.
+
+        Each signal is clamped to ``[0.02, 0.98]`` before its log-odds are taken,
+        so no individual signal can dominate the pool outright -- see
+        :data:`_SIGNAL_CLAMP`.
+
+        Returns ``prior`` when no signal is available.
+        """
+        weight_map = dict(weights or DEFAULT_CONFIDENCE_WEIGHTS)
+        total_weight = 0.0
+        accumulated = 0.0
+        for name, value in signals.items():
+            if value is None:
+                continue
+            weight = weight_map.get(name)
+            if weight is None or weight <= 0:
+                continue
+            bounded = clamp(float(value), _SIGNAL_CLAMP, 1.0 - _SIGNAL_CLAMP)
+            accumulated += weight * logit(bounded)
+            total_weight += weight
+        if total_weight <= 0:
+            return round(float(prior), 4)
+        return round(float(clamp(sigmoid(accumulated / total_weight), 0.0, 1.0)), 4)
+
+    @staticmethod
+    def page_quality_prior(quality: PageQuality, bbox: Optional[BBox] = None,
+                           page: Optional[Page] = None) -> float:
+        """Prior probability of a correct read, from measured page degradation.
+
+        When a ``bbox`` and its ``page`` are supplied the measurement is localised
+        to the evidence region: a page can be pristine at the top and destroyed at
+        the bottom, and a total read from the destroyed part should not inherit the
+        page's average health.
+        """
+        base = quality.score
+        if bbox is None or page is None or not page.has_raster():
+            return round(float(clamp(base, 0.02, 0.99)), 4)
+        try:
+            img = page.raster()
+            x0, y0, x1, y1 = bbox.to_pixels(page.raster_dpi)
+            h, w = image_shape(img)
+            x0 = int(clamp(x0, 0, w - 1)); x1 = int(clamp(x1, x0 + 1, w))
+            y0 = int(clamp(y0, 0, h - 1)); y1 = int(clamp(y1, y0 + 1, h))
+            crop = img[y0:y1, x0:x1]
+            if min(image_shape(crop)) < 8:
+                return round(float(clamp(base, 0.02, 0.99)), 4)
+            local = PageQuality(blur=measure_blur(crop), contrast=measure_contrast(crop),
+                                effective_dpi=quality.effective_dpi,
+                                noise=measure_noise(crop),
+                                illumination=quality.illumination)
+            # Blend: the region's own measurement dominates, the page's grounds it.
+            return round(float(clamp(0.7 * local.score + 0.3 * base, 0.02, 0.99)), 4)
+        except Exception as exc:
+            logger.debug("local quality prior failed: %s", exc)
+            return round(float(clamp(base, 0.02, 0.99)), 4)
+
+    @staticmethod
+    def align_spans(a: Sequence[TextSpan], b: Sequence[TextSpan],
+                    iou_threshold: float = 0.3
+                    ) -> List[Tuple[Optional[TextSpan], Optional[TextSpan]]]:
+        """Pair up spans from two reads of the same page by geometric overlap.
+
+        Greedy best-IoU matching.  Unmatched spans are returned paired with
+        ``None`` so that a backend which simply *missed* a field is penalised, not
+        silently ignored.
+        """
+        pairs: List[Tuple[Optional[TextSpan], Optional[TextSpan]]] = []
+        remaining = list(b)
+        for span in a:
+            best = None
+            best_iou = iou_threshold
+            for candidate in remaining:
+                score = span.bbox.iou(candidate.bbox)
+                if score >= best_iou:
+                    best, best_iou = candidate, score
+            if best is not None:
+                remaining.remove(best)
+                pairs.append((span, best))
+            else:
+                pairs.append((span, None))
+        for leftover in remaining:
+            pairs.append((None, leftover))
+        return pairs
+
+    @staticmethod
+    def cross_read_agreement(a: Sequence[TextSpan], b: Sequence[TextSpan],
+                             iou_threshold: float = 0.3,
+                             min_geometric_fraction: float = 0.2) -> float:
+        """Agreement in ``[0, 1]`` between two independent reads of one page.
+
+        Prefers geometric matching, which is precise.  When too few spans match
+        geometrically -- the normal case when one of the reads came from a vision
+        model, whose bboxes are approximate by construction -- it falls back to
+        comparing the two transcriptions as token sequences, which is coarser but
+        still discriminating.
+
+        Returns ``0.0`` if either read is empty: one method finding nothing where
+        the other found text is maximal disagreement, not a missing measurement.
+        """
+        if not a or not b:
+            return 0.0
+        approximate = any(s.meta.get("approximate_bbox") for s in list(a) + list(b))
+        if not approximate:
+            pairs = align_spans(a, b, iou_threshold)
+            matched = [(x, y) for x, y in pairs if x is not None and y is not None]
+            if pairs and len(matched) >= max(1, int(min_geometric_fraction * len(pairs))):
+                total_weight = 0.0
+                score = 0.0
+                for x, y in pairs:
+                    if x is None or y is None:
+                        present = x if x is not None else y
+                        if present is None:   # align_spans never pairs None with None
+                            continue
+                        total_weight += max(1, len(_compare_key(present.text)))
+                        continue
+                    key_x, key_y = _compare_key(x.text), _compare_key(y.text)
+                    weight = max(1, max(len(key_x), len(key_y)))
+                    score += weight * similarity(key_x, key_y)
+                    total_weight += weight
+                return round(float(_safe_div(score, total_weight)), 4)
+
+        tokens_a = [_compare_key(t) for t in " ".join(s.text for s in a).split() ]
+        tokens_b = [_compare_key(t) for t in " ".join(s.text for s in b).split()]
+        tokens_a = [t for t in tokens_a if t]
+        tokens_b = [t for t in tokens_b if t]
+        if not tokens_a or not tokens_b:
+            return 0.0
+        return round(float(difflib.SequenceMatcher(None, tokens_a, tokens_b).ratio()), 4)
+
+    @staticmethod
+    def value_agreement(a: Any, b: Any, numeric_tolerance: float = 0.0) -> float:
+        """Agreement between two *extracted values* rather than two transcriptions.
+
+        Numbers compare numerically (``48250`` and ``48,250.00`` agree), dates
+        compare as dates, and everything else compares as normalised strings.
+        """
+        if a is None or b is None:
+            return 0.0
+        if isinstance(a, bool) or isinstance(b, bool):
+            return 1.0 if bool(a) == bool(b) else 0.0
+        numbers = (int, float, decimal.Decimal)
+        if isinstance(a, numbers) and isinstance(b, numbers):
+            x, y = float(a), float(b)
+            if x == y:
+                return 1.0
+            scale = max(abs(x), abs(y), 1e-9)
+            return 1.0 if abs(x - y) <= numeric_tolerance * scale else 0.0
+        if isinstance(a, (_dt.date, _dt.datetime)) and isinstance(b, (_dt.date, _dt.datetime)):
+            return 1.0 if str(a)[:10] == str(b)[:10] else 0.0
+        return round(similarity(_compare_key(str(a)), _compare_key(str(b))), 4)
+
+    @staticmethod
+    def format_match_score(value: Any, expected_type: str) -> Optional[float]:
+        """Does ``value`` look like a well-formed instance of ``expected_type``?
+
+        A weak signal on its own, but a genuinely independent one: it catches the
+        field-shifted-by-one-row failure that every other signal misses, because a
+        date sitting in an amount field is fluent, high-confidence and wrong.
+        """
+        if value is None:
+            return 0.0
+        text = str(value).strip()
+        if not text:
+            return 0.0
+        kind = (expected_type or "").lower()
+        if kind in ("int", "integer", "float", "number", "decimal", "amount", "money"):
+            # "12-04-2024" parses as the amount 12, so a date landing in an amount
+            # field would otherwise score a confident 1.0.  That off-by-one-row
+            # failure is exactly what this signal exists to catch, and it is the
+            # one no other signal sees: the value is fluent and the page is clean.
+            if _DATE_SHAPED_RE.search(text) and parse_date(text) is not None:
+                return 0.0
+            return 1.0 if parse_amount(text) is not None else 0.0
+        if kind in ("date", "datetime"):
+            return 1.0 if parse_date(text) is not None else 0.0
+        if kind in ("bool", "boolean"):
+            return 1.0 if parse_bool(text) is not None else 0.0
+        if kind in ("str", "string", "text"):
+            # Long runs of OCR garbage characters are the failure mode here.
+            letters = sum(1 for ch in text if ch.isalnum() or ch.isspace())
+            return round(float(clamp(letters / float(len(text)), 0.0, 1.0)), 4)
+        return None
+
+    @staticmethod
+    def reliability_curve(scores: Sequence[float], labels: Sequence[bool],
+                          bins: int = 10) -> List[Dict[str, float]]:
+        """Bin predictions and report empirical accuracy per bin.
+
+        This is the plot that answers "is a 0.9 right 90% of the time?".  Until it
+        is drawn, a confidence number is an assertion, not a measurement.
+        """
+        if len(scores) != len(labels):
+            raise ConfigError("scores and labels differ in length")
+        buckets: List[List[Tuple[float, bool]]] = [[] for _ in range(max(1, bins))]
+        for score, label in zip(scores, labels):
+            index = int(clamp(float(score), 0.0, 0.999999) * bins)
+            buckets[index].append((float(score), bool(label)))
+        out = []
+        for i, bucket in enumerate(buckets):
+            if not bucket:
+                out.append({"bin_low": i / float(bins), "bin_high": (i + 1) / float(bins),
+                            "count": 0, "mean_confidence": 0.0, "accuracy": 0.0, "gap": 0.0})
+                continue
+            mean_conf = sum(s for s, _ in bucket) / len(bucket)
+            accuracy = sum(1.0 for _, l in bucket if l) / len(bucket)
+            out.append({"bin_low": i / float(bins), "bin_high": (i + 1) / float(bins),
+                        "count": len(bucket), "mean_confidence": round(mean_conf, 4),
+                        "accuracy": round(accuracy, 4), "gap": round(accuracy - mean_conf, 4)})
+        return out
+
+    @staticmethod
+    def expected_calibration_error(scores: Sequence[float], labels: Sequence[bool],
+                                   bins: int = 10) -> float:
+        """Expected calibration error: the bin-count-weighted mean |accuracy - confidence|.
+
+        The single number to track per release.  Under 0.05 is a defensible target
+        for a shipped extraction pipeline.
+        """
+        curve = reliability_curve(scores, labels, bins)
+        total = sum(b["count"] for b in curve)
+        if not total:
+            return 0.0
+        return round(sum(b["count"] * abs(b["gap"]) for b in curve) / float(total), 4)
+
+    @staticmethod
+    def brier_score(scores: Sequence[float], labels: Sequence[bool]) -> float:
+        """Mean squared error of the probabilities.  Rewards sharpness *and*
+        calibration, unlike ECE, which a constant predictor can game."""
+        if not scores:
+            return 0.0
+        return round(sum((float(s) - (1.0 if l else 0.0)) ** 2
+                         for s, l in zip(scores, labels)) / float(len(scores)), 4)
 
 
-def sigmoid(z: float) -> float:
-    """Inverse of :func:`logit`, numerically safe at both tails."""
-    if z >= 0:
-        return 1.0 / (1.0 + math.exp(-z))
-    e = math.exp(z)
-    return e / (1.0 + e)
+# Module-level aliases.  These are load-bearing, not merely back-compatible:
+# the staticmethods above call one another through these flat names, resolved
+# from module globals at call time.  Deleting them breaks Confidence from the inside.
+# ``Confidence.x`` is the documented path; ``x`` is the one that already works.
+logit                      = Confidence.logit
+sigmoid                    = Confidence.sigmoid
+fuse_confidence            = Confidence.fuse_confidence
+page_quality_prior         = Confidence.page_quality_prior
+align_spans                = Confidence.align_spans
+cross_read_agreement       = Confidence.cross_read_agreement
+value_agreement            = Confidence.value_agreement
+format_match_score         = Confidence.format_match_score
+reliability_curve          = Confidence.reliability_curve
+expected_calibration_error = Confidence.expected_calibration_error
+brier_score                = Confidence.brier_score
 
 
 #: Default fusion weights.  These are *priors*, chosen by how much independent
@@ -6466,206 +7845,10 @@ DEFAULT_CONFIDENCE_WEIGHTS = {
 _SIGNAL_CLAMP = 0.02
 
 
-def fuse_confidence(signals: Mapping[str, Optional[float]],
-                    weights: Optional[Mapping[str, float]] = None,
-                    prior: float = 0.5) -> float:
-    """Fuse independent evidence into one calibrated-shaped score in ``[0, 1]``.
-
-    Fusion happens in log-odds space (a log-linear opinion pool), not as a
-    weighted average of probabilities.  That matters: averaging lets one
-    confident-but-wrong signal of 0.99 drag a field up, whereas in log-odds a
-    single strong disagreement pulls the result down hard, which is the
-    behaviour you want when a validator says the line items do not sum to the
-    total.
-
-    Signals set to ``None`` are *absent*, not zero, and are dropped with their
-    weight renormalised away.  Encoding "the backend reported no confidence" as
-    0.0 would quietly punish every engine that declines to guess.
-
-    Each signal is clamped to ``[0.02, 0.98]`` before its log-odds are taken,
-    so no individual signal can dominate the pool outright -- see
-    :data:`_SIGNAL_CLAMP`.
-
-    Returns ``prior`` when no signal is available.
-    """
-    weight_map = dict(weights or DEFAULT_CONFIDENCE_WEIGHTS)
-    total_weight = 0.0
-    accumulated = 0.0
-    for name, value in signals.items():
-        if value is None:
-            continue
-        weight = weight_map.get(name)
-        if weight is None or weight <= 0:
-            continue
-        bounded = clamp(float(value), _SIGNAL_CLAMP, 1.0 - _SIGNAL_CLAMP)
-        accumulated += weight * logit(bounded)
-        total_weight += weight
-    if total_weight <= 0:
-        return round(float(prior), 4)
-    return round(float(clamp(sigmoid(accumulated / total_weight), 0.0, 1.0)), 4)
-
-
-def page_quality_prior(quality: PageQuality, bbox: Optional[BBox] = None,
-                       page: Optional[Page] = None) -> float:
-    """Prior probability of a correct read, from measured page degradation.
-
-    When a ``bbox`` and its ``page`` are supplied the measurement is localised
-    to the evidence region: a page can be pristine at the top and destroyed at
-    the bottom, and a total read from the destroyed part should not inherit the
-    page's average health.
-    """
-    base = quality.score
-    if bbox is None or page is None or not page.has_raster():
-        return round(float(clamp(base, 0.02, 0.99)), 4)
-    try:
-        img = page.raster()
-        x0, y0, x1, y1 = bbox.to_pixels(page.raster_dpi)
-        h, w = image_shape(img)
-        x0 = int(clamp(x0, 0, w - 1)); x1 = int(clamp(x1, x0 + 1, w))
-        y0 = int(clamp(y0, 0, h - 1)); y1 = int(clamp(y1, y0 + 1, h))
-        crop = img[y0:y1, x0:x1]
-        if min(image_shape(crop)) < 8:
-            return round(float(clamp(base, 0.02, 0.99)), 4)
-        local = PageQuality(blur=measure_blur(crop), contrast=measure_contrast(crop),
-                            effective_dpi=quality.effective_dpi,
-                            noise=measure_noise(crop),
-                            illumination=quality.illumination)
-        # Blend: the region's own measurement dominates, the page's grounds it.
-        return round(float(clamp(0.7 * local.score + 0.3 * base, 0.02, 0.99)), 4)
-    except Exception as exc:
-        logger.debug("local quality prior failed: %s", exc)
-        return round(float(clamp(base, 0.02, 0.99)), 4)
-
-
 def _compare_key(text: str) -> str:
     """Aggressive normalisation for agreement comparison only."""
     cleaned = normalize_digits(normalize_unicode(text or "")).lower()
     return re.sub(r"[^a-z0-9]+", "", cleaned)
-
-
-def align_spans(a: Sequence[TextSpan], b: Sequence[TextSpan],
-                iou_threshold: float = 0.3
-                ) -> List[Tuple[Optional[TextSpan], Optional[TextSpan]]]:
-    """Pair up spans from two reads of the same page by geometric overlap.
-
-    Greedy best-IoU matching.  Unmatched spans are returned paired with
-    ``None`` so that a backend which simply *missed* a field is penalised, not
-    silently ignored.
-    """
-    pairs: List[Tuple[Optional[TextSpan], Optional[TextSpan]]] = []
-    remaining = list(b)
-    for span in a:
-        best = None
-        best_iou = iou_threshold
-        for candidate in remaining:
-            score = span.bbox.iou(candidate.bbox)
-            if score >= best_iou:
-                best, best_iou = candidate, score
-        if best is not None:
-            remaining.remove(best)
-            pairs.append((span, best))
-        else:
-            pairs.append((span, None))
-    for leftover in remaining:
-        pairs.append((None, leftover))
-    return pairs
-
-
-def cross_read_agreement(a: Sequence[TextSpan], b: Sequence[TextSpan],
-                         iou_threshold: float = 0.3,
-                         min_geometric_fraction: float = 0.2) -> float:
-    """Agreement in ``[0, 1]`` between two independent reads of one page.
-
-    Prefers geometric matching, which is precise.  When too few spans match
-    geometrically -- the normal case when one of the reads came from a vision
-    model, whose bboxes are approximate by construction -- it falls back to
-    comparing the two transcriptions as token sequences, which is coarser but
-    still discriminating.
-
-    Returns ``0.0`` if either read is empty: one method finding nothing where
-    the other found text is maximal disagreement, not a missing measurement.
-    """
-    if not a or not b:
-        return 0.0
-    approximate = any(s.meta.get("approximate_bbox") for s in list(a) + list(b))
-    if not approximate:
-        pairs = align_spans(a, b, iou_threshold)
-        matched = [(x, y) for x, y in pairs if x is not None and y is not None]
-        if pairs and len(matched) >= max(1, int(min_geometric_fraction * len(pairs))):
-            total_weight = 0.0
-            score = 0.0
-            for x, y in pairs:
-                if x is None or y is None:
-                    present = x or y
-                    total_weight += max(1, len(_compare_key(present.text)))
-                    continue
-                key_x, key_y = _compare_key(x.text), _compare_key(y.text)
-                weight = max(1, max(len(key_x), len(key_y)))
-                score += weight * similarity(key_x, key_y)
-                total_weight += weight
-            return round(float(_safe_div(score, total_weight)), 4)
-
-    tokens_a = [_compare_key(t) for t in " ".join(s.text for s in a).split() ]
-    tokens_b = [_compare_key(t) for t in " ".join(s.text for s in b).split()]
-    tokens_a = [t for t in tokens_a if t]
-    tokens_b = [t for t in tokens_b if t]
-    if not tokens_a or not tokens_b:
-        return 0.0
-    return round(float(difflib.SequenceMatcher(None, tokens_a, tokens_b).ratio()), 4)
-
-
-def value_agreement(a: Any, b: Any, numeric_tolerance: float = 0.0) -> float:
-    """Agreement between two *extracted values* rather than two transcriptions.
-
-    Numbers compare numerically (``48250`` and ``48,250.00`` agree), dates
-    compare as dates, and everything else compares as normalised strings.
-    """
-    if a is None or b is None:
-        return 0.0
-    if isinstance(a, bool) or isinstance(b, bool):
-        return 1.0 if bool(a) == bool(b) else 0.0
-    numbers = (int, float, decimal.Decimal)
-    if isinstance(a, numbers) and isinstance(b, numbers):
-        x, y = float(a), float(b)
-        if x == y:
-            return 1.0
-        scale = max(abs(x), abs(y), 1e-9)
-        return 1.0 if abs(x - y) <= numeric_tolerance * scale else 0.0
-    if isinstance(a, (_dt.date, _dt.datetime)) and isinstance(b, (_dt.date, _dt.datetime)):
-        return 1.0 if str(a)[:10] == str(b)[:10] else 0.0
-    return round(similarity(_compare_key(str(a)), _compare_key(str(b))), 4)
-
-
-def format_match_score(value: Any, expected_type: str) -> Optional[float]:
-    """Does ``value`` look like a well-formed instance of ``expected_type``?
-
-    A weak signal on its own, but a genuinely independent one: it catches the
-    field-shifted-by-one-row failure that every other signal misses, because a
-    date sitting in an amount field is fluent, high-confidence and wrong.
-    """
-    if value is None:
-        return 0.0
-    text = str(value).strip()
-    if not text:
-        return 0.0
-    kind = (expected_type or "").lower()
-    if kind in ("int", "integer", "float", "number", "decimal", "amount", "money"):
-        # "12-04-2024" parses as the amount 12, so a date landing in an amount
-        # field would otherwise score a confident 1.0.  That off-by-one-row
-        # failure is exactly what this signal exists to catch, and it is the
-        # one no other signal sees: the value is fluent and the page is clean.
-        if _DATE_SHAPED_RE.search(text) and parse_date(text) is not None:
-            return 0.0
-        return 1.0 if parse_amount(text) is not None else 0.0
-    if kind in ("date", "datetime"):
-        return 1.0 if parse_date(text) is not None else 0.0
-    if kind in ("bool", "boolean"):
-        return 1.0 if parse_bool(text) is not None else 0.0
-    if kind in ("str", "string", "text"):
-        # Long runs of OCR garbage characters are the failure mode here.
-        letters = sum(1 for ch in text if ch.isalnum() or ch.isspace())
-        return round(float(clamp(letters / float(len(text)), 0.0, 1.0)), 4)
-    return None
 
 
 # -- calibration -------------------------------------------------------------
@@ -6783,10 +7966,16 @@ class PlattCalibrator(Calibrator):
         """JSON-ready dict, including the sample count it was fitted on."""
         return {"kind": "platt", "a": self.a, "b": self.b, "n": self.n}
 
-    @classmethod
-    def from_dict(cls, d: Mapping[str, Any]) -> PlattCalibrator:
-        """Rebuild from :meth:`to_dict` output."""
-        obj = cls(float(d.get("a", 1.0)), float(d.get("b", 0.0)))
+    @staticmethod
+    def from_dict(d: Mapping[str, Any]) -> PlattCalibrator:
+        """Rebuild from :meth:`to_dict` output.
+
+        A staticmethod, not a classmethod, so that it matches
+        :meth:`Calibrator.from_dict` -- the base declares the dispatcher every
+        calibrator must answer to, and a classmethod would take an extra
+        positional parameter it does not have.
+        """
+        obj = PlattCalibrator(float(d.get("a", 1.0)), float(d.get("b", 0.0)))
         obj.n = int(d.get("n", 0))
         return obj
 
@@ -6862,66 +8051,20 @@ class IsotonicCalibrator(Calibrator):
         return {"kind": "isotonic", "thresholds": self.thresholds,
                 "values": self.values, "n": self.n}
 
-    @classmethod
-    def from_dict(cls, d: Mapping[str, Any]) -> IsotonicCalibrator:
-        """Rebuild from :meth:`to_dict` output."""
-        obj = cls(d.get("thresholds"), d.get("values"))
+    @staticmethod
+    def from_dict(d: Mapping[str, Any]) -> IsotonicCalibrator:
+        """Rebuild from :meth:`to_dict` output.
+
+        A staticmethod for the same reason as :meth:`PlattCalibrator.from_dict`:
+        it has to match the dispatcher declared on :class:`Calibrator`.
+        """
+        obj = IsotonicCalibrator(d.get("thresholds"), d.get("values"))
         obj.n = int(d.get("n", 0))
         return obj
 
     def __repr__(self) -> str:
         """Number of steps and the size of the fitting set."""
         return "IsotonicCalibrator(blocks=%d, n=%d)" % (len(self.values), self.n)
-
-
-def reliability_curve(scores: Sequence[float], labels: Sequence[bool],
-                      bins: int = 10) -> List[Dict[str, float]]:
-    """Bin predictions and report empirical accuracy per bin.
-
-    This is the plot that answers "is a 0.9 right 90% of the time?".  Until it
-    is drawn, a confidence number is an assertion, not a measurement.
-    """
-    if len(scores) != len(labels):
-        raise ConfigError("scores and labels differ in length")
-    buckets: List[List[Tuple[float, bool]]] = [[] for _ in range(max(1, bins))]
-    for score, label in zip(scores, labels):
-        index = int(clamp(float(score), 0.0, 0.999999) * bins)
-        buckets[index].append((float(score), bool(label)))
-    out = []
-    for i, bucket in enumerate(buckets):
-        if not bucket:
-            out.append({"bin_low": i / float(bins), "bin_high": (i + 1) / float(bins),
-                        "count": 0, "mean_confidence": 0.0, "accuracy": 0.0, "gap": 0.0})
-            continue
-        mean_conf = sum(s for s, _ in bucket) / len(bucket)
-        accuracy = sum(1.0 for _, l in bucket if l) / len(bucket)
-        out.append({"bin_low": i / float(bins), "bin_high": (i + 1) / float(bins),
-                    "count": len(bucket), "mean_confidence": round(mean_conf, 4),
-                    "accuracy": round(accuracy, 4), "gap": round(accuracy - mean_conf, 4)})
-    return out
-
-
-def expected_calibration_error(scores: Sequence[float], labels: Sequence[bool],
-                               bins: int = 10) -> float:
-    """Expected calibration error: the bin-count-weighted mean |accuracy - confidence|.
-
-    The single number to track per release.  Under 0.05 is a defensible target
-    for a shipped extraction pipeline.
-    """
-    curve = reliability_curve(scores, labels, bins)
-    total = sum(b["count"] for b in curve)
-    if not total:
-        return 0.0
-    return round(sum(b["count"] * abs(b["gap"]) for b in curve) / float(total), 4)
-
-
-def brier_score(scores: Sequence[float], labels: Sequence[bool]) -> float:
-    """Mean squared error of the probabilities.  Rewards sharpness *and*
-    calibration, unlike ECE, which a constant predictor can game."""
-    if not scores:
-        return 0.0
-    return round(sum((float(s) - (1.0 if l else 0.0)) ** 2
-                     for s, l in zip(scores, labels)) / float(len(scores)), 4)
 
 
 # =============================================================================
@@ -7168,7 +8311,10 @@ class SchemaAdapter(object):
                 return self.schema.parse_obj(dict(data))
             if dataclasses.is_dataclass(self.schema):
                 names = set(f.name for f in dataclasses.fields(self.schema))
-                return self.schema(**dict((k, v) for k, v in data.items() if k in names))
+                # is_dataclass() narrows to "a dataclass instance *or* class";
+                # here it is the class, which is what we call.
+                ctor = cast(Callable[..., Any], self.schema)
+                return ctor(**dict((k, v) for k, v in data.items() if k in names))
         except Exception as exc:
             raise ExtractionError("schema validation failed: %s" % exc)
         return dict(data)
@@ -7510,7 +8656,7 @@ class OpenAIClient(BaseLLMClient):
 _FENCE_RE = re.compile(r"```(?:json)?\s*(.*?)```", re.DOTALL)
 
 
-def parse_json_lenient(text: str) -> Any:
+def parse_json_lenient(text: Optional[str]) -> Any:
     """Recover a JSON object from a model's reply.
 
     Models wrap JSON in fences, prefix it with "Here is the extracted data:",
@@ -7749,7 +8895,7 @@ def _group_spans_into_lines(page: Page,
     if all(s.line is not None for s in spans):
         groups: Dict[Tuple[int, int], List[TextSpan]] = {}
         for s in spans:
-            groups.setdefault((int(s.block or 0), int(s.line)), []).append(s)
+            groups.setdefault((int(s.block or 0), int(s.line or 0)), []).append(s)
         ordered = sorted(groups.values(),
                          key=lambda g: (min(x.bbox.y0 for x in g),
                                         min(x.bbox.x0 for x in g)))
@@ -7810,113 +8956,135 @@ class ValidationIssue(object):
 Validator = Callable[[Any], Any]
 
 
-def run_validators(model: Any, validators: Sequence[Validator]) -> List[ValidationIssue]:
-    """Run business rules, collecting issues.
+class Validators(object):
+    """Domain-independent validators, as factories.
 
-    A validator may return ``None``, a string, a :class:`ValidationIssue`, or a
-    list of those.  A validator that *raises* is itself reported as an issue
-    rather than aborting extraction: a buggy rule must not cost you the
-    document.
+    Each returns a ``Validator`` closure, so a schema declares its checks
+    as data.  Only structural invariants that hold for any document type
+    belong here -- arithmetic consistency, date ordering, a format match.
+    Anything that knows what a field *means* belongs in the consuming
+    project.
     """
-    issues: List[ValidationIssue] = []
-    for validator in validators or []:
-        name = getattr(validator, "__name__", repr(validator))
-        try:
-            outcome = validator(model)
-        except Exception as exc:
-            issues.append(ValidationIssue(
-                "validator %s raised %s: %s" % (name, type(exc).__name__, exc),
-                severity="warning"))
-            continue
-        for item in (outcome if isinstance(outcome, (list, tuple)) else [outcome]):
-            if item is None:
+
+    @staticmethod
+    def run_validators(model: Any, validators: Sequence[Validator]) -> List[ValidationIssue]:
+        """Run business rules, collecting issues.
+
+        A validator may return ``None``, a string, a :class:`ValidationIssue`, or a
+        list of those.  A validator that *raises* is itself reported as an issue
+        rather than aborting extraction: a buggy rule must not cost you the
+        document.
+        """
+        issues: List[ValidationIssue] = []
+        for validator in validators or []:
+            name = getattr(validator, "__name__", repr(validator))
+            try:
+                outcome = validator(model)
+            except Exception as exc:
+                issues.append(ValidationIssue(
+                    "validator %s raised %s: %s" % (name, type(exc).__name__, exc),
+                    severity="warning"))
                 continue
-            if isinstance(item, ValidationIssue):
-                issues.append(item)
-            else:
-                issues.append(ValidationIssue(str(item), fields=[], severity="error"))
-    return issues
-
-
-def line_items_sum_to_total(items_field: str = "line_items", amount_field: str = "amount",
-                            total_field: str = "total",
-                            tolerance: decimal.Decimal = decimal.Decimal("0.02"),
-                            relative_tolerance: float = 0.0) -> Validator:
-    """Validator factory: line items must add up to the stated total.
-
-    The single most valuable check on a bill, because it is *independent* of
-    the reading: an OCR error in any one amount breaks the sum, which is why
-    this feeds confidence fusion rather than just producing a warning.
-    """
-    def validate(model: Any) -> Optional[ValidationIssue]:
-        """Compare the summed line items against the stated total."""
-        items = _get_attr(model, items_field)
-        total = _get_attr(model, total_field)
-        if not items or total is None:
-            return None
-        try:
-            summed = sum(decimal.Decimal(str(_get_attr(i, amount_field) or 0)) for i in items)
-            stated = decimal.Decimal(str(total))
-        except (decimal.InvalidOperation, TypeError, ValueError):
-            return ValidationIssue("could not sum %s" % items_field,
-                                   fields=[items_field, total_field], severity="warning")
-        allowed = tolerance + (abs(stated) * decimal.Decimal(str(relative_tolerance)))
-        if abs(summed - stated) > allowed:
-            return ValidationIssue(
-                "%s sums to %s but %s is %s" % (items_field, summed, total_field, stated),
-                fields=[items_field, total_field])
-        return None
-    validate.__name__ = "line_items_sum_to_total"
-    return validate
-
-
-def date_order(earlier_field: str, later_field: str, allow_equal: bool = True) -> Validator:
-    """Validator factory: one date must not precede another."""
-    def validate(model: Any) -> Optional[ValidationIssue]:
-        """Check that the earlier field really is not after the later one."""
-        a = _get_attr(model, earlier_field)
-        b = _get_attr(model, later_field)
-        if a is None or b is None:
-            return None
-        if a > b or (not allow_equal and a == b):
-            return ValidationIssue("%s (%s) is after %s (%s)"
-                                   % (earlier_field, a, later_field, b),
-                                   fields=[earlier_field, later_field])
-        return None
-    validate.__name__ = "date_order(%s<=%s)" % (earlier_field, later_field)
-    return validate
-
-
-def field_matches(field_name: str, pattern: str,
-                  message: Optional[str] = None) -> Validator:
-    """Validator factory: a field must match a regular expression."""
-    compiled = re.compile(pattern)
-
-    def validate(model: Any) -> Optional[ValidationIssue]:
-        """Check the field against the compiled pattern."""
-        value = _get_attr(model, field_name)
-        if value is None:
-            return None
-        if not compiled.search(str(value)):
-            return ValidationIssue(message or "%s (%r) does not match %s"
-                                   % (field_name, value, pattern), fields=[field_name])
-        return None
-    validate.__name__ = "field_matches(%s)" % field_name
-    return validate
-
-
-def required_fields(*names: str) -> Validator:
-    """Validator factory: these fields must be present and non-empty."""
-    def validate(model: Any) -> List[ValidationIssue]:
-        """Report one issue per missing or blank field."""
-        issues = []
-        for name in names:
-            value = _get_attr(model, name)
-            if value is None or (isinstance(value, str) and not value.strip()):
-                issues.append(ValidationIssue("%s is missing" % name, fields=[name]))
+            for item in (outcome if isinstance(outcome, (list, tuple)) else [outcome]):
+                if item is None:
+                    continue
+                if isinstance(item, ValidationIssue):
+                    issues.append(item)
+                else:
+                    issues.append(ValidationIssue(str(item), fields=[], severity="error"))
         return issues
-    validate.__name__ = "required_fields"
-    return validate
+
+    @staticmethod
+    def line_items_sum_to_total(items_field: str = "line_items", amount_field: str = "amount",
+                                total_field: str = "total",
+                                tolerance: decimal.Decimal = decimal.Decimal("0.02"),
+                                relative_tolerance: float = 0.0) -> Validator:
+        """Validator factory: line items must add up to the stated total.
+
+        The single most valuable check on a bill, because it is *independent* of
+        the reading: an OCR error in any one amount breaks the sum, which is why
+        this feeds confidence fusion rather than just producing a warning.
+        """
+        def validate(model: Any) -> Optional[ValidationIssue]:
+            """Compare the summed line items against the stated total."""
+            items = _get_attr(model, items_field)
+            total = _get_attr(model, total_field)
+            if not items or total is None:
+                return None
+            try:
+                summed = sum(decimal.Decimal(str(_get_attr(i, amount_field) or 0)) for i in items)
+                stated = decimal.Decimal(str(total))
+            except (decimal.InvalidOperation, TypeError, ValueError):
+                return ValidationIssue("could not sum %s" % items_field,
+                                       fields=[items_field, total_field], severity="warning")
+            allowed = tolerance + (abs(stated) * decimal.Decimal(str(relative_tolerance)))
+            if abs(summed - stated) > allowed:
+                return ValidationIssue(
+                    "%s sums to %s but %s is %s" % (items_field, summed, total_field, stated),
+                    fields=[items_field, total_field])
+            return None
+        validate.__name__ = "line_items_sum_to_total"
+        return validate
+
+    @staticmethod
+    def date_order(earlier_field: str, later_field: str, allow_equal: bool = True) -> Validator:
+        """Validator factory: one date must not precede another."""
+        def validate(model: Any) -> Optional[ValidationIssue]:
+            """Check that the earlier field really is not after the later one."""
+            a = _get_attr(model, earlier_field)
+            b = _get_attr(model, later_field)
+            if a is None or b is None:
+                return None
+            if a > b or (not allow_equal and a == b):
+                return ValidationIssue("%s (%s) is after %s (%s)"
+                                       % (earlier_field, a, later_field, b),
+                                       fields=[earlier_field, later_field])
+            return None
+        validate.__name__ = "date_order(%s<=%s)" % (earlier_field, later_field)
+        return validate
+
+    @staticmethod
+    def field_matches(field_name: str, pattern: str,
+                      message: Optional[str] = None) -> Validator:
+        """Validator factory: a field must match a regular expression."""
+        compiled = re.compile(pattern)
+
+        def validate(model: Any) -> Optional[ValidationIssue]:
+            """Check the field against the compiled pattern."""
+            value = _get_attr(model, field_name)
+            if value is None:
+                return None
+            if not compiled.search(str(value)):
+                return ValidationIssue(message or "%s (%r) does not match %s"
+                                       % (field_name, value, pattern), fields=[field_name])
+            return None
+        validate.__name__ = "field_matches(%s)" % field_name
+        return validate
+
+    @staticmethod
+    def required_fields(*names: str) -> Validator:
+        """Validator factory: these fields must be present and non-empty."""
+        def validate(model: Any) -> List[ValidationIssue]:
+            """Report one issue per missing or blank field."""
+            issues = []
+            for name in names:
+                value = _get_attr(model, name)
+                if value is None or (isinstance(value, str) and not value.strip()):
+                    issues.append(ValidationIssue("%s is missing" % name, fields=[name]))
+            return issues
+        validate.__name__ = "required_fields"
+        return validate
+
+
+# Module-level aliases.  These are load-bearing, not merely back-compatible:
+# the staticmethods above call one another through these flat names, resolved
+# from module globals at call time.  Deleting them breaks Validators from the inside.
+# ``Validators.x`` is the documented path; ``x`` is the one that already works.
+run_validators          = Validators.run_validators
+line_items_sum_to_total = Validators.line_items_sum_to_total
+date_order              = Validators.date_order
+field_matches           = Validators.field_matches
+required_fields         = Validators.required_fields
 
 
 def _get_attr(obj: Any, name: str) -> Any:
@@ -8083,7 +9251,7 @@ def extract(doc: Document, schema: SchemaLike, context: str = "",
 
     Confidence is fused from independent signals and is *uncalibrated* unless a
     ``calibrator`` fitted on your own labelled set is supplied.  See
-    :func:`fuse_confidence` and :class:`EvalSuite`.
+    :func:`Confidence.fuse_confidence` and :class:`EvalSuite`.
     """
     if client is None:
         raise ConfigError(
@@ -9033,29 +10201,77 @@ class Pipeline(object):
     baseline.
     """
 
+    #: Chooses preprocessing ops per page from its measured quality.  Also
+    #: :func:`Policies.ocr_policy`, :func:`Policies.vlm_policy`, or your own
+    #: ``Callable[[Page], List[Op]]``.  ``None`` skips preprocessing -- the
+    #: baseline to measure against.
     policy: Optional[PolicyFn] = default_policy
+    #: Picks a backend per page.  Also :class:`RuleRouter`, :class:`BudgetRouter`,
+    #: or your own ``Callable[[Page], Optional[str]]``.  ``None`` sends every page
+    #: to :attr:`backend`.
     router: Optional[RouterFn] = default_router
+    #: Force one reader for all pages: a registered name (``"pymupdf"``,
+    #: ``"tesseract"``, ``"paddle"``, ``"anthropic"``) or a :class:`TextBackend`.
+    #: Takes precedence over :attr:`router`.
     backend: Optional[Union[str, TextBackend]] = None
+    #: What to extract -- pydantic model, dataclass, or ``{field: type}`` dict.
+    #: ``None`` means text only: no model call, no cost.
     schema: Optional[SchemaLike] = None
+    #: Domain hints for the prompt, e.g. ``"Indian private hospital bill, INR"``.
     context: str = ""
+    #: The :class:`LLMClient` that does the extracting.  Required when
+    #: :attr:`schema` is set.
     client: Optional[LLMClient] = None
+    #: Business rules run over the extracted object; each outcome feeds the
+    #: confidence of the fields it touched.
     validators: List[Validator] = field(default_factory=list)
+    #: Maps fused confidence onto calibrated probabilities.  Without one, scores
+    #: rank correctly but are not probabilities -- see :class:`PlattCalibrator`.
     calibrator: Optional[Calibrator] = None
+    #: Render resolution for PDF pages.  300 is the floor for reliable OCR; 400
+    #: helps on small print; above 600 costs memory without accuracy.
     render_dpi: int = DEFAULT_DPI
+    #: Stop after this many pages.  ``0`` means no limit.
     max_pages: int = 0
+    #: Thread count for per-page preprocessing and reading.  ``0`` runs serially,
+    #: which is what you want while debugging.
     max_workers: int = 0
+    #: Split pages that hold two physical documents before reading -- see
+    #: :func:`Ops.split_multi_bill_page`.
     split_pages: bool = False
+    #: Apply script, digit, date and amount normalisation to spans after reading.
     normalize: bool = True
+    #: Currency ceiling for the read stage; exceeding it raises
+    #: :class:`BudgetExceeded`.  ``None`` means unbounded.  Meaningless until
+    #: :func:`Pricing.set_pricing` is called -- unpriced models cost ``0.00``.
     budget: Optional[float] = None
+    #: Label carried into eval reports so runs can be told apart.
     name: str = "pipeline"
 
     def ingest(self, source: Source, **kwargs: Any) -> Document:
-        """Ingest ``source`` using this pipeline's DPI and page limit."""
+        """Ingest ``source`` using this pipeline's DPI and page limit.
+
+        :param source: path, path-like, directory, raw ``bytes``, or open binary
+            file -- anything :func:`ingest` accepts
+        :param kwargs: forwarded to :func:`ingest` (``password``, ``kind_hint``,
+            ...); ``render_dpi`` and ``max_pages`` come from this pipeline
+        :returns: a :class:`Document` whose rasters are still lazy -- nothing has
+            been rendered yet
+        """
         return ingest(source, render_dpi=self.render_dpi, max_pages=self.max_pages,
                       **kwargs)
 
     def run_document(self, doc: Document) -> Document:
-        """Preprocess, read and normalise an already-ingested document."""
+        """Preprocess, read and normalise an already-ingested document.
+
+        The middle of :meth:`run`, exposed separately for when you ingested the
+        document yourself -- to filter its pages, attach metadata, or feed pages
+        assembled from somewhere other than a file.
+
+        :param doc: an ingested document; it is read in place and also returned
+        :returns: the same document, with ``page.spans`` populated, ``page.history``
+            recording every op applied, and text normalised if ``normalize`` is set
+        """
         if self.split_pages:
             doc = split_document(doc)
         if self.policy is not None:
@@ -9071,6 +10287,15 @@ class Pipeline(object):
 
         With no ``schema`` configured the result still carries the document,
         so a text-only pipeline is just this with the extraction step empty.
+
+        :param source: path, path-like, directory, raw ``bytes``, or open binary
+            file -- anything :func:`ingest` accepts
+        :param kwargs: forwarded to :meth:`ingest`, e.g. ``password="secret"``
+            for an encrypted PDF
+        :returns: an :class:`Extraction`; when ``schema`` is ``None`` its
+            ``model`` is ``None`` and only ``document`` and ``cost`` are filled in
+        :raises IngestError: ``source`` could not be read as a document
+        :raises BudgetExceeded: this pipeline has a ``budget`` and reading exceeded it
         """
         doc = self.run_document(self.ingest(source, **kwargs))
         if self.schema is None:
@@ -9079,7 +10304,15 @@ class Pipeline(object):
                        validators=self.validators, calibrator=self.calibrator)
 
     def __call__(self, source: Source, **kwargs: Any) -> Extraction:
-        """``pipeline(source)`` -- alias for :meth:`run`, so it is a ``PipelineFn``."""
+        """``pipeline(source)`` -- alias for :meth:`run`, so it is a ``PipelineFn``.
+
+        Being callable is what lets a configured pipeline be handed straight to
+        :meth:`EvalSuite.run`, which expects a ``Callable[[str], Extraction]``.
+
+        :param source: as :meth:`run`
+        :param kwargs: as :meth:`run`
+        :returns: an :class:`Extraction`
+        """
         return self.run(source, **kwargs)
 
     def to_dict(self) -> Dict[str, Any]:
@@ -9109,7 +10342,78 @@ def process(source: Source, schema: Optional[SchemaLike] = None, context: str = 
             backend: Optional[Union[str, TextBackend]] = None,
             validators: Optional[Sequence[Validator]] = None,
             **kwargs: Any) -> Extraction:
-    """One-call convenience wrapper around :class:`Pipeline`."""
+    """One-call convenience wrapper around :class:`Pipeline` -- ingest to extraction.
+
+    Equivalent to building a :class:`Pipeline` with these arguments and calling
+    it once.  Use this for a single document; build a :class:`Pipeline` when you
+    want to reuse one configuration across many documents, record it in an eval
+    report, or run it through :class:`EvalSuite`.
+
+    :param source: what to read.  A path or path-like (``"scan.pdf"``,
+        ``Path("bill.png")``), a directory of pages, raw ``bytes`` of a PDF or
+        image, or an open binary file object.  Format is sniffed from content,
+        not from the extension.
+    :param schema: what to pull out -- a pydantic model, a dataclass, or a plain
+        ``{field: type}`` dict such as ``{"invoice_no": str, "total": float}``.
+        Leave it ``None`` for a text-only run: the read :class:`Document` still
+        comes back on ``Extraction.document``, with no model call made.
+    :param context: domain hints pasted into the prompt, e.g.
+        ``"Indian private hospital bill, amounts in INR"``.  Cheap and effective
+        -- it is what tells the model that ``1,20,000`` is one-lakh-twenty.
+    :param client: the :class:`LLMClient` doing the extracting -- one
+        of :class:`AnthropicClient`, :class:`OpenAIClient`, or the
+        deterministic :class:`EchoClient` in tests.  Required whenever
+        ``schema`` is given.
+    :param policy: chooses preprocessing ops per page from its measured quality.
+        Defaults to :func:`default_policy`.  Pass :func:`Policies.ocr_policy` or
+        else :func:`Policies.vlm_policy` to bias for one reader, a callable of
+        your own for full control, or ``None`` to skip preprocessing entirely --
+        the honest baseline when measuring whether preprocessing earns its keep.
+    :param router: picks a backend per page, e.g. native text layer for digital
+        pages and a VLM for photographed ones.  Defaults to the
+        rule-based :func:`default_router`; see also :class:`RuleRouter`
+        and :class:`BudgetRouter`.  ``None`` sends every page to ``backend``.
+    :param backend: force one reader for every page, as a registered name
+        (``"pymupdf"``, ``"tesseract"``, ``"paddle"``, ``"anthropic"``) or an
+        instance of :class:`TextBackend`.  Overrides ``router`` when both given.
+    :param validators: business rules run over the extracted object; each
+        outcome feeds the confidence of the fields it touched.  The
+        namespace :class:`Validators` holds the ready-made ones.
+    :param kwargs: forwarded to :class:`Pipeline` -- ``render_dpi``,
+        ``max_pages``, ``max_workers``, ``split_pages``, ``normalize``,
+        ``budget``, ``calibrator``, ``name``.
+    :returns: an :class:`Extraction` carrying the parsed object, per-field
+        confidence and provenance, the read document, the
+        accumulated :class:`Cost`, and any warnings.  A failure that costs one
+        page rather than the whole document arrives as a warning, not an
+        exception.
+    :raises ConfigError: a ``schema`` was given without a ``client``
+    :raises IngestError: ``source`` could not be read as a document
+    :raises BudgetExceeded: a ``budget`` was set and reading would exceed it
+
+    Text only, no model call::
+
+        doc = docpipe.process("scan.pdf").document
+        print(doc.text())
+
+    A schema, with domain context and a validator::
+
+        result = docpipe.process(
+            "bill.pdf",
+            schema={"patient": str, "total": float, "bill_date": str},
+            context="Indian private hospital bill, INR",
+            client=docpipe.AnthropicClient(),
+            validators=[docpipe.Validators.line_items_sum_to_total],
+        )
+        print(result.value("total"), result.confidence("total"))
+        for field in result.low_confidence(threshold=0.7):
+            print("review by hand:", field.name, field.confidence)
+
+    Cheap OCR, no VLM, capped at the first 20 pages::
+
+        result = docpipe.process("bundle.pdf", backend="tesseract", router=None,
+                                 policy=docpipe.Policies.ocr_policy, max_pages=20)
+    """
     pipeline = Pipeline(policy=policy, router=router, backend=backend, schema=schema,
                         context=context, client=client,
                         validators=list(validators or []), **kwargs)
@@ -9339,72 +10643,52 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
 # 16. Public surface
 # =============================================================================
 
+# The export surface is deliberately namespaced.  Groups of free functions that
+# share a subject -- raster primitives, quality measures, ops, parsers -- are
+# reachable as staticmethods on a namespace class (``Image.to_gray``), and only
+# the class is exported.  The flat names (``to_gray``) remain module attributes
+# for every existing caller and are how the staticmethods reach one another, but
+# they are not re-exported: one name per subject keeps ``import *`` and the
+# generated reference honest about what this library actually offers.
 __all__ = [
     # errors
     "DocpipeError", "MissingDependency", "IngestError", "BackendError",
     "ExtractionError", "ConfigError", "BudgetExceeded",
-    # capabilities / utilities
-    "capabilities", "have", "require", "set_opencv_enabled", "without_opencv",
-    "stable_hash", "array_hash", "clamp", "percentile", "levenshtein",
-    "similarity", "Timer", "retry_call", "to_json",
+    # namespaces -- grouped free functions, see the note above
+    "Caps", "Util", "Image", "Quality", "Ingest", "Ops", "Policies", "Pricing",
+    "Text", "Confidence", "Validators",
+    # utilities
+    "Timer",
     # IR
     "PageKind", "Verdict", "RegionKind", "BBox", "TextSpan", "PageQuality",
     "LayoutRegion", "Layout", "OpRecord", "Page", "Document", "Cost",
     "merge_bboxes", "DEFAULT_DPI", "DEFAULT_IMAGE_DPI",
-    # image primitives
-    "to_gray", "to_rgb", "ensure_uint8", "resize_image", "rotate_image",
-    "gaussian_blur", "box_blur", "median_blur", "otsu_threshold", "ink_mask",
-    "window_stats", "morph_binary", "gradient_magnitude", "encode_png",
-    "encode_jpeg", "decode_image", "save_image", "estimate_background",
-    "row_projection_at_angle",
     # ingest
-    "sniff_format", "ingest", "ingest_pdf", "ingest_image", "ingest_tiff",
-    "ingest_email", "ingest_dir", "merge_documents", "page_from_image",
-    "document_from_images", "classify_page_kind", "MIN_NATIVE_CHARS",
+    "MIN_NATIVE_CHARS",
     # quality
-    "QualityThresholds", "DEFAULT_THRESHOLDS", "measure_quality", "measure_page",
-    "measure_document", "measure_blur", "measure_contrast", "measure_noise",
-    "measure_illumination", "measure_ink_coverage", "estimate_skew",
-    "estimate_effective_dpi", "estimate_line_pitch", "estimate_stroke_width",
-    "classify_quality",
+    "QualityThresholds", "DEFAULT_THRESHOLDS",
     # preprocessing
-    "Op", "CompositeOp", "compose", "apply_ops", "register_op", "op_from_dict",
-    "OP_FACTORIES", "to_grayscale", "invert_if_dark", "autocontrast", "gamma",
-    "clahe", "normalize_illumination", "remove_shadow", "rescale", "ensure_dpi",
-    "resize_max_side", "deskew", "rotate", "auto_orient", "crop_to_content",
-    "remove_border", "pad", "perspective_correct", "denoise", "despeckle",
-    "unsharp", "morphology", "binarize", "binarize_array", "remove_lines",
-    "remove_stamps", "split_multi_bill_page", "split_document",
-    "default_policy", "ocr_policy", "vlm_policy", "no_policy", "fixed_policy",
-    "preprocess",
+    "Op", "OpFactory", "CompositeOp", "compose", "apply_ops", "register_op",
+    "op_from_dict", "OP_FACTORIES", "preprocess",
     # backends
     "ReadResult", "TextBackend", "BaseBackend", "BackendRegistry", "registry",
     "PyMuPDFTextLayer", "TesseractOCR", "PaddleOCRBackend", "RapidOCRBackend",
     "EasyOCRBackend", "DocTRBackend", "SuryaBackend", "VisionBackend",
-    "AnthropicVisionBackend", "OpenAIVisionBackend", "CachingBackend",
+    "AnthropicVisionBackend", "OpenAIVisionBackend", "GeminiVisionBackend",
+    "CachingBackend",
     "RetryingBackend", "EnsembleBackend", "default_router", "RuleRouter",
-    "BudgetRouter", "read", "read_page", "PRICING", "set_pricing",
-    "price_tokens", "estimate_image_tokens", "DEFAULT_OCR_PROMPT",
-    # normalisation
-    "detect_script", "normalize_digits", "normalize_unicode",
-    "normalize_whitespace", "normalize_text", "fix_ocr_confusions",
-    "parse_amount", "parse_date", "parse_bool", "detect_currency",
-    "normalize_spans", "normalize_document",
+    "BudgetRouter", "read", "read_page", "PRICING", "DEFAULT_OCR_PROMPT",
     # cross-cutting
     "DiskCache", "Tracer", "TraceSpan", "CostTracker",
     # confidence
-    "logit", "sigmoid", "fuse_confidence", "DEFAULT_CONFIDENCE_WEIGHTS",
-    "page_quality_prior", "align_spans", "cross_read_agreement",
-    "value_agreement", "format_match_score", "Calibrator", "IdentityCalibrator",
-    "PlattCalibrator", "IsotonicCalibrator", "reliability_curve",
-    "expected_calibration_error", "brier_score",
+    "DEFAULT_CONFIDENCE_WEIGHTS", "Calibrator", "IdentityCalibrator",
+    "PlattCalibrator", "IsotonicCalibrator",
     # extraction
     "FieldSpec", "SchemaAdapter", "coerce_value", "build_extraction_prompt",
     "format_document_text", "chunk_pages", "DEFAULT_EXTRACTION_SYSTEM",
     "LLMClient", "BaseLLMClient", "EchoClient", "AnthropicClient", "OpenAIClient",
     "parse_json_lenient", "Evidence", "locate_value", "backend_confidence_for",
-    "ValidationIssue", "run_validators", "line_items_sum_to_total", "date_order",
-    "field_matches", "required_fields", "FieldResult", "Extraction", "extract",
+    "ValidationIssue", "FieldResult", "Extraction", "extract",
     "merge_extracted_data", "FieldRule", "extract_with_rules",
     # eval
     "EvalCase", "FieldOutcome", "CaseResult", "compare_values", "EvalSuite",

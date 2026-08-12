@@ -25,7 +25,7 @@ import os
 import re
 import sys
 import textwrap
-from typing import List, Optional, Tuple
+from typing import List, Optional, Tuple, Union
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(HERE)
@@ -106,7 +106,8 @@ def read_sections(lines: List[str]) -> List[Section]:
     return sections
 
 
-def signature_of(lines: List[str], node: ast.AST) -> str:
+def signature_of(lines: List[str],
+                 node: Union[ast.FunctionDef, ast.AsyncFunctionDef]) -> str:
     """The exact source text of a def's signature, minus the trailing colon."""
     start = node.lineno - 1
     end = node.body[0].lineno - 1
@@ -191,7 +192,7 @@ def module_constants(lines: List[str], tree: ast.Module,
             doc = " ".join(above).strip()
         if not doc and name not in exported:
             continue
-        value = ast.unparse(stmt.value) if getattr(stmt, "value", None) else ""
+        value = ast.unparse(stmt.value) if stmt.value is not None else ""
         if len(value) > 90:
             value = value[:88] + "..."
         out.append((stmt.lineno, Entry(name, "data", "%s = %s" % (name, value),
@@ -210,7 +211,8 @@ def collect(path: str):
     exported = set()
     for stmt in tree.body:
         if isinstance(stmt, ast.Assign) and any(
-                getattr(t, "id", "") == "__all__" for t in stmt.targets):
+                getattr(t, "id", "") == "__all__" for t in stmt.targets) and \
+                isinstance(stmt.value, (ast.List, ast.Tuple)):
             for elt in stmt.value.elts:
                 if isinstance(elt, ast.Constant) and isinstance(elt.value, str):
                     exported.add(elt.value)
@@ -398,7 +400,9 @@ def render_doc(text: str, heading_level: int = 3) -> str:
                         and (len(lines[i]) - len(lines[i].lstrip())) > 0:
                     body.append(lines[i].strip())
                     i += 1
-                label = name if kind == "param" else kind
+                # ':raises ConfigError:' carries the exception in the name slot;
+                # dropping it would render every raises clause as bare "raises".
+                label = name if kind == "param" else ("%s %s" % (kind, name) if name else kind)
                 items.append((label, " ".join(b for b in body if b)))
             out.append("<dl class='fields'>")
             for label, body in items:
@@ -889,7 +893,7 @@ def build(source: str, out_path: str, fragment: bool = False) -> str:
 
 
 def main(argv: Optional[List[str]] = None) -> int:
-    parser = argparse.ArgumentParser(description=__doc__.split("\n")[0])
+    parser = argparse.ArgumentParser(description=(__doc__ or "").split("\n")[0])
     parser.add_argument("-o", "--out", default=os.path.join(ROOT, "site", "index.html"),
                         help="output HTML path (default: site/index.html)")
     parser.add_argument("--source", default=SOURCE, help="path to docpipe.py")

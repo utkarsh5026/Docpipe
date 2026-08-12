@@ -8,11 +8,14 @@ OCR/VLM reading backends, schema-driven extraction with provenance, calibrated
 confidence fusion, and an evaluation harness.
 
 Everything lives in **one file** on purpose. Copy `docpipe.py` into a project,
-or `pip install docpipe` — both work, and neither requires a build step.
+or `pip install docpipe-core` — both work, and neither requires a build step.
 
 ```bash
-pip install "docpipe[core,schema]"      # or just: cp docpipe.py yourproject/
+pip install "docpipe-core[core,schema]"   # or just: cp docpipe.py yourproject/
 ```
+
+The distribution is named `docpipe-core` because `docpipe` on PyPI is an
+unrelated project. The import name is unchanged: `import docpipe`.
 
 ---
 
@@ -58,8 +61,8 @@ follow, and they shape the whole library:
 ```python
 import docpipe as dp
 
-doc = dp.ingest("claim_47812.pdf")            # PDF, image, TIFF, or .eml
-doc = dp.preprocess(doc, policy=dp.default_policy)
+doc = dp.Ingest.ingest("claim_47812.pdf")            # PDF, image, TIFF, or .eml
+doc = dp.preprocess(doc, policy=dp.Policies.default_policy)
 doc = dp.read(doc, router=dp.default_router)
 
 print(doc.text())
@@ -93,8 +96,8 @@ result = dp.extract(
             "Dates may be DD-MM-YYYY or DD/MM/YY.",
     client=dp.AnthropicClient(model="claude-sonnet-5"),
     validators=[
-        dp.line_items_sum_to_total(),
-        dp.date_order("admission_date", "discharge_date"),
+        dp.Validators.line_items_sum_to_total(),
+        dp.Validators.date_order("admission_date", "discharge_date"),
     ],
 )
 
@@ -152,12 +155,12 @@ Two details that matter more than they look:
 ```python
 def default_policy(page):
     ops = []
-    if page.quality.illumination < 0.55:  ops.append(dp.normalize_illumination())
-    if page.quality.noise > 0.35:         ops.append(dp.denoise("light"))
-    if page.quality.effective_dpi < 300:  ops.append(dp.ensure_dpi(300))
-    if abs(page.quality.skew_deg) > 0.4:  ops.append(dp.deskew())
-    if page.quality.blur < 0.35:          ops.append(dp.unsharp(amount=1.2))
-    if page.quality.contrast < 0.30:      ops.append(dp.autocontrast())
+    if page.quality.illumination < 0.55:  ops.append(dp.Ops.normalize_illumination())
+    if page.quality.noise > 0.35:         ops.append(dp.Ops.denoise("light"))
+    if page.quality.effective_dpi < 300:  ops.append(dp.Ops.ensure_dpi(300))
+    if abs(page.quality.skew_deg) > 0.4:  ops.append(dp.Ops.deskew())
+    if page.quality.blur < 0.35:          ops.append(dp.Ops.unsharp(amount=1.2))
+    if page.quality.contrast < 0.30:      ops.append(dp.Ops.autocontrast())
     return ops
 ```
 
@@ -185,7 +188,7 @@ recorded in an eval report and reproduced exactly.
 
 Shipped: `PyMuPDFTextLayer` · `TesseractOCR` · `PaddleOCRBackend` ·
 `RapidOCRBackend` · `EasyOCRBackend` · `DocTRBackend` · `SuryaBackend` ·
-`AnthropicVisionBackend` · `OpenAIVisionBackend`.
+`AnthropicVisionBackend` · `OpenAIVisionBackend` · `GeminiVisionBackend`.
 
 Wrappers: `CachingBackend` (keyed on raster content), `RetryingBackend`
 (accounts for attempts the provider already billed), `EnsembleBackend` (two
@@ -292,7 +295,7 @@ into CI.
 ## Dependencies
 
 The core is pure standard library. Everything heavier is optional and imported
-lazily; `dp.capabilities()` reports what is actually usable right now.
+lazily; `dp.Caps.capabilities()` reports what is actually usable right now.
 
 | Extra | Enables |
 |---|---|
@@ -314,7 +317,7 @@ meant to be dropped into old codebases.
 reads `0.00` and warns once until you register what your account actually pays:
 
 ```python
-dp.set_pricing("claude-sonnet-5", input_per_mtok=3.00, output_per_mtok=15.00)
+dp.Pricing.set_pricing("claude-sonnet-5", input_per_mtok=3.00, output_per_mtok=15.00)
 ```
 
 A wrong price is worse than a missing one — it produces a plausible budget
@@ -325,7 +328,7 @@ report that nobody rechecks.
 ## Testing
 
 ```bash
-pip install "docpipe[dev]"
+pip install "docpipe-core[dev]"
 pytest                      # ~660 tests, about 75 seconds
 ```
 
@@ -363,6 +366,40 @@ The generator reads the source with `ast` rather than importing it, so it needs
 no dependencies — not even docpipe's optional ones — and the reference cannot
 drift from the code it documents. CI fails if a name in `__all__` is missing
 from the page.
+
+### Namespaces
+
+One file does not have to mean one flat heap of names. Functions that share a
+subject are grouped onto a namespace class, and only the class is exported:
+
+| | |
+|---|---|
+| `Caps` | what is importable right now; the OpenCV kill switch |
+| `Util` | hashing, clamping, string distance, JSON coercion |
+| `Image` | raster primitives — arrays in, arrays out |
+| `Quality` | page-quality measures and estimators |
+| `Ingest` | bytes of unknown provenance → `Document` |
+| `Ops` | the preprocessing ops, as `Op` factories |
+| `Policies` | measured page → the ops it needs |
+| `Pricing` | token accounting and the optional price table |
+| `Text` | script detection, normalisation, value parsing |
+| `Confidence` | signal fusion and calibration metrics |
+| `Validators` | domain-independent validator factories |
+
+Stateful classes (`Page`, `BaseBackend`, `EvalSuite`) and the layer entry points
+(`read`, `preprocess`, `extract`, `process`) stay top-level.
+
+Every one of those staticmethods is *also* a module attribute under its bare
+name — `dp.to_gray` and `dp.Image.to_gray` are the same object, so nothing
+written against an earlier version breaks:
+
+```python
+dp.Image.to_gray(img)   # the documented path
+dp.to_gray(img)         # identical, and still supported
+```
+
+What changed is `__all__`, which went from 221 names to 113. `from docpipe import *`
+now gives you eleven namespaces instead of two hundred loose functions.
 
 ---
 

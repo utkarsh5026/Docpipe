@@ -1,0 +1,156 @@
+// Workspace settings for docpipe.  Checked in on purpose: the repo's promises
+// (a 3.8 floor, zero required dependencies, one file, no reformatting) are
+// easier to keep when the editor is pointed at them from the first minute.
+//
+// These are workspace-scoped and override your user settings only inside this
+// folder.  Anything genuinely personal (theme, font, interpreter path) is left
+// out so it stays yours.
+{
+  // ---------------------------------------------------------------------
+  // Interpreter and analysis
+  // ---------------------------------------------------------------------
+
+  // `python.defaultInterpreterPath` is deliberately absent: the extension
+  // already discovers `.venv/` in the workspace root, and hard-coding a path
+  // that does not exist on someone else's machine is worse than no setting.
+  // Create one with:  python -m venv .venv && .venv/bin/pip install -e ".[dev]"
+
+  // Type-checking rules come from `[tool.pyright]` in pyproject.toml -- pinned
+  // to pythonVersion 3.8 -- so Pylance here reports what `pyright` reports in a
+  // terminal.  Do not duplicate those keys below; duplicating them is how the
+  // editor and CI start disagreeing.  Only settings with no pyproject
+  // equivalent belong here.
+  //
+  // Constraint 8 in CLAUDE.md is "zero errors across the repo", not "zero
+  // errors in the file you happen to have open", so analyse the whole
+  // workspace rather than just open files.
+  "python.analysis.diagnosticMode": "workspace",
+  "python.analysis.autoImportCompletions": false,
+  "python.analysis.inlayHints.functionReturnTypes": true,
+  "python.analysis.inlayHints.pytestParameters": true,
+
+  // ---------------------------------------------------------------------
+  // Tests
+  // ---------------------------------------------------------------------
+
+  // Discovery config (testpaths, python_files, addopts) lives in
+  // `[tool.pytest.ini_options]`, so no args are repeated here.
+  "python.testing.pytestEnabled": true,
+  "python.testing.unittestEnabled": false,
+  "python.testing.pytestArgs": [],
+
+  // The pure-NumPy image fallbacks are a promise, not a fallback of last
+  // resort.  To exercise them in the Test Explorer, flip this to "1", reload,
+  // and run tests/test_image_ops.py, test_quality.py and test_preprocess.py --
+  // or just use the "test: no OpenCV" task, which does it without a reload.
+  "python.testing.pytestPath": "pytest",
+
+  // ---------------------------------------------------------------------
+  // Editing
+  // ---------------------------------------------------------------------
+
+  // No formatter is configured, and that is the setting -- not an omission.
+  // docpipe.py is one ~9,400-line file with hand-managed alignment and
+  // %-formatting throughout; a format-on-save pass would produce a diff nobody
+  // can review and bury the actual change.  Match the surrounding code by hand.
+  "editor.formatOnSave": false,
+  "editor.formatOnPaste": false,
+  "[python]": {
+    "editor.formatOnSave": false,
+    "editor.tabSize": 4,
+    "editor.insertSpaces": true,
+    // A 9,400-line file is much easier to navigate when the section banner and
+    // enclosing namespace class stay pinned at the top of the viewport.
+    "editor.stickyScroll.enabled": true,
+    "editor.wordBasedSuggestions": "off"
+  },
+
+  // The file's own habit: 160 lines pass 88 columns, only 2 pass 100.
+  // First ruler is the target, second is the wall.
+  "editor.rulers": [88, 100],
+  "files.trimTrailingWhitespace": true,
+  "files.insertFinalNewline": true,
+  "files.trimFinalNewlines": true,
+  "files.encoding": "utf8",
+  "files.eol": "\n",
+
+  "[markdown]": {
+    "editor.wordWrap": "on",
+    // Trailing double-space is a hard line break in Markdown; trimming it
+    // silently rewrites the rendered README.
+    "files.trimTrailingWhitespace": false
+  },
+
+  // ---------------------------------------------------------------------
+  // Explorer and search
+  // ---------------------------------------------------------------------
+
+  "files.exclude": {
+    "**/__pycache__": true,
+    "**/*.pyc": true,
+    "**/.pytest_cache": true,
+    "**/*.egg-info": true,
+    ".ruff_cache": true
+  },
+  "search.exclude": {
+    // Build output of docs/build_reference.py -- generated, never committed.
+    "site": true,
+    // Local sample documents (gitignored); they are binary noise in results.
+    "pdfs": true,
+    "**/.venv": true
+  },
+  "files.watcherExclude": {
+    "**/site/**": true,
+    "**/.venv/**": true,
+    "**/__pycache__/**": true
+  },
+
+  // ---------------------------------------------------------------------
+  // Notebooks
+  // ---------------------------------------------------------------------
+
+  // examples/hospital_bill.ipynb resolves paths relative to the repo root, and
+  // needs only `pip install -e ".[notebook]"` -- no OCR engine, no API key.
+  "jupyter.notebookFileRoot": "${workspaceFolder}",
+  "notebook.output.textLineLimit": 60,
+
+  // ---------------------------------------------------------------------
+  // Prose
+  // ---------------------------------------------------------------------
+
+  // Comments and docstrings use British spelling; identifiers are US-spelled.
+  // en-GB alone would flag the public API names, so both dictionaries are on.
+  "cSpell.language": "en,en-GB",
+  "cSpell.words": [
+    "binarise",
+    "binarize",
+    "deskew",
+    "docpipe",
+    "doctr",
+    "dpi",
+    "easyocr",
+    "genai",
+    "logprob",
+    "paddleocr",
+    "pymupdf",
+    "pyright",
+    "pytesseract",
+    "rapidocr",
+    "rasterise",
+    "staticmethod",
+    "staticmethods",
+    "surya",
+    "tesseract",
+    "uint",
+    "vlm",
+    "vlms"
+  ],
+
+  // ---------------------------------------------------------------------
+  // Git
+  // ---------------------------------------------------------------------
+
+  // Work happens on a branch; releases are tags on main.
+  "git.branchProtection": ["main"],
+  "git.inputValidationSubjectLength": 72
+}
