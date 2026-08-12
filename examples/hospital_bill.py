@@ -64,9 +64,9 @@ def gross_minus_discount_is_total(bill):
 
 VALIDATORS = [
     gross_minus_discount_is_total,
-    dp.date_order("admission_date", "discharge_date"),
-    dp.field_matches("bill_number", r"\w"),
-    dp.required_fields("hospital_name", "total"),
+    dp.Validators.date_order("admission_date", "discharge_date"),
+    dp.Validators.field_matches("bill_number", r"\w"),
+    dp.Validators.required_fields("hospital_name", "total"),
 ]
 
 
@@ -126,12 +126,12 @@ def synthetic_scan():
         y += 42
 
     scan = np.array(image).astype(float)
-    scan *= np.linspace(1.0, 0.6, scan.shape[1])[None, :]        # a shadow
-    scan = dp.gaussian_blur(dp.ensure_uint8(scan), 1.1)          # soft focus
+    scan *= np.linspace(1.0, 0.6, scan.shape[1])[None, :]       # a shadow
+    scan = dp.Image.gaussian_blur(dp.Image.ensure_uint8(scan), 1.1)   # soft focus
     scan = scan.astype(float) + np.random.RandomState(0).normal(0, 9, scan.shape)
-    scan = dp.rotate_image(dp.ensure_uint8(np.clip(scan, 0, 255)),
-                           -2.4, border_value=235)               # crooked feed
-    return dp.resize_image(scan, scale=0.55)                     # low resolution
+    scan = dp.Image.rotate_image(dp.Image.ensure_uint8(np.clip(scan, 0, 255)),
+                                 -2.4, border_value=235)        # crooked feed
+    return dp.Image.resize_image(scan, scale=0.55)              # low resolution
 
 
 class StubOCR(dp.BaseBackend):
@@ -167,29 +167,29 @@ def main():
     else:
         client = dp.EchoClient(STUB_RESPONSE)
         backend = StubOCR()
-        source = dp.encode_png(synthetic_scan())
+        source = dp.Image.encode_png(synthetic_scan())
         print("Extracting a synthetic degraded scan with stubbed OCR and model\n")
 
     # -- ingest ------------------------------------------------------------
-    doc = dp.ingest(source, filename="bill.png", dpi=150)
+    doc = dp.Ingest.ingest(source, filename="bill.png", dpi=150)
     print("ingested: %s" % doc)
 
     # -- measure -----------------------------------------------------------
-    dp.measure_document(doc)
+    dp.Quality.measure_document(doc)
     page = doc.pages[0]
     print("\nmeasured quality:")
     print("  %s" % page.quality)
     print("  policy would apply: %s"
-          % ([op.name for op in dp.default_policy(page)] or "nothing"))
+          % ([op.name for op in dp.Policies.default_policy(page)] or "nothing"))
 
     # -- preprocess and read ----------------------------------------------
-    doc = dp.preprocess(doc, policy=dp.default_policy)
+    doc = dp.preprocess(doc, policy=dp.Policies.default_policy)
     print("\nafter preprocessing:")
     print("  %s" % doc.pages[0].quality)
     print("  history: %s" % doc.pages[0].history_summary())
 
     doc = dp.read(doc, backend=backend)
-    doc = dp.normalize_document(doc, in_place=True)
+    doc = dp.Text.normalize_document(doc, in_place=True)
     print("\nread %d characters via %s" % (doc.char_count, doc.meta["read_backends"]))
 
     # -- extract -----------------------------------------------------------

@@ -249,13 +249,23 @@ class TestComparison:
         assert any(r["metric"] == "cost_per_doc" for r in regressions)
 
     def test_tolerance_is_relative_for_unbounded_metrics(self, eval_dataset, tmp_path):
-        """0.05 must mean 'five percent slower/pricier', not '0.05 milliseconds
-        slower' -- otherwise scheduler noise fails every build."""
+        """0.05 must mean 'five percent pricier', not '0.05 dollars pricier' --
+        otherwise the budget is meaningless at any real cost scale.
+
+        A 0.30 rise on a 10.00 baseline is 3%: inside a *relative* 5% budget and
+        six times an *absolute* one, so this passes only under relative
+        semantics.  Scoped to ``cost_per_doc`` because the other unbounded
+        metrics are wall-clock, and 5% of a sub-millisecond baseline is
+        scheduler noise -- comparing them made this test flaky.
+        """
         suite = dp.EvalSuite.from_dir(eval_dataset)
         path = str(tmp_path / "b.json")
-        suite.run({"p": make_pipeline(cost=dp.Cost(amount=0.010, calls=1))}).save(path)
-        current = suite.run({"p": make_pipeline(cost=dp.Cost(amount=0.0102, calls=1))})
-        assert current.regression_vs(path, tolerance=0.05)["regressed"] is False
+        suite.run({"p": make_pipeline(cost=dp.Cost(amount=10.00, calls=1))}).save(path)
+        current = suite.run({"p": make_pipeline(cost=dp.Cost(amount=10.30, calls=1))})
+        outcome = current.regression_vs(path, tolerance=0.05,
+                                        metrics=["cost_per_doc"])
+        assert outcome["current_metrics"]["cost_per_doc"] == 10.30
+        assert outcome["regressed"] is False
 
     def test_a_real_cost_increase_still_fails(self, eval_dataset, tmp_path):
         suite = dp.EvalSuite.from_dir(eval_dataset)
