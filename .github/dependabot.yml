@@ -1,0 +1,50 @@
+# Dependency updates.  Two ecosystems are in play here and they matter very
+# differently: the Actions pins are the only versions this repo actually
+# *pins*, so they are the ones that rot.  The Python side declares floors
+# (`>=`), which any newer release already satisfies -- Dependabot only opens a
+# PR there when a floor becomes genuinely unsatisfiable.
+version: 2
+
+updates:
+  # ci.yml, docs.yml and publish.yml pin actions/checkout, actions/setup-python,
+  # the Pages actions and the artifact actions to a major tag.  A major bump is
+  # the one that breaks a release, so it should arrive as a reviewable PR rather
+  # than as a surprise on a tag push.
+  #
+  # Note that `pypa/gh-action-pypi-publish@release/v1` in publish.yml is a
+  # *branch* ref, deliberately: Trusted Publishing guidance is to track that
+  # branch.  Dependabot leaves branch refs alone, so it stays as it is.
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+    # One PR for all of them: they are first-party GitHub actions that move
+    # together, and three separate PRs to re-run the same CI gate is noise.
+    groups:
+      github-actions:
+        patterns: ["*"]
+    labels: ["dependencies", "ci"]
+    commit-message:
+      prefix: "ci"
+
+  # pyproject.toml.  The core has `dependencies = []` on purpose, so this only
+  # ever touches the optional extras and the dev tooling (pytest, build, twine).
+  - package-ecosystem: "pip"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+    open-pull-requests-limit: 5
+    groups:
+      python-dev:
+        patterns: ["pytest*", "build", "twine"]
+    labels: ["dependencies", "python"]
+    commit-message:
+      prefix: "deps"
+    ignore:
+      # The 3.8 floor is a promise, not an accident.  Anything that drops 3.8
+      # support would raise the floor by the back door, so those bumps are
+      # declined here and taken deliberately if ever.
+      - dependency-name: "numpy"
+        update-types: ["version-update:semver-major"]
+      - dependency-name: "pydantic"
+        update-types: ["version-update:semver-major"]
