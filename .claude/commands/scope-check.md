@@ -26,8 +26,8 @@ Hunt for these specifically — they are the ways it actually creeps in:
 1. **Named business entities in core.** No `HospitalBill`, no `FIRDocument`, no claim or
    policy vocabulary in a type name, field name or docstring example that only makes sense
    for insurance or legal work. Schemas belong to projects, always.
-2. **Business validation dressed as generic validation.** `line_items_sum_to_total` and
-   `date_order` are legitimate — they are arithmetic and ordering, true of any document with
+2. **Business validation dressed as generic validation.** `Validators.line_items_sum_to_total`
+   and `Validators.date_order` are legitimate — they are arithmetic and ordering, true of any document with
    line items or a date range. A tariff lookup, a policy-number format, or a payer-specific
    rule is not.
 3. **Hardcoded constants that are really one corpus's priors.** Thresholds and fusion weights

@@ -16,20 +16,32 @@ only makes sense for one domain's paperwork, it belongs in that project, not her
 README.md's *Scope boundary*). Say in one sentence which distortion this inverts. If you
 cannot, stop and say so rather than adding it.
 
-## 2. Implement in section 7
+## 2. Implement on the `Ops` class in section 7
 
-Place it near ops of the same family — geometric ops, tonal ops, removal ops — not at the end
-of the section.
+Ops are staticmethods on the `Ops` namespace class. Place it near ops of the same family —
+geometric ops, tonal ops, removal ops — not at the end of the class.
 
 ```python
-@register_op("my_op", geometric=False, needs_raster=True)
-def my_op(img: ImageArray, page: Page, strength: float = 1.0) -> Optional[ImageArray]:
-    """What distortion this corrects.
+class Ops(object):
+    ...
+    @staticmethod                                        # outermost, above @register_op
+    @register_op("my_op", geometric=False, needs_raster=True)
+    def my_op(img: ImageArray, page: Page, strength: float = 1.0) -> Optional[ImageArray]:
+        """What distortion this corrects.
 
-    Then the part a reader cannot get from the code: why the threshold is where it is,
-    what it costs when it fires needlessly, and when it deliberately does nothing.
-    """
+        Then the part a reader cannot get from the code: why the threshold is where it is,
+        what it costs when it fires needlessly, and when it deliberately does nothing.
+        """
 ```
+
+Then add the module-level alias with the others in the block below the class:
+
+```python
+my_op = Ops.my_op
+```
+
+That alias is not optional bookkeeping: ops call each other and the `Image.*` primitives
+through the bare names, resolved from module globals at call time.
 
 Requirements:
 
@@ -48,12 +60,13 @@ Requirements:
 
 ## 3. Wire it up
 
-- Add the public name to `__all__` in section 16, in the preprocessing group.
-- Decide whether `default_policy` should reach for it, and if so under what measured
+- **`__all__` does not change** — `Ops` is already exported, and the alias is deliberately
+  not re-exported. Only a brand-new namespace or top-level object earns an `__all__` entry.
+- Decide whether `Policies.default_policy` should reach for it, and if so under what measured
   condition. If it should not be automatic, say why in the docstring — an op nobody's policy
   invokes needs a reason to exist.
-- Check whether `ocr_policy` / `vlm_policy` differ here. Binarisation is the precedent:
-  helps classical OCR, hurts VLMs.
+- Check whether `Policies.ocr_policy` / `Policies.vlm_policy` differ here. Binarisation is
+  the precedent: helps classical OCR, hurts VLMs.
 
 ## 4. Test it in `tests/test_preprocess.py`
 
@@ -71,7 +84,7 @@ ground-truth word boxes, then asserting the measurement recovers the known value
 ```bash
 pytest -q tests/test_preprocess.py tests/test_image_ops.py
 DOCPIPE_DISABLE_OPENCV=1 pytest -q tests/test_preprocess.py
-python docs/build_reference.py --out /tmp/ref.html && grep -c "id='my_op'" /tmp/ref.html
+python docs/build_reference.py --out /tmp/ref.html && grep -c "id='Ops-my_op'" /tmp/ref.html
 ```
 
 Then report: what it corrects, when it fires, whether any policy calls it, and the test

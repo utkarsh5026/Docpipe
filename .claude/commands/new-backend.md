@@ -48,7 +48,7 @@ Requirements:
   nothing. A made-up 0.99 corrupts confidence fusion downstream.
 - **Override `estimate_cost`** for anything paid, returning token counts. Do **not** add
   prices to `PRICING` — it ships empty on purpose, and consumers register their own via
-  `set_pricing`.
+  `Pricing.set_pricing`.
 - **Swallow per-page failures deliberately or not at all.** If you catch, say in the
   docstring why one bad page must not cost the whole document, and record it on the page.
 - Python 3.8, `%`-formatting, full docstrings on every method.

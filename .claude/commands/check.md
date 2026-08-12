@@ -36,12 +36,40 @@ builtins.__import__ = guard
 import docpipe
 assert docpipe.parse_amount("1,23,456.78") is not None
 assert docpipe.fuse_confidence({"validation": 0.9}) > 0.5
+assert docpipe.Text.parse_amount("1,23,456.78") is not None
+assert docpipe.Confidence.fuse_confidence({"validation": 0.9}) > 0.5
 print("core imports and runs with no optional dependencies")
 PY
 ```
 
 Failure means a heavy import escaped to module scope. Move it behind `require(...)` or
 `have(...)` at the point of use — never a top-level `import numpy`.
+
+## Gate 2b — every namespaced staticmethod keeps its module-level alias
+
+The aliases are load-bearing: staticmethods call one another through the bare names,
+resolved from module globals at call time, so a missing alias fails only at runtime.
+
+```bash
+python - <<'PY'
+import docpipe, sys
+names = ["Caps", "Util", "Image", "Quality", "Ingest", "Ops",
+         "Policies", "Pricing", "Text", "Confidence", "Validators"]
+bad = []
+for cls_name in names:
+    cls = getattr(docpipe, cls_name)
+    for attr, raw in vars(cls).items():
+        if attr.startswith("_") or not isinstance(raw, staticmethod):
+            continue
+        if getattr(docpipe, attr, None) is not getattr(cls, attr):
+            bad.append("%s.%s" % (cls_name, attr))
+if bad:
+    sys.exit("missing or mismatched module-level alias: %s" % ", ".join(bad))
+total = sum(len([a for a, r in vars(getattr(docpipe, n)).items()
+                 if isinstance(r, staticmethod)]) for n in names)
+print("%d staticmethods across %d namespaces, all aliased" % (total, len(names)))
+PY
+```
 
 ## Gate 3 — install state
 
