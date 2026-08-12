@@ -85,6 +85,18 @@ document.
 and ships in the library because consumers need it too. `TruthBackend` (conftest) makes a
 controlled number of mistakes so accuracy assertions are exact, not plausible.
 
+**8. `pyright` reports zero errors across the repo.** Not CI-enforced (yet), but `pyright`
+with no arguments reads `[tool.pyright]` in `pyproject.toml` — pinned to `pythonVersion
+3.8`, so an annotation needing a newer stdlib fails here before it fails the parse gate.
+Pylance in an editor picks up the same settings.
+
+Fix the *annotation*, not the symptom. Most of what a checker finds here is the source
+lying: a `__exit__` typed `-> bool` claims it may swallow exceptions (making everything
+after a `with` block possibly-unbound), `parse_amount(text: str)` when the body explicitly
+handles `None`, `compose() -> Op` when it always returns a `CompositeOp`. `cast` is fine for
+genuine duck typing across an optional dependency; a blanket `# type: ignore` on a real
+mismatch is not.
+
 ## Scope boundary
 
 The library owns everything that does not depend on what a document *means*. Domain schemas,
