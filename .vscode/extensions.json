@@ -1,0 +1,31 @@
+// Extensions VS Code offers to install when this folder is opened.
+{
+  "recommendations": [
+    // Interpreter selection, the Test Explorer and debugging.
+    "ms-python.python",
+    "ms-python.debugpy",
+    // Reads `[tool.pyright]` from pyproject.toml, so the editor reports the
+    // same type errors the `pyright` CLI does -- against the 3.8 floor.
+    "ms-python.vscode-pylance",
+    // examples/hospital_bill.ipynb.
+    "ms-toolsai.jupyter",
+    // pyproject.toml -- schema validation for the project metadata that CI
+    // cross-checks against __version__.
+    "tamasfe.even-better-toml",
+    // .github/workflows/{ci,docs,publish}.yml.
+    "github.vscode-github-actions",
+    // Docstrings are 100% coverage here and read as prose; the dictionaries
+    // are configured for British spelling in settings.json.
+    "streetsidesoftware.code-spell-checker"
+  ],
+
+  // Formatters and linters are not used in this repo, and installing one with
+  // format-on-save enabled would reflow a 9,400-line single file into an
+  // unreviewable diff.  See the note in settings.json.
+  "unwantedRecommendations": [
+    "ms-python.black-formatter",
+    "ms-python.autopep8",
+    "ms-python.isort",
+    "charliermarsh.ruff"
+  ]
+}

@@ -1,0 +1,112 @@
+// Debug configurations.  F5 with one selected in the Run and Debug panel.
+//
+// All of these run from the workspace root, so `import docpipe` picks up
+// ./docpipe.py whether or not the package is installed -- which is the same
+// thing a vendoring consumer gets.
+{
+  "version": "0.2.0",
+  "configurations": [
+    {
+      "name": "Python: current file",
+      "type": "debugpy",
+      "request": "launch",
+      "program": "${file}",
+      "console": "integratedTerminal",
+      "cwd": "${workspaceFolder}"
+    },
+    {
+      "name": "pytest: current file",
+      "type": "debugpy",
+      "request": "launch",
+      "module": "pytest",
+      // -q comes from pyproject; the debugger wants the traceback, not a dot.
+      "args": ["-vv", "--no-header", "${file}"],
+      "console": "integratedTerminal",
+      "cwd": "${workspaceFolder}"
+    },
+    {
+      "name": "pytest: current file, no OpenCV",
+      "type": "debugpy",
+      "request": "launch",
+      "module": "pytest",
+      "args": ["-vv", "--no-header", "${file}"],
+      // Forces the pure-NumPy path for every image op, the same way
+      // Caps.without_opencv() does in-process.
+      "env": { "DOCPIPE_DISABLE_OPENCV": "1" },
+      "console": "integratedTerminal",
+      "cwd": "${workspaceFolder}"
+    },
+    {
+      "name": "pytest: last failures",
+      "type": "debugpy",
+      "request": "launch",
+      "module": "pytest",
+      "args": ["-vv", "--no-header", "--last-failed"],
+      "console": "integratedTerminal",
+      "cwd": "${workspaceFolder}"
+    },
+    {
+      // "Debug Test" in the Test Explorer uses the config marked with this
+      // purpose.  justMyCode is off so a step-in can cross into numpy, cv2 or
+      // fitz -- where an image-op disagreement usually turns out to live.
+      "name": "pytest: debug the selected test",
+      "type": "debugpy",
+      "request": "launch",
+      "purpose": ["debug-test"],
+      "console": "integratedTerminal",
+      "justMyCode": false,
+      "cwd": "${workspaceFolder}"
+    },
+    {
+      "name": "docpipe CLI",
+      "type": "debugpy",
+      "request": "launch",
+      "module": "docpipe",
+      "args": ["${input:cliCommand}", "${input:documentPath}", "--verbose"],
+      "console": "integratedTerminal",
+      "cwd": "${workspaceFolder}"
+    },
+    {
+      "name": "docpipe CLI: caps",
+      "type": "debugpy",
+      "request": "launch",
+      "module": "docpipe",
+      "args": ["caps"],
+      "console": "integratedTerminal",
+      "cwd": "${workspaceFolder}"
+    },
+    {
+      "name": "example: hospital_bill.py",
+      "type": "debugpy",
+      "request": "launch",
+      "program": "${workspaceFolder}/examples/hospital_bill.py",
+      "console": "integratedTerminal",
+      "cwd": "${workspaceFolder}"
+    },
+    {
+      "name": "docs: build the API reference",
+      "type": "debugpy",
+      "request": "launch",
+      "program": "${workspaceFolder}/docs/build_reference.py",
+      "args": ["--out", "site/index.html"],
+      "console": "integratedTerminal",
+      "cwd": "${workspaceFolder}"
+    }
+  ],
+
+  "inputs": [
+    {
+      "id": "cliCommand",
+      "type": "pickString",
+      "description": "docpipe subcommand",
+      "options": ["info", "quality", "read", "preprocess"],
+      "default": "quality"
+    },
+    {
+      "id": "documentPath",
+      "type": "promptString",
+      "description": "Path to a PDF, image, TIFF or .eml file",
+      "default": "pdfs/"
+    }
+  ]
+}
