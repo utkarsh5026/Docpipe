@@ -6,6 +6,8 @@ and skipping OCR is the single most damaging false positive in the library: it
 produces a confident, empty result that looks like a successful extraction.
 """
 
+from typing import Any
+
 import pytest
 
 import docpipe as dp
@@ -142,7 +144,7 @@ class TestIngestPDF:
         assert page.height_pt == pytest.approx(842, abs=1)
 
     def test_max_pages_truncates_and_warns(self, tmp_path):
-        fitz = dp._fitz()
+        fitz: Any = dp._fitz()
         pdf = fitz.open()
         for _ in range(5):
             pdf.new_page()
@@ -153,7 +155,7 @@ class TestIngestPDF:
         assert any("truncated" in w for w in doc.warnings)
 
     def test_page_range_selects_specific_pages(self, tmp_path):
-        fitz = dp._fitz()
+        fitz: Any = dp._fitz()
         pdf = fitz.open()
         for i in range(4):
             page = pdf.new_page()
@@ -172,7 +174,7 @@ class TestIngestPDF:
             dp.ingest_pdf(b"%PDF-1.4\nthis is not a pdf at all")
 
     def test_encrypted_pdf_opens_with_an_empty_password(self, tmp_path):
-        fitz = dp._fitz()
+        fitz: Any = dp._fitz()
         pdf = fitz.open()
         page = pdf.new_page()
         page.insert_text((50, 50), "secret hospital bill total 500", fontsize=12)

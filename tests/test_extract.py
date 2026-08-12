@@ -17,19 +17,31 @@ import docpipe as dp
 np = pytest.importorskip("numpy")
 
 
+def spec_for(adapter: dp.SchemaAdapter, name: str) -> dp.FieldSpec:
+    """The :class:`docpipe.FieldSpec` for ``name``, asserted present.
+
+    ``SchemaAdapter.field`` returns ``None`` for an unknown name, which is the
+    right contract but makes every assertion below an Optional access.  Failing
+    here names the missing field instead of raising ``AttributeError`` on None.
+    """
+    found = adapter.field(name)
+    assert found is not None, "adapter has no field %r" % name
+    return found
+
+
 # -- schema adaptation -------------------------------------------------------
 
 class TestSchemaAdapterDictSpec:
     def test_simple_type_map(self):
         adapter = dp.SchemaAdapter.from_schema({"total": "number", "name": "string"})
         assert {f.name for f in adapter.fields} == {"total", "name"}
-        assert adapter.field("total").type_name == "number"
+        assert spec_for(adapter, "total").type_name == "number"
 
     def test_expanded_form_carries_descriptions(self):
         adapter = dp.SchemaAdapter.from_schema({
             "total": {"type": "number", "description": "grand total payable",
                       "required": False}})
-        spec = adapter.field("total")
+        spec = spec_for(adapter, "total")
         assert spec.description == "grand total payable"
         assert spec.required is False
 
@@ -56,9 +68,9 @@ class TestSchemaAdapterDataclass:
 
         adapter = dp.SchemaAdapter.from_schema(Bill)
         assert adapter.name == "Bill"
-        assert adapter.field("hospital").required is True
-        assert adapter.field("discharge").required is False
-        assert adapter.field("total").type_name == "number"
+        assert spec_for(adapter, "hospital").required is True
+        assert spec_for(adapter, "discharge").required is False
+        assert spec_for(adapter, "total").type_name == "number"
 
     def test_build_instantiates_the_dataclass(self):
         import dataclasses
@@ -98,13 +110,13 @@ class TestSchemaAdapterPydantic:
 
     def test_optional_fields_are_not_required(self):
         adapter = dp.SchemaAdapter.from_schema(self._model())
-        assert adapter.field("hospital_name").required is True
-        assert adapter.field("discharge_date").required is False
+        assert spec_for(adapter, "hospital_name").required is True
+        assert spec_for(adapter, "discharge_date").required is False
 
     def test_dates_and_arrays_are_typed(self):
         adapter = dp.SchemaAdapter.from_schema(self._model())
-        assert adapter.field("admission_date").type_name == "date"
-        assert adapter.field("line_items").type_name == "array"
+        assert spec_for(adapter, "admission_date").type_name == "date"
+        assert spec_for(adapter, "line_items").type_name == "array"
 
     def test_build_validates(self):
         adapter = dp.SchemaAdapter.from_schema(self._model())
@@ -495,6 +507,7 @@ class TestExtract:
     def test_extra_keys_in_the_response_are_kept(self, bill_document):
         response = json.dumps(dict(json.loads(GOOD_RESPONSE), surprise="extra"))
         result = dp.extract(bill_document, SCHEMA, client=dp.EchoClient(response))
+        assert result.model is not None
         assert result.model["surprise"] == "extra"
 
     def test_a_list_response_takes_the_first_object(self, bill_document):
@@ -533,7 +546,8 @@ class TestRuleExtraction:
         rules = [dp.FieldRule(name="patient_name", label=r"Patient\s*Name",
                               value_pattern=r"[:\s]*([A-Z][A-Z\s]{4,})")]
         results = dp.extract_with_rules(bill_document, rules)
-        assert "RAMESH" in results["patient_name"].value
+        value = results["patient_name"].value
+        assert value is not None and "RAMESH" in value
 
     def test_typed_rules_coerce_their_value(self, bill_document):
         rules = [dp.FieldRule(name="total", label=r"Total\s*Amount\s*Payable",

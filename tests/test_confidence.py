@@ -228,10 +228,12 @@ class TestFormatMatch:
         assert dp.format_match_score("12-04-2024", "number") == 0.0
 
     def test_ocr_garbage_scores_low_for_a_string_field(self):
-        assert dp.format_match_score("|||###~~~@@@", "string") < 0.2
+        score = dp.format_match_score("|||###~~~@@@", "string")
+        assert score is not None and score < 0.2
 
     def test_clean_text_scores_high_for_a_string_field(self):
-        assert dp.format_match_score("RAMESH KUMAR SHARMA", "string") > 0.9
+        score = dp.format_match_score("RAMESH KUMAR SHARMA", "string")
+        assert score is not None and score > 0.9
 
     def test_none_scores_zero(self):
         assert dp.format_match_score(None, "number") == 0.0

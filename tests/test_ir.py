@@ -69,7 +69,7 @@ class TestBBox:
     def test_is_frozen(self):
         box = dp.BBox(0, 0, 0, 1, 1)
         with pytest.raises(Exception):
-            box.x0 = 5
+            box.x0 = 5  # type: ignore[misc]  # frozen on purpose -- that is the test
 
     def test_dict_round_trip(self):
         box = dp.BBox(2, 1.5, 2.5, 3.5, 4.5)
@@ -317,7 +317,7 @@ class TestCost:
 
     def test_mixing_currencies_is_refused(self):
         with pytest.raises(dp.ConfigError):
-            dp.Cost(currency="USD", amount=1.0) + dp.Cost(currency="INR", amount=1.0)
+            _ = dp.Cost(currency="USD", amount=1.0) + dp.Cost(currency="INR", amount=1.0)
 
     def test_zero_cost_in_another_currency_is_harmless(self):
         total = dp.Cost(currency="USD", amount=1.0) + dp.Cost(currency="INR")

@@ -57,6 +57,7 @@ class TestOpMachinery:
     def test_composite_serialises_and_rebuilds(self, page):
         original = dp.compose(dp.to_grayscale(), dp.unsharp(amount=1.5))
         rebuilt = dp.op_from_dict(original.to_dict())
+        assert isinstance(rebuilt, dp.CompositeOp)
         assert [o.name for o in rebuilt.ops] == ["to_grayscale", "unsharp"]
         assert rebuilt(page).history[-1].params["amount"] == 1.5
 
