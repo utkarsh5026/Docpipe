@@ -1,23 +1,29 @@
 # What goes into the sdist beyond the module itself.
 #
+# The tarball is for someone building or packaging the library, not for someone
+# reading about it -- the prose and the generated reference live in the repo and
+# on Pages, where they can be read without downloading anything.  So the rule
+# here is: ship what a build or a `pytest` run needs, and nothing else.
+#
 # setuptools picks up tests/test_*.py on its own but not conftest.py, which is
 # where every fixture lives -- an sdist with one and not the other ships a test
 # suite that cannot collect.  Downstream packagers build from the sdist and run
 # the suite to decide whether the build is good, so it is included in full.
 recursive-include tests *.py
 
-# The prose a user needs when they have the tarball and no network.
+# The licence is a legal requirement in the distribution, and README.md is what
+# `readme = "README.md"` in pyproject.toml renders into the PyPI description --
+# leave that one out and the build fails.
 include LICENSE
 include README.md
-include How-to-use.md
-include CLAUDE.md
 
-# The reference generator reads docpipe.py with `ast` and needs nothing else,
-# so it works straight out of the sdist.
-recursive-include docs *.py
-
-# Never ship the caches or the built page.
+# Never ship the caches, the built page, or the editor and agent configuration.
+# The prunes are belt-and-braces: setuptools does not reach into these on its
+# own, but a stray `include` upstream of here should not be able to leak them.
 global-exclude *.py[cod]
 global-exclude .DS_Store
 prune site
 prune __pycache__
+prune .claude
+prune .vscode
+prune pdfs
