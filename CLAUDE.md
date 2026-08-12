@@ -21,6 +21,7 @@ up — the module docstring at the top of `docpipe.py` carries the same reasonin
 | `docs/build_reference.py` | Generates the API reference by `ast`-parsing `docpipe.py` |
 | `examples/hospital_bill.py` | End-to-end consumer example |
 | `.github/workflows/` | `ci.yml` (tests + compat gates), `docs.yml` (Pages) |
+| `.vscode/` | Editor config: every CI gate as a task, debug configs, snippets for the conventions below |
 
 `docpipe.py` is organised into 16 banner-delimited sections (`# === N. Title ===`), matching
 the layer numbering in the module docstring. New code goes in the section it belongs to —

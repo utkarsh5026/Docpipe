@@ -34,6 +34,9 @@ other.
   15. [I have 5,000 files, not one](#15-i-have-5000-files-not-one)
   16. [I can&#39;t install OpenCV here](#16-i-cant-install-opencv-here)
   17. [I want this inside a web service](#17-i-want-this-inside-a-web-service)
+  18. [We already use LangChain (or Bedrock, or an internal gateway)](#18-we-already-use-langchain-or-bedrock-or-an-internal-gateway)
+  19. [I want this to feed our existing RAG stack](#19-i-want-this-to-feed-our-existing-rag-stack)
+- [Every seam you can extend](#every-seam-you-can-extend)
 - [The CLI cookbook](#the-cli-cookbook)
 - [Picking only the parts you need](#picking-only-the-parts-you-need)
 - [Things that surprise people](#things-that-surprise-people)
@@ -196,7 +199,7 @@ doc = dp.read(doc)                       # routes each page to the right reader
 print(doc.text())                        # the whole document
 print(doc.pages[0].text())               # one page
 for line in doc.pages[0].lines():        # spans grouped into visual lines
-    print(" ".join(s.text for s in line))
+    print(line)
 ```
 
 Or, from the shell, with nothing to write at all:
@@ -944,6 +947,468 @@ tracker = dp.CostTracker()     # tokens and money, per backend
 
 ---
 
+### 18. We already use LangChain (or Bedrock, or an internal gateway)
+
+**The problem.** Your team standardised on something long before this library
+turned up. Every model call goes through a LangChain chat model, or Bedrock, or
+an internal gateway that adds auth, redaction, logging and a rate limit — and
+nobody is allowed to call a provider SDK directly. `dp.AnthropicClient` is
+useless to you, and from the outside the library looks like it hard-codes its
+two providers.
+
+**The solution.** It does not. `extract()` never talks to a provider. It talks
+to exactly one method:
+
+```python
+def complete(self, prompt, system=None, images=None):
+    """Returns ``(text, dp.Cost)``."""
+```
+
+Anything with that method is a client. `AnthropicClient` and `OpenAIClient` are
+two implementations that happen to ship in the file; they are not privileged.
+Subclass `BaseLLMClient` to inherit the plumbing — model id, `max_tokens`,
+`temperature`, a lock, `is_available` — and write the one method:
+
+```python
+import base64
+import docpipe as dp
+
+
+class LangChainClient(dp.BaseLLMClient):
+    """Any LangChain chat model or LCEL runnable, behind docpipe's interface."""
+
+    name = "langchain"
+
+    def __init__(self, llm, model="", **options):
+        # `model` is the pricing key as well as a label -- see below.
+        dp.BaseLLMClient.__init__(self, model=model or "langchain", **options)
+        self.llm = llm
+
+    def is_available(self):
+        return self.llm is not None
+
+    def complete(self, prompt, system=None, images=None):
+        content = [{"type": "text", "text": prompt}]
+        for blob in (images or []):
+            data = base64.b64encode(blob).decode("ascii")
+            content.append({"type": "image_url",
+                            "image_url": {"url": "data:image/jpeg;base64,%s" % data}})
+
+        messages = ([("system", system)] if system else []) + [("human", content)]
+        reply = self.llm.invoke(messages)
+
+        usage = getattr(reply, "usage_metadata", None) or {}
+        return reply.content, dp.Pricing.price_tokens(
+            self.model,
+            int(usage.get("input_tokens", 0) or 0),
+            int(usage.get("output_tokens", 0) or 0))
+```
+
+That object is now a client everywhere a client is taken:
+
+```python
+from langchain_openai import ChatOpenAI
+
+client = LangChainClient(ChatOpenAI(model="gpt-4o", temperature=0), model="gpt-4o")
+
+result = dp.extract(doc, schema, client=client, context="...")     # one call
+pipeline = dp.Pipeline(schema=schema, client=client)               # or configured once
+result = dp.process("bill.pdf", schema=schema, client=client)      # or end to end
+```
+
+Four details that are easy to get wrong:
+
+- **Return the text, not the message object.** The extractor parses a JSON
+  reply out of that string — leniently, so fences and preamble are fine, but it
+  has to be a string.
+- **`model` is the pricing key.** Cost stays `0.00` until you say what your
+  account pays: `dp.Pricing.set_pricing("gpt-4o", input_per_mtok=2.50,
+  output_per_mtok=10.00)`. Use the same string in both places.
+- **Report tokens even when you cannot report money.** If your gateway returns
+  no usage block, `dp.Cost(calls=1)` is the honest answer — the call is still
+  counted, so budgets and `CostTracker` still see it.
+- **`images` is optional.** Only `extract(include_images=True)` populates it; a
+  text-only model behind your wrapper can ignore the argument entirely. The
+  image block format is provider-specific — the dict above is what
+  OpenAI-backed chat models accept.
+
+Do not wrap your client in your own retry loop. `extract(retries=2)` already
+retries transport and parse failures, and gives up immediately on
+`MissingDependency` and `ConfigError`, which no amount of retrying will fix.
+
+**The same seam, for a plain HTTP gateway:**
+
+```python
+class GatewayClient(dp.BaseLLMClient):
+    """An internal LLM endpoint that speaks its own JSON."""
+
+    name = "gateway"
+
+    def __init__(self, url, token, model="internal-llm", **options):
+        dp.BaseLLMClient.__init__(self, model=model, **options)
+        self.url = url
+        self.token = token
+
+    def complete(self, prompt, system=None, images=None):
+        payload = {"model": self.model, "prompt": prompt, "system": system or "",
+                   "max_tokens": self.max_tokens, "temperature": self.temperature}
+        response = requests.post(
+            self.url, json=payload, timeout=120,
+            headers={"Authorization": "Bearer %s" % self.token})
+        response.raise_for_status()
+        body = response.json()
+        return body["text"], dp.Cost(calls=1,
+                                     input_tokens=body.get("prompt_tokens", 0),
+                                     output_tokens=body.get("completion_tokens", 0))
+```
+
+**Reading pages with your own vision model is a different seam**, because
+reading happens per page and is routed. Subclass `VisionBackend` — it already
+handles downscaling, JPEG encoding, cost estimation and splitting a
+transcription into spans with honest (approximate) geometry — and implement one
+method:
+
+```python
+class GatewayVision(dp.VisionBackend):
+    """Transcribe a page through the same internal model."""
+
+    name = "vlm:gateway"
+
+    def __init__(self, llm, **options):
+        dp.VisionBackend.__init__(self, model="internal-vision", **options)
+        self.llm = llm
+
+    def is_available(self):
+        return self.llm is not None
+
+    def _call_model(self, image_bytes, media_type, prompt):
+        data = base64.b64encode(image_bytes).decode("ascii")
+        reply = self.llm.invoke([("human", [
+            {"type": "text", "text": prompt},
+            {"type": "image_url",
+             "image_url": {"url": "data:%s;base64,%s" % (media_type, data)}}])])
+        usage = getattr(reply, "usage_metadata", None) or {}
+        return reply.content, dp.Pricing.price_tokens(
+            self.model,
+            int(usage.get("input_tokens", 0) or 0),
+            int(usage.get("output_tokens", 0) or 0))
+
+
+dp.registry.register("vlm:gateway", lambda: GatewayVision(llm))   # a factory
+
+router = (dp.RuleRouter(fallback="tesseract")
+          .add(lambda p: p.kind is dp.PageKind.DIGITAL_NATIVE, "pymupdf")
+          .add(lambda p: not p.quality.is_readable, "vlm:gateway"))
+
+doc = dp.read(doc, router=router)
+```
+
+**And test the wrapper without the gateway.** Your adapter is code, so it can be
+wrong; a stub with the two attributes you read is enough to prove it is not:
+
+```python
+class _StubReply(object):
+    content = '{"total": "1200"}'
+    usage_metadata = {"input_tokens": 10, "output_tokens": 5}
+
+
+class _StubLLM(object):
+    def invoke(self, messages):
+        return _StubReply()
+
+
+text, cost = LangChainClient(_StubLLM()).complete("hello")
+assert text == '{"total": "1200"}' and cost.total_tokens == 15
+```
+
+For everything downstream of the client — your schema, your validators, your
+error handling — use `EchoClient` instead and skip the wrapper entirely (use
+case 9).
+
+---
+
+### 19. I want this to feed our existing RAG stack
+
+**The problem.** The reason you are opening the PDF at all is to get chunks into
+a vector store. `docpipe.Document` is not your framework's `Document`, and you
+do not want a second document abstraction in the codebase.
+
+**The solution.** Converting is a for-loop. The part worth having is the
+metadata you can attach on the way out: the pipeline already measured which
+pages are worth embedding, and that is what stops the index filling with OCR
+noise that will later be retrieved as if it meant something.
+
+```python
+from langchain_core.documents import Document as LCDocument
+
+doc = dp.read(dp.preprocess(dp.Ingest.ingest("manual.pdf")))
+doc = dp.Text.normalize_document(doc)          # digits, whitespace, confusions
+
+chunks = [
+    LCDocument(
+        page_content=page.text(),
+        metadata={
+            "source": doc.source_uri,
+            "page": page.index,
+            "kind": str(page.kind),                    # digital_native / scanned / ...
+            "quality": page.quality.score,             # measured, not guessed
+            "verdict": str(page.quality.verdict),
+            "backend": doc.meta.get("read_backends", {}).get(page.index, ""),
+        },
+    )
+    for page in doc.pages
+    if page.quality.is_readable and not page.is_blank
+]
+```
+
+Two things that filter buys you. A page the pipeline itself judged unreadable
+embeds as noise and retrieves as noise — dropping it is cheaper than explaining
+the answer it later produces. And because every chunk carries its page index,
+a retrieved chunk still leads back to a rectangle on the original page:
+
+```python
+hit = retriever.invoke("what is the refund window")[0]
+page = doc.pages[hit.metadata["page"]]
+box = dp.locate_value(doc, "30 days")[0].bbox        # if you want to highlight it
+```
+
+Keep the IR rather than re-reading the PDF next time — it reloads with
+`dp.Document.load_json` and is a fraction of the size once the pixels are gone:
+
+```python
+doc.release_rasters()
+doc.save_json("index/manual.json")
+```
+
+---
+
+## Every seam you can extend
+
+The rule the library holds itself to: **if you have to fork `docpipe.py` to get
+your job done, that is a defect in the library.** Every layer has a seam, none
+of them needs an edit to this file, and each one is an ordinary Python object —
+no plugin manifest, no entry point, no registration ceremony beyond a function
+call.
+
+| You want to replace…              | Implement                                              | Plug it in with                     |
+| ---------------------------------- | ------------------------------------------------------ | ----------------------------------- |
+| The model client                   | `.complete(prompt, system, images) -> (text, Cost)`  | `extract(client=...)`             |
+| An OCR engine                      | `BaseBackend._read(page) -> ReadResult`              | `registry.register(name, factory)`|
+| A vision reader                    | `VisionBackend._call_model(...) -> (text, Cost)`     | the same registry                   |
+| An image correction                | a raster function under `@register_op`               | a policy, or `preprocess(ops=[...])` |
+| Which ops run on a page            | `Callable[[Page], List[Op]]`                         | `preprocess(policy=...)`          |
+| Which backend reads a page         | `Callable[[Page], Optional[str]]`                    | `read(router=...)`                |
+| A business rule                    | `Callable[[data], Optional[ValidationIssue]]`        | `extract(validators=[...])`       |
+| How the signals are weighed        | a `{signal: weight}` mapping                         | `extract(weights=...)`            |
+| How scores become probabilities    | subclass `Calibrator`                                | `extract(calibrator=...)`         |
+| Where reads are cached             | `.get(key)` / `.set(key, value)` / `in`          | `CachingBackend(inner, cache=...)`|
+| What counts as a bad page          | `QualityThresholds(...)`                             | `preprocess(thresholds=...)`      |
+| Where documents come from          | build `Page` / `Document` yourself                   | `Ingest.document_from_images`     |
+| What a schema looks like           | a dict, a dataclass or a pydantic model                | `extract(schema=...)`             |
+| The entire pipeline                | `Callable[[str], Extraction]`                        | `EvalSuite.run({...})`            |
+
+Backends are use case 10, ops are use case 11, routers are use case 7 and
+clients are use case 18. The rest are below.
+
+### A policy of your own
+
+A policy is a function from a measured page to a list of ops. That is the whole
+interface — `Policies.default_policy` has no privileges yours does not.
+
+```python
+def cheap_policy(page):
+    """Deskew and upsample; nothing else.  Our scanners are good and our CPU
+    budget is not, and unsharp on a clean page costs more than it returns."""
+    ops = []
+    if abs(page.quality.skew_deg) > 0.4:
+        ops.append(dp.Ops.deskew())
+    if page.quality.effective_dpi and page.quality.effective_dpi < 250:
+        ops.append(dp.Ops.ensure_dpi(min_dpi=300))
+    return ops
+
+
+doc = dp.preprocess(doc, policy=cheap_policy)
+```
+
+Read the measurements, not the file name or the page number. A policy that
+ignores `page.quality` is a fixed sequence wearing a policy's clothes, and will
+damage the pages that arrived clean.
+
+### Your own thresholds, instead of your own policy
+
+Often the shipped policies are right and only the boundaries are wrong for your
+documents — the defaults come from scanned Indian hospital bills and court
+filings, and are priors rather than constants.
+
+```python
+thresholds = dp.QualityThresholds(min_dpi=200, blur_floor=0.25, skew_correct_deg=0.8)
+
+doc = dp.preprocess(
+    doc,
+    thresholds=thresholds,                                                  # measurement
+    policy=lambda p: dp.Policies.default_policy(p, thresholds=thresholds),  # and decision
+)
+```
+
+Pass them in both places. `preprocess(thresholds=...)` reaches the
+*measurement* — which is what sets each page's verdict — while the policy takes
+its own `thresholds` argument for the corrections it chooses. Supplying only
+one leaves the two disagreeing about what "degraded" means.
+
+### A confidence signal of your own
+
+The fusion is open: `fuse_confidence` takes whatever signals you hand it,
+weighted however you like. If you can check a value against something the
+document does not contain — a customer ledger, a policy number database — that
+is an independent signal and belongs in the fusion.
+
+```python
+WEIGHTS = dict(dp.DEFAULT_CONFIDENCE_WEIGHTS, ledger_match=0.30)
+
+result = dp.extract(doc, schema, client=client, weights=WEIGHTS)
+
+for field in result.fields.values():
+    if field.name != "bill_number" or field.value is None:
+        continue
+    signals = dict(field.signals)
+    signals["ledger_match"] = 0.95 if ledger.exists(field.value) else 0.05
+    field.signals = signals
+    field.confidence = dp.Confidence.fuse_confidence(signals, weights=WEIGHTS)
+```
+
+Two rules, both of which fail silently if you break them:
+
+- **A signal with no weight in the map is dropped, not defaulted.** Copy
+  `DEFAULT_CONFIDENCE_WEIGHTS` and add to it, as above; pass a bare
+  `{"ledger_match": 0.3}` and every built-in signal disappears from the fusion.
+- **`None` means absent, not zero.** A lookup you could not perform must be
+  `None` — the weight is then renormalised away. Encoding it as `0.0` says
+  "checked, and it failed", which is a completely different claim.
+
+Re-fusing by hand bypasses the calibrator, so apply it yourself if you fitted
+one: `field.confidence = calibrator.predict(fused)`.
+
+### A calibrator of your own
+
+`Calibrator` is three methods: `fit(scores, labels)`, `predict(score)` and
+`to_dict()`. Platt and isotonic ship because they cover the usual cases, but if
+your risk team has a mapping they already trust, wrap it:
+
+```python
+class TableCalibrator(dp.Calibrator):
+    """Map raw scores through the lookup table risk signed off on."""
+
+    def __init__(self, table=None):
+        self.table = list(table or [])       # [(upper_bound, probability), ...]
+
+    def fit(self, scores, labels):
+        return self                          # nothing to fit; it is a policy
+
+    def predict(self, score):
+        for upper, probability in self.table:
+            if score <= upper:
+                return probability
+        return 1.0
+
+    def to_dict(self):
+        return {"kind": "table", "table": self.table}
+```
+
+`to_dict()` is what lets a fitted calibrator travel inside an eval report and be
+rebuilt six months later, so implement it even when there is nothing to fit.
+Note that `Calibrator.from_dict` only knows the three shipped kinds — rebuild
+your own from your own dict.
+
+### A cache of your own
+
+`CachingBackend` uses three methods of whatever you hand it — `get`, `set` and
+`in`. The annotation names `DiskCache` because that is what ships, but nothing
+checks the type at runtime, so Redis, S3 or your own store all work:
+
+```python
+class RedisCache(object):
+    """The whole interface CachingBackend needs, over redis."""
+
+    def __init__(self, client, prefix="docpipe:", ttl=7 * 24 * 3600):
+        self.client = client
+        self.prefix = prefix
+        self.ttl = ttl
+
+    def get(self, key):
+        try:
+            raw = self.client.get(self.prefix + key)
+        except Exception:
+            return None            # a cache must never be able to fail a run
+        return json.loads(raw) if raw else None
+
+    def set(self, key, value):
+        try:
+            self.client.setex(self.prefix + key, self.ttl, json.dumps(value))
+        except Exception:
+            pass
+
+    def __contains__(self, key):
+        return self.get(key) is not None
+
+
+backend = dp.CachingBackend(dp.TesseractOCR(), cache=RedisCache(redis.Redis()))
+doc = dp.read(doc, backend=backend)
+```
+
+Swallow your own errors, as above. A miss must return `None`, never raise: the
+cache is an optimisation, and an unreachable Redis should slow a run down, not
+end it. Values are plain JSON (spans and warnings), so any store that holds
+strings will do.
+
+### Documents from somewhere that is not a file
+
+If your pages arrive as arrays — a scanner SDK, a camera, a frame grabber, a
+service that hands you PNG bytes — you do not need a temp file:
+
+```python
+doc = dp.Ingest.document_from_images(frames, dpi=300, source_uri="scanner://tray-3")
+page = dp.Ingest.page_from_image(frames[0], index=0, dpi=300)
+```
+
+From there it is an ordinary `Document`: measure it, preprocess it, read it,
+extract from it. `Document` and `Page` are plain dataclasses, so building one by
+hand for a source neither of those helpers covers is also fair game.
+
+### The entire pipeline, under the eval harness
+
+`EvalSuite.run` takes anything callable that maps a file path to an
+`Extraction`. Your existing chain qualifies, once wrapped — which means you can
+measure whether adopting any of this would help *before* adopting it, on your
+own documents, against your own ground truth:
+
+```python
+def existing_chain_pipeline(path):
+    """Our current LangChain extraction, wrapped so the harness can score it."""
+    payload = existing_chain.invoke({"path": path})
+    return dp.Extraction(fields=dict(
+        (name, dp.FieldResult(name=name, value=value, confidence=1.0))
+        for name, value in payload.items()))
+
+
+suite = dp.EvalSuite.from_dir("datasets/bills")
+report = suite.run({
+    "existing": existing_chain_pipeline,
+    "docpipe": dp.Pipeline(schema=schema, client=client, name="docpipe"),
+})
+
+print(report.compare("existing", "docpipe"))
+print(report.by_field())            # which fields moved, in which direction
+```
+
+A pipeline that raises on one document is recorded as an error for that case and
+the run continues, so a single corrupt scan does not invalidate the comparison.
+
+This is the honest way round: rather than believe this guide, run the harness
+against what you already have and let the numbers decide which parts are worth
+taking.
+
+---
+
 ## The CLI cookbook
 
 Every command works on PDFs, images, TIFFs and `.eml` files.
@@ -1025,9 +1490,11 @@ constants — they come from scanned Indian hospital bills and court filings.
 Recalibrate them against your own labelled set. That is what the eval harness is
 for, and `QualityThresholds` exists so you can pass your own.
 
-**"I need something the library doesn't do."** Register an op, a backend or a
-router. If you ever have to fork the library to get your job done, that is a defect
-in the library, not in your requirements — please open an issue.
+**"I need something the library doesn't do."** Register an op, a backend, a
+router, a client, a calibrator or a cache — see
+[Every seam you can extend](#every-seam-you-can-extend). If you ever have to fork
+the library to get your job done, that is a defect in the library, not in your
+requirements — please open an issue.
 
 ---
 
