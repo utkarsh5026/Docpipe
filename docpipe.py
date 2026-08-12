@@ -339,7 +339,22 @@ class Caps(object):
 
     @staticmethod
     def require(name: str, purpose: str = "") -> Module:
-        """Import ``name`` or raise :class:`MissingDependency` with a pip hint."""
+        """Import ``name`` or raise :class:`MissingDependency` with a pip hint.
+
+        The gate every optional import goes through, so a missing dependency
+        fails where the user called it rather than three frames deep inside a
+        backend.
+
+        :param name: the import name, e.g. ``"cv2"``, ``"fitz"``, ``"PIL.Image"``.
+            Note that this is the import name, not the pip name -- the mapping
+            between them is what produces a correct install hint.
+        :param purpose: what it was needed for, e.g. ``"Tesseract input
+            conversion"``.  It goes into the error message, so make it name the
+            feature the user was reaching for.
+        :returns: the imported module
+        :raises MissingDependency: not importable; the message carries the pip
+            install command
+        """
         mod = _try_import(name)
         if mod is None:
             raise MissingDependency(name, purpose, _PIP_NAMES.get(name, name))
@@ -347,12 +362,33 @@ class Caps(object):
 
     @staticmethod
     def have(name: str) -> bool:
-        """True when optional module ``name`` can be imported."""
+        """True when optional module ``name`` can be imported.
+
+        The non-raising counterpart to :func:`Caps.require`, for choosing a code
+        path rather than demanding one.  Results are cached, so probing in a hot
+        loop is cheap.
+
+        :param name: the import name, e.g. ``"cv2"`` or ``"pytesseract"``
+        :returns: whether the import succeeds.  ``False`` also covers a module
+            that is installed but broken -- a native library failing to load
+            counts as unavailable, which is the useful answer.
+        """
         return _try_import(name) is not None
 
     @staticmethod
     def set_opencv_enabled(enabled: bool) -> bool:
-        """Enable/disable OpenCV acceleration globally.  Returns the previous value."""
+        """Enable/disable OpenCV acceleration globally.  Returns the previous value.
+
+        Process-wide and not thread-safe, so set it during start-up or in a test
+        fixture.  For a scoped change prefer ``with Caps.without_opencv():``.
+        The ``DOCPIPE_DISABLE_OPENCV=1`` environment variable does the same at
+        import time, which is what CI uses to exercise the NumPy fallbacks.
+
+        :param enabled: ``False`` forces the pure-NumPy path even when OpenCV is
+            installed.  Results differ slightly between the two backends -- the
+            fallbacks are equivalent, not bit-identical.
+        :returns: the previous setting, so a caller can restore it
+        """
         global _USE_OPENCV
         prev = _USE_OPENCV
         _USE_OPENCV = bool(enabled)
@@ -482,7 +518,16 @@ class Util(object):
 
     @staticmethod
     def array_hash(arr: ImageArray) -> str:
-        """Content hash of a NumPy array, for caching backend reads."""
+        """Content hash of a NumPy array, for caching backend reads.
+
+        Hashes the pixels, shape and dtype rather than a filename, which is what
+        makes :class:`CachingBackend` correct across preprocessing changes: alter
+        an op and the cache misses, as it should.
+
+        :param arr: the array to hash; a non-array falls back to hashing its
+            ``repr``
+        :returns: a stable hex digest, identical across processes and runs
+        """
         try:
             buf = arr.tobytes()
         except AttributeError:
@@ -491,7 +536,14 @@ class Util(object):
 
     @staticmethod
     def clamp(value: float, lo: float, hi: float) -> float:
-        """Clamp ``value`` into ``[lo, hi]``."""
+        """Clamp ``value`` into ``[lo, hi]``.
+
+        :param value: the number to bound
+        :param lo: lower bound, returned when ``value`` is below it
+        :param hi: upper bound, returned when ``value`` is above it
+        :returns: the bounded value.  No check that ``lo <= hi``; inverted bounds
+            return ``lo``.
+        """
         if value < lo:
             return lo
         if value > hi:
@@ -504,6 +556,11 @@ class Util(object):
 
         ``q`` is in ``[0, 100]``.  Returns ``0.0`` for an empty sequence, which is
         the convention the metrics code below relies on.
+
+        :param values: the sample, in any order; it is sorted internally
+        :param q: the percentile in ``0.0..100.0``, clamped.  ``50`` is the
+            median, ``95`` the usual tail metric.
+        :returns: the interpolated value, or ``0.0`` for an empty sequence
         """
         if not values:
             return 0.0
@@ -525,6 +582,16 @@ class Util(object):
         Iterative two-row DP: O(len(a) * len(b)) time, O(min) space.  When
         ``max_distance`` is given and every cell in a row exceeds it, we bail out
         early and return ``max_distance + 1``.
+
+        :param a: the first string
+        :param b: the second string
+        :param max_distance: give up once the distance provably exceeds this.
+            Turns a "are these nearly equal?" test into an early exit rather than
+            a full matrix -- worth passing when scanning many candidates and only
+            close ones matter.
+        :returns: the edit distance, or ``max_distance + 1`` when the bound was
+            hit.  The sentinel means "further than you asked about", not an exact
+            distance.
         """
         if a == b:
             return 0
@@ -553,7 +620,18 @@ class Util(object):
 
     @staticmethod
     def similarity(a: str, b: str) -> float:
-        """Normalised similarity in ``[0, 1]``: ``1 - edit_distance / max_len``."""
+        """Normalised similarity in ``[0, 1]``: ``1 - edit_distance / max_len``.
+
+        The comparison behind evidence matching and cross-read agreement.
+        Normalising by the longer string keeps a one-character error in a long
+        value from scoring as badly as one in a short value.
+
+        :param a: the first string
+        :param b: the second string
+        :returns: ``1.0`` for identical strings, ``0.0`` when either is empty
+            (unless both are), graded in between.  Normalise the inputs first if
+            case or punctuation should not count.
+        """
         if a == b:
             return 1.0
         if not a or not b:
@@ -573,6 +651,24 @@ class Util(object):
         API key, malformed request) fail immediately instead of being hammered
         three times and billed three times.  ``on_retry(attempt, exc, delay)`` is
         the hook the cost tracker uses to record failed-but-charged attempts.
+
+        :param fn: the zero-argument callable to attempt
+        :param attempts: total tries including the first; must be at least ``1``
+        :param base_delay: seconds before the first retry, doubling each time
+        :param max_delay: ceiling on the backoff, before jitter
+        :param jitter: random fraction of the delay added on top, in ``0.0..1.0``.
+            ``0.25`` is enough to break up the thundering herd when many pages
+            fail against the same provider at once.
+        :param retry_on: exception types worth retrying.  ``(Exception,)`` is
+            broad because provider SDKs raise their own hierarchies.
+        :param give_up_on: exception types that never become successes.  These
+            win over ``retry_on``, so a bad API key fails once, not three times.
+        :param on_retry: called as ``on_retry(attempt, exc, delay)`` before each
+            sleep -- the hook for counting billed-but-failed attempts.
+        :param sleep: the sleep function, injectable so tests do not wait
+        :returns: whatever ``fn`` returned on its first success
+        :raises ConfigError: ``attempts`` is less than 1
+        :raises Exception: the last failure, once every attempt is spent
         """
         if attempts < 1:
             raise ConfigError("attempts must be >= 1")
@@ -598,7 +694,18 @@ class Util(object):
 
     @staticmethod
     def to_json(obj: Any, indent: Optional[int] = 2, sort_keys: bool = False) -> str:
-        """Serialise any docpipe object graph to JSON."""
+        """Serialise any docpipe object graph to JSON.
+
+        Handles the types ``json`` will not: dataclasses, enums, ``Decimal``,
+        dates and NumPy scalars, by way of each object's ``to_dict``.
+
+        :param obj: any docpipe object, or a container of them
+        :param indent: spaces per level; ``None`` produces compact one-line JSON
+        :param sort_keys: sort object keys, which makes output diffable -- worth
+            setting for anything committed as a baseline
+        :returns: the JSON text, with non-ASCII characters left as themselves so
+            Devanagari and CJK stay readable in a report
+        """
         return json.dumps(_as_jsonable(obj), indent=indent, sort_keys=sort_keys, ensure_ascii=False)
 
 
@@ -649,7 +756,13 @@ class Timer(object):
 
 
 def chunked(seq: Sequence[T], size: int) -> Iterator[List[T]]:
-    """Yield ``seq`` in lists of at most ``size``."""
+    """Yield ``seq`` in lists of at most ``size``.
+
+    :param seq: the sequence to split
+    :param size: maximum items per chunk; the final chunk may be shorter
+    :returns: an iterator of lists
+    :raises ConfigError: ``size`` is less than 1
+    """
     if size < 1:
         raise ConfigError("chunk size must be >= 1")
     for i in range(0, len(seq), size):
@@ -842,14 +955,27 @@ class BBox(object):
         return ((self.x0 + self.x1) / 2.0, (self.y0 + self.y1) / 2.0)
 
     def union(self, other: BBox) -> BBox:
-        """Smallest box containing both.  Requires the same page."""
+        """Smallest box containing both.  Requires the same page.
+
+        :param other: a box on the same page
+        :returns: the smallest box enclosing both
+        :raises ValueError: the boxes are on different pages.  A union across
+            pages has no geometric meaning, and silently returning one would put
+            a reviewer highlight in the wrong place.
+        """
         if other.page != self.page:
             raise ValueError("cannot union boxes from pages %d and %d" % (self.page, other.page))
         return BBox(self.page, min(self.x0, other.x0), min(self.y0, other.y0),
                     max(self.x1, other.x1), max(self.y1, other.y1))
 
     def intersection(self, other: BBox) -> Optional[BBox]:
-        """Overlap rectangle, or ``None`` when they do not overlap."""
+        """Overlap rectangle, or ``None`` when they do not overlap.
+
+        :param other: any box
+        :returns: the overlapping rectangle, or ``None`` when the boxes are on
+            different pages or merely touch.  Edge contact is not overlap: two
+            adjacent table cells intersect in zero area and return ``None``.
+        """
         if other.page != self.page:
             return None
         x0 = max(self.x0, other.x0)
@@ -861,7 +987,13 @@ class BBox(object):
         return BBox(self.page, x0, y0, x1, y1)
 
     def iou(self, other: BBox) -> float:
-        """Intersection over union in ``[0, 1]``."""
+        """Intersection over union in ``[0, 1]``.
+
+        :param other: any box
+        :returns: overlap area divided by combined area, in ``0.0..1.0``.
+            ``0.0`` for boxes on different pages or with no overlap; ``1.0`` for
+            identical boxes.
+        """
         inter = self.intersection(other)
         if inter is None:
             return 0.0
@@ -874,38 +1006,81 @@ class BBox(object):
         ``tolerance`` slackens every edge outward, which matters because OCR
         boxes and layout boxes come from different estimators and rarely nest
         exactly.
+
+        :param other: the box that might be inside this one
+        :param tolerance: slack in points applied outward on every edge.  ``0.0``
+            demands exact containment; ``2.0`` (about a character's width at
+            12pt) is realistic when testing OCR word boxes against a detected
+            table region.
+        :returns: whether ``other`` lies within this box, on the same page
         """
         return (other.page == self.page
                 and other.x0 >= self.x0 - tolerance and other.y0 >= self.y0 - tolerance
                 and other.x1 <= self.x1 + tolerance and other.y1 <= self.y1 + tolerance)
 
     def overlaps(self, other: BBox) -> bool:
-        """True when the two boxes share any area on the same page."""
+        """True when the two boxes share any area on the same page.
+
+        :param other: any box
+        :returns: whether the two share positive area.  Touching edges do not
+            count -- see :meth:`intersection`.
+        """
         return self.intersection(other) is not None
 
     def expand(self, margin: float) -> BBox:
-        """This box grown by ``margin`` points on every side (negative shrinks)."""
+        """This box grown by ``margin`` points on every side (negative shrinks).
+
+        :param margin: points to add to every side; negative shrinks.  Useful for
+            padding a highlight so it does not clip the glyphs it marks.
+        :returns: a new box.  Not clipped to the page, so follow it up
+            with :meth:`clipped` when the result must stay on the sheet.
+        """
         return BBox(self.page, self.x0 - margin, self.y0 - margin,
                     self.x1 + margin, self.y1 + margin)
 
     def scaled(self, factor: float) -> BBox:
-        """This box with every coordinate multiplied by ``factor``."""
+        """This box with every coordinate multiplied by ``factor``.
+
+        Scales position as well as size, since it multiplies the coordinates
+        rather than resizing about the centre.
+
+        :param factor: multiplier applied to all four coordinates
+        :returns: a new box on the same page
+        """
         return BBox(self.page, self.x0 * factor, self.y0 * factor,
                     self.x1 * factor, self.y1 * factor)
 
     def translated(self, dx: float, dy: float) -> BBox:
-        """This box shifted by ``(dx, dy)`` points."""
+        """This box shifted by ``(dx, dy)`` points.
+
+        :param dx: horizontal shift in points; positive moves right
+        :param dy: vertical shift in points; positive moves down, since the origin
+            is the top-left corner
+        :returns: a new box on the same page
+        """
         return BBox(self.page, self.x0 + dx, self.y0 + dy, self.x1 + dx, self.y1 + dy)
 
     def clipped(self, width: float, height: float) -> BBox:
-        """This box confined to a ``width`` x ``height`` page."""
+        """This box confined to a ``width`` x ``height`` page.
+
+        :param width: page width in points (595 for A4, 612 for US Letter)
+        :param height: page height in points (842 for A4, 792 for US Letter)
+        :returns: a new box with every coordinate clamped into the page.  A box
+            entirely outside collapses to zero area rather than raising.
+        """
         return BBox(self.page,
                     clamp(self.x0, 0.0, width), clamp(self.y0, 0.0, height),
                     clamp(self.x1, 0.0, width), clamp(self.y1, 0.0, height))
 
     # -- unit conversion --------------------------------------------------
     def to_pixels(self, dpi: float) -> Tuple[int, int, int, int]:
-        """``(x0, y0, x1, y1)`` in integer pixels at ``dpi``."""
+        """``(x0, y0, x1, y1)`` in integer pixels at ``dpi``.
+
+        :param dpi: the resolution to express the box at.  Use ``page.raster_dpi``
+            to index into that page's current raster -- passing a different DPI
+            gives coordinates for an image that does not exist.
+        :returns: ``(x0, y0, x1, y1)`` as rounded integer pixels
+        """
         s = dpi / 72.0
         return (int(round(self.x0 * s)), int(round(self.y0 * s)),
                 int(round(self.x1 * s)), int(round(self.y1 * s)))
@@ -913,25 +1088,71 @@ class BBox(object):
     @classmethod
     def from_pixels(cls, page: int, x0: float, y0: float, x1: float, y1: float,
                     dpi: float) -> BBox:
-        """Build a point-space BBox from pixel coordinates measured at ``dpi``."""
+        """Build a point-space BBox from pixel coordinates measured at ``dpi``.
+
+        The conversion every backend needs: engines report pixels, the IR stores
+        points, and storing pixels would silently invalidate every box the moment
+        a resolution-changing op ran.
+
+        :param page: zero-based page index the box belongs to
+        :param x0: left edge in pixels
+        :param y0: top edge in pixels
+        :param x1: right edge in pixels
+        :param y1: bottom edge in pixels
+        :param dpi: resolution the pixel coordinates were measured at, normally
+            ``page.raster_dpi``
+        :returns: the box in points (1/72 inch), which stays valid across
+            rescaling
+        """
         s = 72.0 / float(dpi)
         return cls(page, x0 * s, y0 * s, x1 * s, y1 * s)
 
     @classmethod
     def from_xywh(cls, page: int, x: float, y: float, w: float, h: float) -> BBox:
-        """Build from a top-left corner plus a width and height."""
+        """Build from a top-left corner plus a width and height.
+
+        For engines reporting ``(x, y, w, h)`` rather than two corners --
+        Tesseract's TSV output among them.
+
+        :param page: zero-based page index
+        :param x: left edge, in points
+        :param y: top edge, in points
+        :param w: width in points
+        :param h: height in points
+        :returns: the equivalent corner-based box
+        """
         return cls(page, x, y, x + w, y + h)
 
     @classmethod
     def from_quad(cls, page: int, points: Sequence[Sequence[float]]) -> BBox:
-        """Axis-aligned hull of a polygon -- what most detectors actually emit."""
+        """Axis-aligned hull of a polygon -- what most detectors actually emit.
+
+        PaddleOCR, RapidOCR and EasyOCR all detect quadrilaterals so that rotated
+        text is found correctly.  The IR stores axis-aligned boxes, so the hull is
+        taken here; backends that need the original keep it in ``span.meta``.
+
+        :param page: zero-based page index
+        :param points: the polygon's vertices as ``[(x, y), ...]`` in points --
+            any number of them, though detectors emit four
+        :returns: the smallest axis-aligned box containing every vertex
+        """
         xs = [float(p[0]) for p in points]
         ys = [float(p[1]) for p in points]
         return cls(page, min(xs), min(ys), max(xs), max(ys))
 
     @classmethod
     def whole_page(cls, page: int, width_pt: float, height_pt: float) -> BBox:
-        """A box covering the entire page -- the default evidence region."""
+        """A box covering the entire page -- the default evidence region.
+
+        What a vision backend attaches to its spans, since it reports no
+        coordinates.  Such spans are marked ``approximate_bbox`` so nothing
+        mistakes a page-sized box for real geometry.
+
+        :param page: zero-based page index
+        :param width_pt: page width in points
+        :param height_pt: page height in points
+        :returns: a box spanning the whole page
+        """
         return cls(page, 0.0, 0.0, width_pt, height_pt)
 
     # -- serialisation ----------------------------------------------------
@@ -942,7 +1163,12 @@ class BBox(object):
 
     @classmethod
     def from_dict(cls, d: Mapping[str, Any]) -> BBox:
-        """Inverse of :meth:`to_dict`."""
+        """Inverse of :meth:`to_dict`.
+
+        :param d: a mapping with ``page``, ``x0``, ``y0``, ``x1``, ``y1``
+        :returns: the reconstructed box
+        :raises KeyError: a required key is missing
+        """
         return cls(int(d["page"]), float(d["x0"]), float(d["y0"]),
                    float(d["x1"]), float(d["y1"]))
 
@@ -953,7 +1179,16 @@ class BBox(object):
 
 
 def merge_bboxes(boxes: Sequence[BBox]) -> List[BBox]:
-    """Union boxes per page.  Evidence spanning pages stays as one box per page."""
+    """Union boxes per page.  Evidence spanning pages stays as one box per page.
+
+    Per page rather than one box overall, because a value found on pages 2 and 7
+    is two pieces of evidence -- collapsing them would produce a box spanning
+    both and pointing at neither.
+
+    :param boxes: any boxes, in any order, from any pages
+    :returns: one merged box per page that appeared, ordered by page index.
+        Empty input gives an empty list.
+    """
     by_page: Dict[int, BBox] = {}
     for b in boxes:
         cur = by_page.get(b.page)
@@ -1011,7 +1246,12 @@ class TextSpan(object):
 
     @classmethod
     def from_dict(cls, d: Mapping[str, Any]) -> TextSpan:
-        """Inverse of :meth:`to_dict`."""
+        """Inverse of :meth:`to_dict`.
+
+        :param d: a mapping as produced by :meth:`to_dict`
+        :returns: the reconstructed span
+        :raises KeyError: ``text`` or ``bbox`` is missing
+        """
         return cls(text=d["text"], bbox=BBox.from_dict(d["bbox"]),
                    source=d.get("source", "unknown"), confidence=d.get("confidence"),
                    script=d.get("script"), line=d.get("line"), block=d.get("block"),
@@ -1074,7 +1314,13 @@ class PageQuality(object):
 
     @classmethod
     def from_dict(cls, d: Mapping[str, Any]) -> PageQuality:
-        """Inverse of :meth:`to_dict` (the derived ``score`` key is ignored)."""
+        """Inverse of :meth:`to_dict` (the derived ``score`` key is ignored).
+
+        :param d: a mapping as produced by :meth:`to_dict`
+        :returns: the reconstructed quality.  Every key has a default that means
+            "undegraded", so a partial dict loads as a clean page rather than a
+            spuriously bad one.  ``score`` is recomputed from the components.
+        """
         return cls(blur=float(d.get("blur", 1.0)), skew_deg=float(d.get("skew_deg", 0.0)),
                    contrast=float(d.get("contrast", 1.0)),
                    ink_coverage=float(d.get("ink_coverage", 0.0)),
@@ -1108,7 +1354,13 @@ class LayoutRegion(object):
 
     @classmethod
     def from_dict(cls, d: Mapping[str, Any]) -> LayoutRegion:
-        """Inverse of :meth:`to_dict`."""
+        """Inverse of :meth:`to_dict`.
+
+        :param d: a mapping as produced by :meth:`to_dict`
+        :returns: the reconstructed region
+        :raises KeyError: ``bbox`` is missing
+        :raises ValueError: ``kind`` is not a :class:`RegionKind` value
+        """
         return cls(RegionKind(d.get("kind", "unknown")), BBox.from_dict(d["bbox"]),
                    float(d.get("confidence", 1.0)), dict(d.get("meta") or {}))
 
@@ -1120,7 +1372,13 @@ class Layout(object):
     regions: List[LayoutRegion] = field(default_factory=list)
 
     def of_kind(self, kind: RegionKind) -> List[LayoutRegion]:
-        """Every region of exactly ``kind``, in detection order."""
+        """Every region of exactly ``kind``, in detection order.
+
+        :param kind: the :class:`RegionKind` to filter on, e.g.
+            ``RegionKind.TABLE`` or ``RegionKind.SIGNATURE``.  Exact, not
+            hierarchical -- asking for ``TABLE`` never returns table cells.
+        :returns: the matching regions, in the order the detector found them
+        """
         return [r for r in self.regions if r.kind is kind]
 
     @property
@@ -1144,7 +1402,12 @@ class Layout(object):
 
     @classmethod
     def from_dict(cls, d: Mapping[str, Any]) -> Layout:
-        """Inverse of :meth:`to_dict`."""
+        """Inverse of :meth:`to_dict`.
+
+        :param d: a mapping as produced by :meth:`to_dict`
+        :returns: the reconstructed layout; a missing ``regions`` key yields an
+            empty layout rather than an error
+        """
         return cls([LayoutRegion.from_dict(r) for r in (d.get("regions") or [])])
 
 
@@ -1227,6 +1490,15 @@ class Page(object):
         * Once an op has run, the provider is dropped and the processed raster
           is authoritative; a differing DPI request rescales it instead, so an
           op chain is never silently discarded.
+
+        :param dpi: the resolution wanted.  ``None`` keeps the page's current
+            DPI, falling back to :data:`DEFAULT_DPI`.  Ask for what you need
+            rather than rescaling afterwards -- a re-render from the PDF beats
+            an upsample every time, and this method knows which is possible.
+        :returns: the page image as a ``uint8`` NumPy array, greyscale or RGB
+        :raises DocpipeError: the page has neither a raster nor a provider,
+            e.g. an email-body page, which carries text but no pixels.  Guard
+            with :meth:`has_raster`.
         """
         want = int(dpi or self._raster_dpi or DEFAULT_DPI)
         if self._raster is not None:
@@ -1259,6 +1531,15 @@ class Page(object):
 
         Dropping the provider is the default and is deliberate: after a deskew,
         re-rendering from the PDF would silently undo the op.
+
+        :param img: the new raster, a ``uint8`` NumPy array
+        :param dpi: the resolution ``img`` represents.  ``None`` keeps the page's
+            current DPI -- correct for an op that preserved size, wrong for one
+            that rescaled, which must pass the new value.
+        :param keep_provider: retain the lazy source.  Leave this ``False``
+            except when installing a raster equivalent to what the provider
+            would return; keeping it lets a later DPI change discard your image.
+        :returns: ``self``, so calls chain
         """
         self._raster = img
         self._raster_dpi = int(dpi or self._raster_dpi or DEFAULT_DPI)
@@ -1299,7 +1580,13 @@ class Page(object):
 
     # -- text -------------------------------------------------------------
     def text(self, separator: str = "\n") -> str:
-        """Reading-order text.  Spans are sorted by line, then by x."""
+        """Reading-order text.  Spans are sorted by line, then by x.
+
+        :param separator: placed between lines; the default single newline
+            preserves the page's line structure, which is what amount-and-label
+            parsing depends on
+        :returns: the page's text.  Empty for a page that has not been read.
+        """
         return separator.join(l.strip() for l in self.lines() if l.strip())
 
     def lines(self, y_tolerance: Optional[float] = None) -> List[str]:
@@ -1307,12 +1594,31 @@ class Page(object):
 
         ``y_tolerance`` defaults to 60% of the median span height, which tracks
         font size instead of assuming one.
+
+        :param y_tolerance: vertical distance in points within which two spans
+            count as the same line.  ``None`` derives it from the page's own
+            median span height, which is right across font sizes.  Pass a value
+            only for pages that defeat that -- a table whose rows are closer
+            than its text is tall.
+        :returns: one string per visual line, top to bottom, words joined by
+            single spaces.  Empty lines are dropped.
         """
         return [" ".join(s.text.strip() for s in group if s.text.strip())
                 for group in _group_spans_into_lines(self, y_tolerance)]
 
     def spans_in(self, bbox: BBox, min_overlap: float = 0.5) -> List[TextSpan]:
-        """Spans whose area overlaps ``bbox`` by at least ``min_overlap``."""
+        """Spans whose area overlaps ``bbox`` by at least ``min_overlap``.
+
+        The fraction is of the *span's* area, not the box's, so a small word
+        inside a large region counts as fully contained.
+
+        :param bbox: the region to search, in points
+        :param min_overlap: least fraction of each span's area that must fall
+            inside, in ``0.0..1.0``.  ``0.5`` requires the majority of the word;
+            ``0.3`` is more forgiving and is what evidence matching uses, since
+            OCR boxes and layout boxes come from different estimators.
+        :returns: the qualifying spans, in page order
+        """
         out = []
         for s in self.spans:
             inter = s.bbox.intersection(bbox)
@@ -1362,6 +1668,16 @@ class Page(object):
 
         Ops use this so that a pipeline never mutates the caller's document --
         A/B'ing two pipelines against one ingested document has to be safe.
+
+        The raster is shared, not copied: it is large, and ops replace it rather
+        than writing into it.  Everything else -- spans, layout, history, meta --
+        is copied, so the two pages diverge cleanly.
+
+        :param deep_spans: copy each :class:`TextSpan` rather than sharing the
+            objects.  ``True`` is right whenever the copy will be read or
+            normalised, since span mutation would otherwise reach back into the
+            original.
+        :returns: the new page
         """
         new = Page(
             index=self.index, width_pt=self.width_pt, height_pt=self.height_pt,
@@ -1381,6 +1697,10 @@ class Page(object):
 
         ``include_spans=False`` keeps the structure and the measurements but drops
         the text, which is what the eval harness stores for a fixture.
+
+        :param include_spans: keep the per-span text and geometry
+        :returns: a JSON-serialisable dict.  The raster is never included --
+            see :meth:`Page.from_dict`.
         """
         d = {
             "index": self.index, "kind": str(self.kind),
@@ -1396,7 +1716,16 @@ class Page(object):
 
     @classmethod
     def from_dict(cls, d: Mapping[str, Any]) -> Page:
-        """Inverse of :meth:`to_dict`.  The raster is *not* restored."""
+        """Inverse of :meth:`to_dict`.  The raster is *not* restored.
+
+        Pixels are deliberately not serialised -- a JSON document would be
+        enormous -- so a restored page has spans, geometry and history but
+        :meth:`has_raster` is ``False``.  Re-ingest the source to read it again.
+
+        :param d: a mapping as produced by :meth:`to_dict`
+        :returns: the reconstructed page
+        :raises KeyError: ``index`` is missing; every other key has a default
+        """
         page = cls(
             index=int(d["index"]),
             width_pt=float(d.get("width_pt", 612.0)),
@@ -1438,18 +1767,41 @@ class Document(object):
         return iter(self.pages)
 
     def __getitem__(self, i: int) -> Page:
-        """Page by list position (see :meth:`page` for lookup by page index)."""
+        """Page by list position (see :meth:`page` for lookup by page index).
+
+        Position and page index diverge the moment pages are filtered or split,
+        which is why both accessors exist.
+
+        :param i: list position, negative indexing allowed
+        :returns: the page at that position
+        :raises IndexError: out of range
+        """
         return self.pages[i]
 
     def page(self, index: int) -> Page:
-        """Page by its ``index`` attribute (not its list position)."""
+        """Page by its ``index`` attribute (not its list position).
+
+        The accessor to use when resolving provenance: every ``bbox.page`` is a
+        page index, not a position, and the two differ after :meth:`select`.
+
+        :param index: the page's own ``index`` attribute
+        :returns: the matching page
+        :raises KeyError: no page carries that index
+        """
         for p in self.pages:
             if p.index == index:
                 return p
         raise KeyError("no page with index %d" % index)
 
     def text(self, separator: str = "\n\n") -> str:
-        """Reading-order text of every non-empty page, joined by ``separator``."""
+        """Reading-order text of every non-empty page, joined by ``separator``.
+
+        :param separator: placed between pages.  The default blank line reads
+            naturally; use :func:`format_document_text` instead when the text is
+            headed for a prompt, since that one adds page markers.
+        :returns: the document's text.  Empty for a document that has been
+            ingested but not read.
+        """
         return separator.join(p.text() for p in self.pages if p.text().strip())
 
     def spans(self) -> List[TextSpan]:
@@ -1477,6 +1829,10 @@ class Document(object):
 
         Warnings survive on the Document rather than being raised because a bad
         page is not a bad document: the caller usually wants the other 40 pages.
+
+        :param message: what went wrong.  Duplicates are dropped, so a warning
+            raised once per page on a 300-page bundle appears once.
+        :returns: ``self``, so calls chain
         """
         if message not in self.warnings:
             self.warnings.append(message)
@@ -1495,13 +1851,28 @@ class Document(object):
         return self
 
     def select(self, predicate: Callable[[Page], bool]) -> Document:
-        """A new Document containing only pages satisfying ``predicate``."""
+        """A new Document containing only pages satisfying ``predicate``.
+
+        Page ``index`` attributes are preserved, not renumbered, so provenance
+        still resolves through :meth:`page`.  Use :func:`Ingest.merge_documents`
+        when you do want contiguous renumbering.
+
+        :param predicate: ``Callable[[Page], bool]``, e.g.
+            ``lambda p: not p.is_blank`` or ``lambda p: p.quality.score > 0.5``
+        :returns: a new document sharing the surviving page objects
+        """
         return Document(source_uri=self.source_uri,
                         pages=[p for p in self.pages if predicate(p)],
                         meta=dict(self.meta), warnings=list(self.warnings))
 
     def to_dict(self, include_spans: bool = True) -> Dict[str, Any]:
-        """JSON-ready dict; ``include_spans=False`` drops the text."""
+        """JSON-ready dict; ``include_spans=False`` drops the text.
+
+        :param include_spans: keep per-page spans.  ``False`` yields a compact
+            structural summary -- geometry, quality, history -- which is what you
+            want for a manifest or a diff between two runs.
+        :returns: a JSON-serialisable dict.  Rasters are never included.
+        """
         return {
             "source_uri": self.source_uri,
             "meta": _as_jsonable(self.meta),
@@ -1511,21 +1882,37 @@ class Document(object):
 
     @classmethod
     def from_dict(cls, d: Mapping[str, Any]) -> Document:
-        """Inverse of :meth:`to_dict`.  Rasters are *not* restored."""
+        """Inverse of :meth:`to_dict`.  Rasters are *not* restored.
+
+        :param d: a mapping as produced by :meth:`to_dict`
+        :returns: the reconstructed document, on which every page reports
+            a :meth:`Page.has_raster` of ``False``.
+        """
         return cls(source_uri=d.get("source_uri", ""),
                    pages=[Page.from_dict(p) for p in (d.get("pages") or [])],
                    meta=dict(d.get("meta") or {}),
                    warnings=list(d.get("warnings") or []))
 
     def save_json(self, path: str, include_spans: bool = True) -> str:
-        """Write :meth:`to_dict` to ``path`` as UTF-8 JSON.  Returns ``path``."""
+        """Write :meth:`to_dict` to ``path`` as UTF-8 JSON.  Returns ``path``.
+
+        :param path: destination file; overwritten if it exists
+        :param include_spans: keep per-page spans, as :meth:`to_dict`
+        :returns: ``path``, so it can be used inline
+        """
         with open(path, "w", encoding="utf-8") as fh:
             fh.write(to_json(self.to_dict(include_spans=include_spans)))
         return path
 
     @classmethod
     def load_json(cls, path: str) -> Document:
-        """Read a document back from a file written by :meth:`save_json`."""
+        """Read a document back from a file written by :meth:`save_json`.
+
+        :param path: a file written by :meth:`save_json`
+        :returns: the reconstructed document, without rasters
+        :raises OSError: the file could not be read
+        :raises ValueError: the file is not valid JSON
+        """
         with open(path, "r", encoding="utf-8") as fh:
             return cls.from_dict(json.load(fh))
 
@@ -1551,6 +1938,14 @@ class Cost(object):
 
         Mixing currencies raises :class:`ConfigError` -- unless one side is zero,
         which is what makes ``sum(costs)`` (starting from ``0``) work.
+
+        :param other: the cost to add
+        :returns: a new :class:`Cost` with amounts, tokens, calls and wasted
+            calls summed.  ``NotImplemented`` for a non-``Cost``, so Python falls
+            back to the reflected operand.
+        :raises ConfigError: both sides are non-zero and in different currencies.
+            No conversion is attempted -- a guessed exchange rate is exactly the
+            kind of confidently wrong number this library refuses to produce.
         """
         if not isinstance(other, Cost):
             return NotImplemented
@@ -1567,7 +1962,12 @@ class Cost(object):
 
     @classmethod
     def zero(cls, currency: str = "USD") -> Cost:
-        """An empty cost in ``currency`` -- the identity for addition."""
+        """An empty cost in ``currency`` -- the identity for addition.
+
+        :param currency: the currency label; no conversion is ever performed, so
+            it must match the units of your registered prices
+        :returns: a zero cost, safe to use as an accumulator seed
+        """
         return cls(currency=currency)
 
     @property
@@ -1603,17 +2003,33 @@ class Cost(object):
 
 
 def is_gray(img: ImageArray) -> bool:
-    """True for a single-channel ``(H, W)`` array."""
+    """True for a single-channel ``(H, W)`` array.
+
+    :param img: an array, or anything without ``ndim`` (which reports ``False``)
+    :returns: whether the array is two-dimensional
+    """
     return getattr(img, "ndim", 0) == 2
 
 
 def is_color(img: ImageArray) -> bool:
-    """True for a multi-channel ``(H, W, C>=3)`` array."""
+    """True for a multi-channel ``(H, W, C>=3)`` array.
+
+    :param img: an array, or anything without ``ndim`` (which reports ``False``)
+    :returns: whether the array is three-dimensional with at least 3 channels.
+        A single-channel ``(H, W, 1)`` array is *not* colour by this test.
+    """
     return getattr(img, "ndim", 0) == 3 and img.shape[2] >= 3
 
 
 def image_shape(img: ImageArray) -> Tuple[int, int]:
-    """``(height, width)`` in pixels."""
+    """``(height, width)`` in pixels.
+
+    Note the order: NumPy's, not the ``(width, height)`` that
+    :func:`Image.resize_image` takes.  Mixing the two silently transposes pages.
+
+    :param img: a 2D or 3D array
+    :returns: ``(height, width)``, ignoring any channel dimension
+    """
     return (int(img.shape[0]), int(img.shape[1]))
 
 
@@ -1655,7 +2071,16 @@ class Image(object):
 
     @staticmethod
     def ensure_uint8(img: ImageArray) -> ImageArray:
-        """Coerce any numeric array to uint8, scaling float [0,1] images by 255."""
+        """Coerce any numeric array to uint8, scaling float [0,1] images by 255.
+
+        The guard at the top of every image primitive, so ops need not care
+        whether an upstream step handed back floats or booleans.
+
+        :param img: any numeric array -- ``uint8`` passes straight through,
+            floats peaking at or below ``1.0`` are scaled by 255, booleans map to
+            ``0``/``255``, and anything else is clipped into ``0..255``
+        :returns: a ``uint8`` array of the same shape
+        """
         np = _np()
         arr = np.asarray(img)
         if arr.dtype == np.uint8:
@@ -1671,7 +2096,13 @@ class Image(object):
 
     @staticmethod
     def to_gray(img: ImageArray) -> GrayImage:
-        """Grayscale view of ``img`` using ITU-R 601 luma weights."""
+        """Grayscale view of ``img`` using ITU-R 601 luma weights.
+
+        :param img: a greyscale or colour array.  Greyscale input is returned
+            unchanged, so this is safe to call unconditionally; an alpha channel
+            is dropped.
+        :returns: a single-channel ``uint8`` array
+        """
         np = _np()
         arr = ensure_uint8(img)
         if arr.ndim == 2:
@@ -1686,7 +2117,12 @@ class Image(object):
 
     @staticmethod
     def to_rgb(img: ImageArray) -> ImageArray:
-        """3-channel RGB view of ``img``."""
+        """3-channel RGB view of ``img``.
+
+        :param img: a greyscale or colour array.  Greyscale is replicated across
+            three channels; a 4-channel image loses its alpha.
+        :returns: an ``(H, W, 3)`` ``uint8`` array
+        """
         np = _np()
         arr = ensure_uint8(img)
         if arr.ndim == 3:
@@ -1701,6 +2137,12 @@ class Image(object):
         what makes Sauvola-family binarisation practical at 300 DPI.  Windows are
         clipped at the borders and the divisor tracks the clipped area, so edge
         pixels are not biased toward black the way zero-padding would make them.
+
+        :param gray: a single-channel array
+        :param window: neighbourhood side in pixels.  Cost does not grow with it,
+            so pick it by what the page needs -- a little taller than one text
+            line for binarisation.
+        :returns: ``(mean, std)``, both float arrays the same shape as ``gray``
         """
         np = _np()
         g = np.asarray(gray, dtype=np.float64)
@@ -1729,7 +2171,13 @@ class Image(object):
 
     @staticmethod
     def box_blur(img: ImageArray, radius: int) -> ImageArray:
-        """Mean filter of radius ``radius`` (integral-image based in the fallback)."""
+        """Mean filter of radius ``radius`` (integral-image based in the fallback).
+
+        :param img: greyscale or colour; colour is filtered per channel
+        :param radius: half-width in pixels, so the kernel is ``2 * radius + 1``
+            square.  Below ``1`` the image is returned unchanged.
+        :returns: the blurred ``uint8`` array
+        """
         np = _np()
         if radius < 1:
             return ensure_uint8(img)
@@ -1751,6 +2199,12 @@ class Image(object):
         to uint8, so its effective sigma runs slightly under the request at large
         radii.  Measured against :func:`Quality.measure_blur` the two paths agree to within
         about 0.02 over sigma 0.8-4.0, which is what the tests assert.
+
+        :param img: greyscale or colour
+        :param sigma: standard deviation in pixels.  Zero or negative returns the
+            image unchanged.  The kernel radius is derived from it, so cost grows
+            with sigma on the OpenCV path and stays flat on the fallback.
+        :returns: the blurred ``uint8`` array
         """
         if sigma <= 0:
             return ensure_uint8(img)
@@ -1767,7 +2221,18 @@ class Image(object):
 
     @staticmethod
     def median_blur(img: ImageArray, ksize: int = 3) -> ImageArray:
-        """Median filter -- the right tool for salt-and-pepper scanner speckle."""
+        """Median filter -- the right tool for salt-and-pepper scanner speckle.
+
+        Unlike a mean filter it removes isolated specks without softening the
+        stroke edges around them, which is why denoising uses it rather than a
+        blur.
+
+        :param img: greyscale or colour; colour is filtered per channel
+        :param ksize: kernel side in pixels, forced odd.  ``3`` removes single
+            speckles; ``5`` handles heavier fax noise and starts to round off the
+            corners of glyphs.
+        :returns: the filtered ``uint8`` array
+        """
         np = _np()
         cv = _cv2()
         arr = ensure_uint8(img)
@@ -1793,6 +2258,18 @@ class Image(object):
         ``interpolation="auto"`` picks cubic when upscaling (preserves stroke edges
         that OCR character models rely on) and area when downscaling (avoids the
         aliasing that makes fine print look like noise).
+
+        :param img: greyscale or colour
+        :param size: target ``(width, height)`` in pixels -- note this is the
+            opposite order to :func:`Image.image_shape`.  Takes precedence over
+            ``scale``.
+        :param scale: uniform multiplier, used when ``size`` is ``None``.  A
+            scale of ``1.0`` returns the image unchanged.
+        :param interpolation: ``"auto"`` (cubic up, area down), or one of
+            ``"nearest"``, ``"linear"``, ``"cubic"``, ``"area"``.  Use
+            ``"nearest"`` on an already-binarised page, where interpolation would
+            reintroduce grey.
+        :returns: the resized ``uint8`` array
         """
         np = _np()
         arr = ensure_uint8(img)
@@ -1842,6 +2319,18 @@ class Image(object):
         mode of the naive implementation.  ``border_value`` defaults to the
         image's median, which keeps a white page white and a dark scan dark rather
         than stamping black wedges that later confuse ink-coverage measurement.
+
+        :param img: greyscale or colour
+        :param angle_deg: counter-clockwise rotation in degrees.  Angles under
+            ``1e-4`` return the image unchanged.
+        :param border_value: fill level for exposed corners, ``0..255``.
+            ``None`` uses the image's median, which is what keeps a white page
+            white and a dark scan dark.
+        :param expand: grow the canvas so nothing is clipped.  Leave it ``True``
+            for deskewing -- ``False`` keeps the original dimensions and cuts the
+            corners off, which loses letterheads.
+        :returns: the rotated ``uint8`` array, larger than the input when
+            ``expand`` is set
         """
         np = _np()
         arr = ensure_uint8(img)
@@ -1908,6 +2397,13 @@ class Image(object):
         For angles under ~15 degrees a shear and a rotation give indistinguishable
         profiles, and the shear costs one integer fancy-index instead of a full
         resampling pass.
+
+        :param gray: a single-channel array
+        :param angle_deg: the tilt to simulate, in degrees.  Accurate for small
+            angles only -- beyond about 15 degrees a shear stops approximating a
+            rotation, which is why the skew search is bounded there.
+        :returns: the per-row ink sums as a float array, whose variance peaks at
+            the angle that makes text lines horizontal
         """
         np = _np()
         g = np.asarray(gray, dtype=np.float64)
@@ -1922,7 +2418,13 @@ class Image(object):
 
     @staticmethod
     def otsu_threshold(gray: GrayImage) -> int:
-        """Otsu's global threshold via between-class variance maximisation."""
+        """Otsu's global threshold via between-class variance maximisation.
+
+        :param gray: a greyscale or colour array; colour is converted first
+        :returns: the threshold as an integer in ``0..255``.  Global, so it is
+            exact on an evenly-lit page and badly wrong under a shadow gradient
+            -- which is what :func:`Image.ink_mask` detects and works around.
+        """
         np = _np()
         g = to_gray(gray)
         hist = np.bincount(g.ravel(), minlength=256).astype(np.float64)
@@ -1962,7 +2464,14 @@ class Image(object):
         mask checks for that case and switches to a local (Sauvola) threshold,
         which is immune to it.
 
-        ``adaptive`` may be ``"auto"`` (default), ``True`` or ``False``.
+        :param gray: a greyscale or colour array
+        :param threshold: force a fixed grey level, ``0..255``; pixels at or
+            below it are ink.  ``None`` chooses a threshold automatically, which
+            is almost always what you want.
+        :param adaptive: ``"auto"`` (default) uses a local Sauvola threshold only
+            when the page looks unevenly lit; ``True`` always does; ``False``
+            always uses global Otsu.  Ignored when ``threshold`` is given.
+        :returns: a boolean mask, ``True`` where there is ink
         """
         g = to_gray(gray)
         if threshold is not None:
@@ -1977,7 +2486,13 @@ class Image(object):
 
     @staticmethod
     def gradient_magnitude(gray: GrayImage) -> FloatArray:
-        """Sobel gradient magnitude as float64.  Used by the sharpness metric."""
+        """Sobel gradient magnitude as float64.  Used by the sharpness metric.
+
+        :param gray: a greyscale or colour array; colour is converted first
+        :returns: a float array of edge strengths, the same shape as the input.
+            Unnormalised, so compare it against itself rather than an absolute
+            number.
+        """
         np = _np()
         g = to_gray(gray).astype(np.float64)
         cv = _cv2()
@@ -2000,6 +2515,16 @@ class Image(object):
 
         Implemented with summed-area tables so that a 1x120 kernel (what line
         removal needs) costs the same as a 3x3 one.
+
+        :param mask: a boolean or ``0``/``1`` array
+        :param kh: kernel height in pixels
+        :param kw: kernel width in pixels.  Asymmetry is the point: ``(1, 120)``
+            finds horizontal rules and ignores everything else.
+        :param operation: ``"erode"``, ``"dilate"``, ``"open"`` (erode then
+            dilate, removing specks) or ``"close"`` (dilate then erode, filling
+            gaps).  Named from the mask's point of view, so ``"dilate"`` grows
+            the ``True`` region.
+        :returns: the transformed boolean mask
         """
         np = _np()
         m = np.asarray(mask).astype(np.uint8)
@@ -2030,6 +2555,15 @@ class Image(object):
         text line survives as background and the correction punches a hole through
         it.  Sized at 1/12 of the shorter side and clamped: big enough for body
         text at any sane DPI, small enough to still follow a shadow gradient.
+
+        :param gray: a greyscale or colour array
+        :param radius: kernel size in pixels, forced odd, minimum ``3``.
+            ``None`` derives one from the page size, which is right unless the
+            text is unusually large -- a kernel narrower than a glyph is tall
+            leaves text in the background estimate.
+        :returns: the estimated background as a ``uint8`` array, the same shape
+            as the input.  Divide the page by it to flatten lighting, which is
+            what :func:`Ops.normalize_illumination` does.
         """
         np = _np()
         g = to_gray(gray)
@@ -2066,7 +2600,16 @@ class Image(object):
 
     @staticmethod
     def encode_png(img: ImageArray) -> bytes:
-        """Encode an array as PNG bytes -- what vision backends actually send."""
+        """Encode an array as PNG bytes -- what vision backends actually send.
+
+        Lossless, so prefer it for archival and for debugging output.  For a
+        model call use :func:`Image.encode_jpeg`, which is several times smaller
+        at a quality the page cannot tell apart.
+
+        :param img: greyscale or colour
+        :returns: the PNG bytes
+        :raises MissingDependency: neither OpenCV nor Pillow is importable
+        """
         arr = ensure_uint8(img)
         cv = _cv2()
         if cv is not None:
@@ -2086,7 +2629,16 @@ class Image(object):
     def encode_jpeg(img: ImageArray, quality: int = 88) -> bytes:
         """Encode as JPEG.  Preferred for VLM calls: a 300 DPI page as PNG is
         several megabytes, and the artefacts JPEG adds at q>=85 are well below what
-        the scanner already introduced."""
+        the scanner already introduced.
+
+        :param img: greyscale or colour; greyscale is expanded to RGB
+        :param quality: JPEG quality in ``1..100``.  ``88`` is the default and
+            sits above the point where compression artefacts become visible to a
+            recogniser; below ``75`` ringing around glyph edges starts to cost
+            accuracy.
+        :returns: the JPEG bytes
+        :raises MissingDependency: neither OpenCV nor Pillow is importable
+        """
         arr = ensure_uint8(img)
         cv = _cv2()
         if cv is not None:
@@ -2110,6 +2662,12 @@ class Image(object):
         bytes are not a decodable image.  Callers batch-processing a directory or
         walking email attachments need one exception type to catch, or a single
         corrupt scan takes down the run.
+
+        :param data: the encoded bytes -- PNG, JPEG, BMP, GIF or WebP.  Format is
+            detected from content, so no filename is needed.
+        :returns: a ``uint8`` array, greyscale ``(H, W)`` or RGB ``(H, W, 3)``
+        :raises IngestError: the bytes are empty or not a decodable image
+        :raises MissingDependency: neither OpenCV nor Pillow is importable
         """
         np = _np()
         if not data:
@@ -2141,7 +2699,15 @@ class Image(object):
 
     @staticmethod
     def save_image(img: ImageArray, path: str) -> str:
-        """Write an array to disk, choosing the encoder from the extension."""
+        """Write an array to disk, choosing the encoder from the extension.
+
+        :param img: greyscale or colour
+        :param path: destination.  ``.jpg``/``.jpeg`` encode as JPEG; every other
+            extension, including none, encodes as PNG.
+        :returns: ``path``, so it can be used inline
+        :raises MissingDependency: neither OpenCV nor Pillow is importable
+        :raises OSError: the file could not be written
+        """
         ext = os.path.splitext(path)[1].lower()
         data = encode_jpeg(img) if ext in (".jpg", ".jpeg") else encode_png(img)
         with open(path, "wb") as fh:
@@ -2298,6 +2864,10 @@ class Quality(object):
 
         Roughly: crisp print ~0.9, Gaussian sigma=1 ~0.6, sigma=2 ~0.45,
         sigma=4 ~0.3, sigma=8 ~0.05, a 120 DPI scan upsampled to 300 ~0.18.
+        
+        :param gray: the page as a greyscale array; colour input is converted
+        :returns: sharpness in ``0.0..1.0``; ``1.0`` is crisp.  Compare against
+            ``QualityThresholds.blur_floor`` (degraded) and ``blur_unreadable``.
         """
         np = _np()
         g = to_gray(gray)
@@ -2337,6 +2907,11 @@ class Quality(object):
 
         Falls back to the percentile spread when the page has too little (or too
         much) ink for the split to mean anything.
+        
+        :param gray: the page as a greyscale array; colour input is converted
+        :returns: ink-to-paper separation in ``0.0..1.0``.  A near-blank page
+            reports high contrast rather than zero, since there is no ink whose
+            separation could be poor.
         """
         np = _np()
         g = to_gray(gray)
@@ -2354,7 +2929,13 @@ class Quality(object):
 
     @staticmethod
     def measure_ink_coverage(gray: GrayImage) -> float:
-        """Fraction of pixels that are ink, using an illumination-aware mask."""
+        """Fraction of pixels that are ink, using an illumination-aware mask.
+
+        :param gray: the page as a greyscale array; colour input is converted
+        :returns: inked fraction in ``0.0..1.0``.  Body text lands near ``0.05``,
+            dense Devanagari near ``0.25``; above ``0.4`` suggests a negative
+            scan -- see :func:`Ops.invert_if_dark`.
+        """
         mask = ink_mask(gray)
         return round(float(mask.mean()), 5) if mask.size else 0.0
 
@@ -2366,6 +2947,11 @@ class Quality(object):
         both text edges and noise.  Text edges are sparse and large; sensor noise is
         dense and small, so the *median* absolute residual tracks noise while being
         largely blind to text.
+        
+        :param gray: the page as a greyscale array; colour input is converted
+        :returns: speckle in ``0.0..1.0``; ``0.0`` is clean.  Above
+            ``QualityThresholds.noise_ceiling`` the page is treated as degraded
+            and :func:`Ops.denoise` is reached for.
         """
         np = _np()
         g = to_gray(gray)
@@ -2385,6 +2971,12 @@ class Quality(object):
         away) and its spread measured.  This is what catches phone photos with a
         shadow across one half -- the exact case where global binarisation destroys
         a third of the page.
+        
+        :param gray: the page as a greyscale array; colour input is converted
+        :returns: evenness in ``0.0..1.0``; ``1.0`` is perfectly flat lighting
+            and ``0.0`` a hard shadow gradient.  Below the
+            ``QualityThresholds.illumination_floor`` cut-off,
+            the op :func:`Ops.normalize_illumination` is applied.
         """
         np = _np()
         g = to_gray(gray).astype(np.float64)
@@ -2422,6 +3014,25 @@ class Quality(object):
 
         Returns ``0.0`` when the page has too little ink to judge, or when no angle
         is convincingly better than leaving the page alone.
+
+        :param gray: the page as a greyscale array; colour input is converted
+        :param max_angle: widest tilt to search, in degrees either way.  Beyond
+            ``15`` a page is not skewed but rotated -- a different problem, and
+            searching that far mostly finds table rules.
+        :param method: ``"auto"``, ``"projection"``, ``"hough"``, or
+            ``"minarearect"``, each described above.  ``"auto"`` takes the median
+            of whichever are available.
+        :param coarse_step: degrees per step in the first projection pass.
+            ``1.0`` is ample; smaller only costs time, since the fine pass
+            refines whatever the coarse pass found.
+        :param fine_step: degrees per step in the refinement pass.  ``0.1`` is
+            below what deskewing can act on anyway -- :func:`Ops.deskew` declines
+            under ``0.4`` degrees.
+        :param min_improvement: how much better than the straight-page hypothesis
+            a candidate must score to be believed, as a relative margin.  ``0.15``
+            keeps a page that is genuinely straight from being rotated by noise.
+        :returns: the skew in degrees, positive meaning content tilted clockwise;
+            ``0.0`` when the page is straight, nearly blank, or ink-saturated
         """
         np = _np()
         g = to_gray(gray)
@@ -2584,6 +3195,11 @@ class Quality(object):
         puts the Otsu threshold outside the true stroke and the halo is counted as
         ink.  Callers must not use it as a resolution estimate on a soft page;
         see :func:`Quality.estimate_line_pitch`.
+        
+        :param gray: the page as a greyscale array; colour input is converted
+        :returns: mean stroke thickness in pixels, or ``0.0`` when the page has
+            too little ink.  Roughly 3 px for body text at 300 DPI -- but it
+            inflates under blur, so prefer line pitch for resolution.
         """
         np = _np()
         mask = ink_mask(to_gray(gray))
@@ -2610,6 +3226,15 @@ class Quality(object):
 
         Returns ``0.0`` when the projection has no convincing periodicity -- a
         title page, a photograph, or a form with irregular row heights.
+
+        :param gray: the page as a greyscale array
+        :param min_pitch: shortest spacing considered, in pixels.  ``8`` is below
+            body text at any usable resolution; raising it rejects the harmonics
+            that dense text can produce.
+        :param max_pitch: longest spacing considered, in pixels.  ``200`` covers
+            double-spaced large print at 600 DPI.
+        :returns: the dominant line spacing in pixels, or ``0.0`` when the page
+            has too little ink or no convincing periodicity
         """
         np = _np()
         g = to_gray(gray)
@@ -2678,6 +3303,13 @@ class Quality(object):
         prose.
 
         Returns ``fallback`` when the page carries too little ink to judge.
+
+        :param gray: the page as a greyscale array
+        :param fallback: returned when neither cue yields an estimate.  Pass the
+            page's nominal ``raster_dpi`` so callers always get a usable number.
+        :returns: estimated content DPI, clamped to ``30..1200``.  Compare it
+            against ``page.raster_dpi``: a large gap means the page was upsampled
+            somewhere and carries less signal than its size suggests.
         """
         g = to_gray(gray)
         pitch = estimate_line_pitch(g)
@@ -2704,6 +3336,13 @@ class Quality(object):
         ``unreadable`` is a routing signal, not a discard: those pages get the
         vision model and a confidence penalty rather than being dropped, because a
         human reviewer would rather see a low-confidence guess than a blank.
+
+        :param q: the measured :class:`PageQuality`
+        :param thresholds: cut-offs to compare against.  ``None`` uses the
+            defaults in :data:`DEFAULT_THRESHOLDS`
+        :returns: a :class:`Verdict`.  A near-blank page reports ``CLEAN`` rather
+            than ``UNREADABLE`` -- there is nothing on it to misread, and calling
+            it unreadable would route empty pages to the expensive backend.
         """
         th = thresholds or DEFAULT_THRESHOLDS
         if q.ink_coverage < th.ink_blank:
@@ -2726,7 +3365,23 @@ class Quality(object):
     def measure_quality(img: ImageArray, raster_dpi: int = 0,
                         thresholds: Optional[QualityThresholds] = None,
                         skew_method: str = "auto", max_skew: float = 15.0) -> PageQuality:
-        """Measure every channel-degradation signal for one page image."""
+        """Measure every channel-degradation signal for one page image.
+
+        The measurement half of adaptive preprocessing: policies read the result
+        and reach only for the ops a page's actual degradation warrants.
+
+        :param img: the page raster, greyscale or colour
+        :param raster_dpi: the resolution the image was rendered at, recorded on
+            the result and used as the fallback for ``effective_dpi``.  ``0``
+            means unknown.
+        :param thresholds: cut-offs for the verdict.  ``None`` uses the
+            defaults in :data:`DEFAULT_THRESHOLDS`
+        :param skew_method: passed to :func:`Quality.estimate_skew` -- ``"auto"``,
+            ``"projection"``, ``"hough"``, or ``"minarearect"``
+        :param max_skew: widest skew to search, in degrees
+        :returns: a :class:`PageQuality` carrying blur, skew, contrast, ink
+            coverage, noise, illumination, effective DPI and an overall verdict
+        """
         gray = to_gray(img)
         q = PageQuality(
             blur=measure_blur(gray),
@@ -2746,7 +3401,19 @@ class Quality(object):
     @staticmethod
     def measure_page(page: Page, dpi: Optional[int] = None,
                      thresholds: Optional[QualityThresholds] = None, **kwargs: Any) -> Page:
-        """Measure ``page`` in place and return it.  No-op for pages without rasters."""
+        """Measure ``page`` in place and return it.  No-op for pages without rasters.
+
+        :param page: the page to measure; ``page.quality`` is replaced and the
+            measurement recorded in ``page.history``
+        :param dpi: render the raster at this DPI for measuring; ``None`` uses
+            whatever the page already has
+        :param thresholds: cut-offs for the verdict.  ``None`` uses the
+            defaults in :data:`DEFAULT_THRESHOLDS`
+        :param kwargs: forwarded to :func:`Quality.measure_quality` --
+            ``skew_method``, ``max_skew``
+        :returns: the same page, mutated.  A page with no raster is returned
+            untouched, its quality left at defaults.
+        """
         if not page.has_raster():
             return page
         with Timer() as t:
@@ -2760,7 +3427,18 @@ class Quality(object):
     def measure_document(doc: Document, dpi: Optional[int] = None,
                          thresholds: Optional[QualityThresholds] = None, max_workers: int = 0,
                          **kwargs: Any) -> Document:
-        """Measure every page's quality.  Returns the same Document, mutated."""
+        """Measure every page's quality.  Returns the same Document, mutated.
+
+        :param doc: the document to measure, page by page
+        :param dpi: render DPI for measuring; ``None`` uses each page's own
+        :param thresholds: cut-offs for the verdict.  ``None`` uses the
+            defaults in :data:`DEFAULT_THRESHOLDS`
+        :param max_workers: threads to measure with.  ``0`` runs serially.
+        :param kwargs: forwarded to :func:`Quality.measure_quality`
+        :returns: the same document, mutated.  :func:`preprocess` does this for
+            you -- call it directly to inspect quality without changing pixels,
+            which is what ``docpipe quality`` does.
+        """
         _map_maybe_parallel(
             lambda p: measure_page(p, dpi=dpi, thresholds=thresholds, **kwargs),
             doc.pages, max_workers, "measure")
@@ -2838,7 +3516,19 @@ class Ingest(object):
 
     @staticmethod
     def sniff_format(data: bytes, filename: str = "") -> str:
-        """Identify a document format from its bytes, falling back to its name."""
+        """Identify a document format from its bytes, falling back to its name.
+
+        Content first, extension last, because in practice the extension lies:
+        scanners emit ``.pdf`` files that are really TIFFs, and mail gateways
+        strip extensions entirely.
+
+        :param data: the leading bytes of the file; the first 2 KB are enough
+        :param filename: used only for its extension, and only when the magic
+            bytes were inconclusive
+        :returns: one of ``"pdf"``, ``"png"``, ``"jpeg"``, ``"tiff"``, ``"bmp"``,
+            ``"gif"``, ``"webp"``, ``"eml"``, or ``"unknown"``.  A ``.msg`` file
+            reports ``"eml"``, since it takes the same path.
+        """
         head = data[:64] if data else b""
         for magic, name in _MAGIC:
             if head.startswith(magic):
@@ -2872,6 +3562,23 @@ class Ingest(object):
         insert pasted in (a photographed bill stapled into a typed claim form).
         Those pages need *both* paths, and treating them as native silently loses
         the insert -- which is usually where the numbers are.
+
+        :param char_count: characters the PDF's text layer reports for this page
+        :param image_area_ratio: fraction of the page covered by embedded raster
+            images, in ``0.0..1.0``.  Above ``0.35`` alongside real text means
+            HYBRID -- a scanned insert on a typed form.
+        :param has_images: whether the page embeds any raster image at all
+        :param min_chars: characters below which the text layer is not trusted.
+            Defaults to :data:`MIN_NATIVE_CHARS`.  Scanned pages routinely carry
+            a handful of stray characters from a header stamp, so the floor
+            cannot be ``1``.
+        :param ink_hint: measured ink coverage in ``0.0..1.0``, when known.  Lets
+            a page with no text and no embedded image still be called SCANNED
+            rather than BLANK, which is the case for a page whose content is one
+            large drawing.
+        :returns: the :class:`PageKind` -- ``DIGITAL_NATIVE``, ``HYBRID``,
+            ``SCANNED``, or ``BLANK``.  This drives routing, as decided
+            by :func:`default_router`.
         """
         if char_count >= min_chars:
             if has_images and image_area_ratio > 0.35:
@@ -2894,6 +3601,28 @@ class Ingest(object):
         encrypted-but-openable files (empty owner password), files with leading
         junk before ``%PDF-``, and structurally damaged files that PyMuPDF can
         repair on a second pass.
+
+        :param source: path, path-like, raw ``bytes``, or an open binary file
+        :param password: for an encrypted PDF.  Files encrypted with an empty
+            owner password -- the common case for bank and hospital statements --
+            open without this.
+        :param max_pages: stop after this many pages; ``0`` means all of them.
+            Applied after ``page_range``.
+        :param page_range: zero-based page indices to ingest, e.g.
+            ``range(10, 20)`` or ``[0, 5, 9]``.  ``None`` takes every page.
+        :param render_dpi: resolution for the lazy page renderers.  ``300`` is
+            the floor for reliable OCR, ``400`` helps on small print.  Nothing is
+            rendered until a page's raster is actually asked for -- a 300-page
+            bundle at 400 DPI would be tens of gigabytes eagerly.
+        :param extract_text: read the embedded text layer.  Leave it on: it is
+            nearly free, and it is what lets :func:`default_router` route a
+            digital page to the exact, free ``"pymupdf"`` read.
+        :param min_native_chars: per-page character floor for trusting that text
+            layer; passed to :func:`Ingest.classify_page_kind`.
+        :returns: a :class:`Document` whose pages carry native spans where they
+            exist and a lazy raster provider throughout
+        :raises IngestError: the file could not be opened even after a repair
+            pass, or the password was wrong
         """
         fitz = _fitz()
         if fitz is None:
@@ -3007,7 +3736,18 @@ class Ingest(object):
     @staticmethod
     def ingest_image(source: Source, dpi: Optional[int] = None,
                      page_index: int = 0) -> Document:
-        """Ingest a single-page image (PNG/JPEG/BMP/WebP) as a one-page Document."""
+        """Ingest a single-page image (PNG/JPEG/BMP/WebP) as a one-page Document.
+
+        :param source: path, path-like, raw ``bytes``, or an open binary file
+        :param dpi: the image's true resolution.  ``None`` reads it from the
+            file's metadata and falls back to :data:`DEFAULT_IMAGE_DPI`.  Worth
+            passing explicitly for phone photos, whose EXIF DPI is meaningless --
+            every DPI-relative threshold downstream depends on this number.
+        :param page_index: the index this page takes in the document, for
+            assembling a multi-page document from separate image files
+        :returns: a one-page :class:`Document` with the raster already attached
+        :raises IngestError: the bytes could not be decoded as an image
+        """
         data, uri = _read_source(source)
         img = decode_image(data)
         detected_dpi = dpi or _image_dpi_hint(data) or DEFAULT_IMAGE_DPI
@@ -3021,7 +3761,18 @@ class Ingest(object):
 
     @staticmethod
     def ingest_tiff(source: Source, dpi: Optional[int] = None) -> Document:
-        """Ingest a (possibly multi-page) TIFF.  Fax archives are full of these."""
+        """Ingest a (possibly multi-page) TIFF.  Fax archives are full of these.
+
+        Needs Pillow for multi-page files; without it, only the first frame is
+        read, via :func:`Ingest.ingest_image`.
+
+        :param source: path, path-like, raw ``bytes``, or an open binary file
+        :param dpi: true resolution; ``None`` reads the TIFF tag and falls back
+            to :data:`DEFAULT_IMAGE_DPI`.  Fax TIFFs commonly declare 204x98,
+            which is anisotropic and worth overriding.
+        :returns: a :class:`Document` with one page per frame
+        :raises IngestError: the file could not be opened as a TIFF
+        """
         pil = _try_import("PIL.Image")
         data, uri = _read_source(source)
         if pil is None:
@@ -3054,6 +3805,22 @@ class Ingest(object):
         and each part has to be routed on its actual bytes rather than its
         filename.  Pages carry ``meta['attachment']`` so a downstream reviewer can
         be told *which* attachment a field came from.
+
+        :param source: path, path-like, raw ``bytes``, or an open binary file
+            holding an RFC 822 message
+        :param dpi: passed to each image attachment's ingest; ``None`` detects
+            per attachment
+        :param include_body: turn the message body into a leading text page.
+            Useful -- claim references and policy numbers are often typed in the
+            covering mail rather than attached.  That page carries no raster.
+        :param max_attachments: ceiling on attachments processed, guarding
+            against a mail bomb.  Attachments past the limit are noted in the
+            document's warnings rather than silently dropped.
+        :returns: a :class:`Document` whose pages span every readable
+            attachment, in message order, each tagged with
+            ``meta["attachment"]``.  An attachment that cannot be read is
+            recorded as a warning and skipped, so one corrupt part does not cost
+            the message.
         """
         import email
         from email import policy as _email_policy
@@ -3125,13 +3892,33 @@ class Ingest(object):
 
     @staticmethod
     def page_from_image(img: ImageArray, index: int = 0, dpi: int = DEFAULT_IMAGE_DPI) -> Page:
-        """Public helper: build a :class:`Page` from an in-memory array."""
+        """Public helper: build a :class:`Page` from an in-memory array.
+
+        The entry point for pages that never came from a file -- a frame grabbed
+        from a scanner SDK, a crop produced upstream, a synthetic test page.
+
+        :param img: a NumPy array, greyscale or RGB.  Converted to ``uint8``.
+        :param index: the page's index within its document, which every span's
+            ``bbox.page`` refers back to
+        :param dpi: the array's true resolution.  Defaults to the
+            constant :data:`DEFAULT_IMAGE_DPI`.  Get this right: every
+            DPI-relative threshold downstream is computed from it.
+        :returns: a :class:`Page` with the raster attached and its point-space
+            geometry derived from the array's shape and ``dpi``
+        """
         return _page_from_array(ensure_uint8(img), index, dpi)
 
     @staticmethod
     def document_from_images(images: Sequence[ImageArray], dpi: int = DEFAULT_IMAGE_DPI,
                              source_uri: str = "<arrays>") -> Document:
-        """Public helper: build a :class:`Document` from in-memory arrays."""
+        """Public helper: build a :class:`Document` from in-memory arrays.
+
+        :param images: the page rasters, in order
+        :param dpi: resolution assumed for every array, as described
+            in :func:`Ingest.page_from_image`
+        :param source_uri: label recorded on the document and used in reports
+        :returns: a :class:`Document` with one page per array, indexed from ``0``
+        """
         doc = Document(source_uri=source_uri,
                        meta={"format": "arrays", "page_count": len(images),
                              "ingested_at": _utcnow()})
@@ -3149,12 +3936,32 @@ class Ingest(object):
         Format is decided by content, not by extension.  Returns a :class:`Document`
         whose pages are geometry-complete but *not* rasterised.
 
-        :param source: path, bytes, or a file-like object
-        :param filename: name hint used only when ``source`` is bytes
-        :param dpi: assumed resolution for bare images (default: metadata, else 200)
-        :param render_dpi: default resolution for PDF page rendering
-        :param max_pages: stop after this many pages (0 = no limit)
-        :param page_range: explicit zero-based page indices to keep
+        :param source: a path or path-like (``"scan.pdf"``), raw ``bytes``, or an
+            open binary file object.  A directory is not accepted here; walk one
+            with :func:`Ingest.ingest_dir` instead.
+        :param filename: name hint, used only when ``source`` is bytes or a
+            stream and only to break a tie the magic bytes could not.  Also
+            becomes the document's ``source_uri``.
+        :param dpi: assumed resolution for bare images.  ``None`` reads the
+            file's metadata and falls back to :data:`DEFAULT_IMAGE_DPI`.  Ignored
+            for PDFs, which use ``render_dpi``.
+        :param password: for an encrypted PDF; ignored for other formats
+        :param max_pages: stop after this many pages; ``0`` means no limit
+        :param page_range: explicit zero-based page indices to keep, e.g.
+            ``range(10, 20)``.  PDFs only.
+        :param render_dpi: resolution for PDF page rendering.  ``300`` is the
+            floor for reliable OCR; ``400`` helps on small print.
+        :param min_native_chars: per-page character floor for trusting a PDF text
+            layer; see :func:`Ingest.classify_page_kind`.
+        :returns: a :class:`Document` whose pages are geometry-complete but not
+            yet rasterised -- ``raster()`` is lazy by contract, not as an
+            optimisation.
+        :raises IngestError: the input was empty, the format was unrecognised, or
+            the file could not be opened
+
+        Bytes off a queue, with the name as the only hint::
+
+            doc = ingest(payload, filename="claim-4471.pdf")
         """
         data, uri = _read_source(source)
         if filename and uri in ("<bytes>", "<stream>"):
@@ -3193,6 +4000,19 @@ class Ingest(object):
         Unreadable files are reported as warnings on an empty Document rather than
         aborting the batch -- a 5000-file inbox with three corrupt scans should
         still process 4997 of them.
+
+        :param directory: the root to walk.  Dotfiles are skipped; files are
+            taken in sorted order per directory, so the result is stable.
+        :param pattern: a regular expression matched against each *filename*
+            with ``re.search``, e.g. ``"[.]pdf$"`` or ``"^claim-"``.  ``None``
+            attempts every file, relying on content sniffing.
+        :param recursive: descend into subdirectories.  ``False`` reads only the
+            top level.
+        :param kwargs: forwarded to :func:`Ingest.ingest` for each file --
+            ``render_dpi``, ``max_pages``, ``password``, ...
+        :returns: one :class:`Document` per file attempted, in walk order.  A
+            file that failed yields an empty document carrying the reason in its
+            ``warnings``, so the count always matches the files seen.
         """
         out: List[Document] = []
         regex = re.compile(pattern) if pattern else None
@@ -3215,7 +4035,17 @@ class Ingest(object):
 
     @staticmethod
     def merge_documents(docs: Sequence[Document], source_uri: str = "<merged>") -> Document:
-        """Concatenate documents into one, renumbering pages and their bboxes."""
+        """Concatenate documents into one, renumbering pages and their bboxes.
+
+        Renumbering is the point: every span's ``bbox.page`` refers to a page
+        index, so concatenating without reindexing would leave provenance
+        pointing at the wrong pages.
+
+        :param docs: the documents to concatenate, in order
+        :param source_uri: label for the merged document
+        :returns: one :class:`Document` whose pages are numbered from ``0``, with
+            warnings unioned and duplicates dropped
+        """
         merged = Document(source_uri=source_uri, meta={"ingested_at": _utcnow(),
                                                        "merged_from": len(docs)})
         idx = 0
@@ -5512,7 +6342,16 @@ class PyMuPDFTextLayer(BaseBackend):
     needs_raster = False
 
     def supports(self, page: Page) -> bool:
-        """True only for a page that already carries a trustworthy text layer."""
+        """True only for a page that already carries a trustworthy text layer.
+
+        Stricter than :meth:`BaseBackend.supports` on purpose: a scanned page in
+        a PDF has a text layer of empty strings, and reading that would return
+        nothing while looking like a success.
+
+        :param page: the page in question
+        :returns: ``True`` only when the page is ``DIGITAL_NATIVE`` or ``HYBRID``
+            *and* already carries spans -- see :func:`Ingest.classify_page_kind`
+        """
         return page.kind in (PageKind.DIGITAL_NATIVE, PageKind.HYBRID) and bool(page.spans)
 
     def _read(self, page: Page) -> ReadResult:
@@ -5545,11 +6384,26 @@ class TesseractOCR(BaseBackend):
                  **options: Any) -> None:
         """Configure the engine.
 
-        :param lang: Tesseract language code(s), e.g. ``"eng"`` or ``"eng+hin"``
-        :param psm: page segmentation mode (3 = fully automatic)
-        :param oem: OCR engine mode (3 = default, LSTM where available)
-        :param config: extra flags appended to the command line
-        :param min_confidence: drop words below this confidence in ``[0, 1]``
+        :param lang: Tesseract language code(s), ``+``-joined, e.g. ``"eng"``,
+            ``"eng+hin"``, ``"eng+deu"``.  Each needs its traineddata installed;
+            naming a missing one fails at read time, not here.
+        :param psm: page segmentation mode.  ``3`` (fully automatic) is right for
+            a whole page; ``6`` ("a single uniform block") is markedly better on
+            a cropped table cell or a form field; ``7`` reads one line, ``11``
+            finds sparse text in any order.
+        :param oem: OCR engine mode.  ``3`` picks the best available, ``1``
+            forces the LSTM engine, ``0`` the legacy one.  Leave it at ``3``
+            unless you are reproducing an old result.
+        :param config: extra flags appended to the command line, e.g.
+            ``"-c tessedit_char_whitelist=0123456789.,"`` to read an
+            amounts-only column.
+        :param min_confidence: drop words below this confidence, in ``0.0..1.0``.
+            ``0.0`` keeps everything, which is the right default -- confidence
+            is a fusion input, and dropping words here hides evidence
+            from :func:`locate_value` rather than improving accuracy.
+        :param name: overrides the registry name, so the same engine can be
+            registered twice with different options
+        :param options: forwarded to :class:`BaseBackend`
         """
         BaseBackend.__init__(self, name=name, **options)
         self.lang = lang
@@ -5667,9 +6521,15 @@ class PaddleOCRBackend(BaseBackend):
                  name: Optional[str] = None, **options: Any) -> None:
         """Configure the engine.
 
-        :param lang: PaddleOCR language code, e.g. ``"en"`` or ``"ch"``
-        :param use_angle_cls: run the text-direction classifier (needed for pages
-            with rotated or vertical text)
+        :param lang: PaddleOCR language code, e.g. ``"en"``, ``"ch"``,
+            ``"devanagari"``.  One per engine instance -- register the backend
+            twice under different names to read two scripts.
+        :param use_angle_cls: run the text-direction classifier, needed for pages
+            with rotated or vertical text.  Costs a little latency per page and
+            is worth keeping on for anything photographed.
+        :param name: overrides the registry name, so the same engine can be
+            registered twice with different options
+        :param options: forwarded to :class:`BaseBackend`
         """
         BaseBackend.__init__(self, name=name, **options)
         self.lang = lang
@@ -5731,7 +6591,13 @@ class RapidOCRBackend(BaseBackend):
     preferred_dpi = 300
 
     def __init__(self, name: Optional[str] = None, **options: Any) -> None:
-        """Configure the engine.  ``options`` are passed to ``RapidOCR``."""
+        """Configure the engine.
+
+        :param name: overrides the registry name, so the same engine can be
+            registered twice with different options
+        :param options: passed straight to ``RapidOCR`` at construction, e.g.
+            ``det_model_path=...`` to point at your own ONNX weights
+        """
         BaseBackend.__init__(self, name=name, **options)
         self._engine = None
 
@@ -5787,8 +6653,15 @@ class EasyOCRBackend(BaseBackend):
                  name: Optional[str] = None, **options: Any) -> None:
         """Configure the engine.
 
-        :param languages: EasyOCR language codes to load together
-        :param gpu: use CUDA if EasyOCR finds it
+        :param languages: EasyOCR language codes loaded together, e.g.
+            ``("en",)`` or ``("en", "hi")``.  EasyOCR restricts which codes may
+            be combined -- Latin scripts mix freely, but most non-Latin scripts
+            pair only with English.
+        :param gpu: use CUDA if EasyOCR finds it.  ``False`` is the safe default;
+            on CPU this engine is several times slower than PP-OCR.
+        :param name: overrides the registry name, so the same engine can be
+            registered twice with different options
+        :param options: forwarded to :class:`BaseBackend`
         """
         BaseBackend.__init__(self, name=name, **options)
         self.languages = list(languages)
@@ -5842,9 +6715,19 @@ class DocTRBackend(BaseBackend):
                  name: Optional[str] = None, **options: Any) -> None:
         """Configure the two-stage predictor.
 
-        :param det_arch: detection architecture, e.g. ``"db_resnet50"``
-        :param reco_arch: recognition architecture, e.g. ``"crnn_vgg16_bn"``
-        :param pretrained: download pretrained weights rather than start cold
+        :param det_arch: text-detection architecture.  ``"db_resnet50"`` is the
+            accurate default; ``"db_mobilenet_v3_large"`` is markedly faster and
+            a little worse on small print.
+        :param reco_arch: recognition architecture.  ``"crnn_vgg16_bn"`` is the
+            balanced default; ``"crnn_mobilenet_v3_small"`` trades accuracy for
+            speed, and ``"master"`` or ``"parseq"`` cost more for better results
+            on irregular text.
+        :param pretrained: download pretrained weights rather than start cold.
+            ``False`` is only useful when loading your own fine-tuned weights --
+            an untrained model reads nothing.
+        :param name: overrides the registry name, so the same engine can be
+            registered twice with different options
+        :param options: forwarded to :class:`BaseBackend`
         """
         BaseBackend.__init__(self, name=name, **options)
         self.det_arch = det_arch
@@ -5913,7 +6796,14 @@ class SuryaBackend(BaseBackend):
                  name: Optional[str] = None, **options: Any) -> None:
         """Configure the engine.
 
-        :param languages: script/language hints passed to the recogniser
+        :param languages: script/language hints passed to the recogniser, e.g.
+            ``("en",)`` or ``("en", "hi")``.  Surya detects script itself, so
+            these are hints rather than a restriction -- which is why it handles
+            a Devanagari letterhead over a Latin amounts table without being
+            told the page is mixed.
+        :param name: overrides the registry name, so the same engine can be
+            registered twice with different options
+        :param options: forwarded to :class:`BaseBackend`
         """
         BaseBackend.__init__(self, name=name, **options)
         self.languages = list(languages)
@@ -6020,13 +6910,34 @@ class Pricing(object):
         Until a model is priced, :class:`Cost` reports token counts with a zero
         amount and warns once, so a missing price is visible rather than silently
         reported as free.
+
+        Register what your account actually pays, not the list price -- committed
+        spend and enterprise agreements both move it, and the point of this table
+        is that the number in the report is one you can defend::
+
+            Pricing.set_pricing("claude-sonnet-4-5", 3.0, 15.0)
+
+        :param model: the model id exactly as the backend reports it in
+            ``Cost.model``; a mismatched string leaves the model unpriced
+        :param input_per_mtok: USD per million input tokens, e.g. ``3.0``
+        :param output_per_mtok: USD per million output tokens, e.g. ``15.0``,
+            typically several times the input rate
         """
         PRICING[model] = (float(input_per_mtok), float(output_per_mtok))
         _UNPRICED_WARNED.discard(model)
 
     @staticmethod
     def price_tokens(model: str, input_tokens: int, output_tokens: int) -> Cost:
-        """Convert token counts to a :class:`Cost` using the registered pricing."""
+        """Convert token counts to a :class:`Cost` using the registered pricing.
+
+        :param model: the model id to look up in :data:`PRICING`
+        :param input_tokens: prompt tokens consumed
+        :param output_tokens: completion tokens produced
+        :returns: a :class:`Cost` for one call.  When the model is unpriced the
+            token counts are still exact and ``amount`` is ``0.0``, with a warning
+            logged once per model -- never an exception, since an unpriced model
+            must not stop a document being read.
+        """
         prices = PRICING.get(model)
         if prices is None:
             if model not in _UNPRICED_WARNED:
@@ -6049,6 +6960,14 @@ class Pricing(object):
         documented approximation for Claude and is close enough for OpenAI's
         high-detail mode to be useful for *budgeting*.  It is an estimate, and the
         reconciled figure from the response's usage block always wins.
+
+        :param img: the raster that would be sent
+        :param divisor: pixels per token.  ``750`` is Anthropic's documented
+            approximation and is close enough for OpenAI high-detail mode to be
+            useful for budgeting.  Lower it to estimate more conservatively.
+        :returns: an estimated token count, rounded up.  Use it for pre-flight
+            budgeting only -- :class:`BudgetRouter` does, and then reconciles
+            against the real usage once the call returns.
         """
         h, w = image_shape(img)
         return int(math.ceil(w * h / float(divisor)))
@@ -6106,10 +7025,23 @@ class VisionBackend(BaseBackend):
                  name: Optional[str] = None, **options: Any) -> None:
         """Configure the model call.
 
-        :param model: provider model id, used for pricing as well as the request
-        :param prompt: transcription instructions; see :data:`DEFAULT_OCR_PROMPT`
-        :param max_tokens: ceiling on the transcription length
-        :param temperature: 0.0 -- transcription is not a creative task
+        :param model: provider model id, e.g. ``"claude-sonnet-4-5"`` or
+            ``"gpt-4o"``.  Used as the pricing key as well as in the request, so
+            it must match what you passed to :func:`Pricing.set_pricing`.
+        :param prompt: transcription instructions.  The default value
+            is :data:`DEFAULT_OCR_PROMPT`, tuned to suppress the
+            summarising and reordering a general prompt invites.  Override it to
+            add domain vocabulary, never to ask for interpretation -- that
+            belongs in :func:`extract`.
+        :param max_tokens: ceiling on the transcription length.  ``8192`` covers
+            a dense A4 page; raise it for large-format or multi-column pages,
+            where a truncated read silently loses the bottom of the page.
+        :param temperature: ``0.0``, because transcription is recall, not
+            creativity.  Raising it produces plausible text that is not on the
+            page, which is the one failure mode confidence cannot catch.
+        :param name: overrides the registry name, so the same model can be
+            registered twice with different prompts
+        :param options: forwarded to :class:`BaseBackend`
         """
         BaseBackend.__init__(self, name=name, **options)
         self.model = model
@@ -6132,6 +7064,12 @@ class VisionBackend(BaseBackend):
 
         Approximate by construction -- it is what :class:`BudgetRouter` decides
         on, so it errs toward the honest side rather than the flattering one.
+
+        :param page: the page that would be read
+        :returns: estimated :class:`Cost` from image tokens plus prompt length,
+            with output guessed from the page's character count.
+            ``Cost.zero()`` for a page with no raster.  Reads ``0.00`` until the
+            model is priced.
         """
         if not page.has_raster():
             return Cost.zero()
@@ -6187,8 +7125,17 @@ class AnthropicVisionBackend(VisionBackend):
                  client: Any = None, **options: Any) -> None:
         """Configure the Claude vision call.
 
-        :param api_key: falls back to ``ANTHROPIC_API_KEY``
-        :param client: a pre-built SDK client, e.g. one with custom transport
+        :param model: Claude model id, e.g. ``"claude-sonnet-5"`` (the default,
+            the best accuracy-per-rupee for transcription) or
+            ``"claude-opus-5"`` for the hardest handwriting.  Also the pricing
+            key -- see :func:`Pricing.set_pricing`.
+        :param api_key: falls back to the ``ANTHROPIC_API_KEY`` environment
+            variable when ``None``
+        :param client: a pre-built SDK client, e.g. one with custom transport,
+            a proxy, or a Bedrock/Vertex wrapper.  When given, ``api_key`` is
+            unused and :meth:`is_available` is ``True`` without the SDK check.
+        :param options: forwarded to :class:`VisionBackend` -- ``prompt``,
+            ``max_tokens``, ``temperature``, ``name``
         """
         VisionBackend.__init__(self, model=model, **options)
         self._api_key = api_key
@@ -6240,9 +7187,16 @@ class OpenAIVisionBackend(VisionBackend):
                  **options: Any) -> None:
         """Configure the OpenAI vision call.
 
-        :param api_key: falls back to ``OPENAI_API_KEY``
-        :param client: a pre-built SDK client
-        :param detail: image fidelity hint sent to the API
+        :param model: OpenAI model id, e.g. ``"gpt-4o"``.  Also the pricing key.
+        :param api_key: falls back to the ``OPENAI_API_KEY`` environment
+            variable when ``None``
+        :param client: a pre-built SDK client; when given, ``api_key`` is unused
+        :param detail: image fidelity hint -- ``"high"`` tiles the image and
+            reads small print, ``"low"`` sends a single low-resolution pass for
+            far fewer tokens, and ``"auto"`` lets the provider choose.  Keep
+            ``"high"`` for documents; ``"low"`` loses most printed detail.
+        :param options: forwarded to :class:`VisionBackend` -- ``prompt``,
+            ``max_tokens``, ``temperature``, ``name``
         """
         VisionBackend.__init__(self, model=model, **options)
         self._api_key = api_key
@@ -6310,6 +7264,9 @@ class GeminiVisionBackend(VisionBackend):
                  **options: Any) -> None:
         """Configure the Gemini vision call.
 
+        :param model: Gemini model id, e.g. ``"gemini-2.5-flash"`` (fast and
+            cheap, ample for printed pages) or ``"gemini-2.5-pro"`` for harder
+            reads.  Also the pricing key.
         :param api_key: falls back to ``GOOGLE_API_KEY``, then ``GEMINI_API_KEY``
         :param client: a pre-built ``genai.Client``, e.g. one pointed at Vertex AI
         :param thinking_budget: reasoning tokens allowed before the answer.
@@ -6356,6 +7313,10 @@ class GeminiVisionBackend(VisionBackend):
         :attr:`tokens_per_tile` for a small image and the same again for every
         :attr:`tile_px` tile of a large one, so cost is a step function of size,
         not a line.  Still an estimate -- the response's usage block always wins.
+
+        :param page: the page that would be read
+        :returns: estimated :class:`Cost`, or ``Cost.zero()`` for a page with no
+            raster.  Reads ``0.00`` until the model is priced.
         """
         if not page.has_raster():
             return Cost.zero()
@@ -6451,8 +7412,13 @@ class CachingBackend(BaseBackend):
                  namespace: str = "") -> None:
         """Wrap ``inner`` with a content-addressed read cache.
 
-        :param cache: defaults to a :class:`DiskCache` in the standard location
-        :param namespace: mixed into every key, to separate unrelated runs
+        :param inner: the backend to memoise; its ``needs_raster`` is inherited
+        :param cache: where reads are stored; ``None`` builds
+            a :class:`DiskCache` in the standard location.  Point it at a
+            per-branch directory to keep experiments from sharing results.
+        :param namespace: mixed into every key, to separate unrelated runs that
+            would otherwise collide -- e.g. ``"v2-prompt"`` after changing the
+            OCR prompt, since the prompt is not part of the raster hash.
         """
         BaseBackend.__init__(self, name="cached:%s" % inner.name)
         self.inner = inner
@@ -6467,11 +7433,24 @@ class CachingBackend(BaseBackend):
         return self.inner.is_available()
 
     def supports(self, page: Page) -> bool:
-        """Delegates to the wrapped backend."""
+        """Delegates to the wrapped backend.
+
+        :param page: the page in question
+        :returns: whatever the wrapped backend answers -- caching never widens
+            what can be read
+        """
         return self.inner.supports(page)
 
     def estimate_cost(self, page: Page) -> Cost:
-        """Zero on a cache hit, otherwise the wrapped backend's estimate."""
+        """Zero on a cache hit, otherwise the wrapped backend's estimate.
+
+        This is what lets :class:`BudgetRouter` send a repeated page to an
+        expensive backend it could not otherwise afford.
+
+        :param page: the page that would be read
+        :returns: ``Cost.zero()`` when the key is already cached, else the
+            wrapped backend's estimate
+        """
         return Cost.zero() if self._key(page) in self.cache else self.inner.estimate_cost(page)
 
     def _key(self, page: Page) -> str:
@@ -6485,7 +7464,18 @@ class CachingBackend(BaseBackend):
         return stable_hash(self.namespace, self.inner.name, raster, spans)
 
     def read(self, page: Page) -> ReadResult:
-        """Return the cached read if there is one, else read and store it."""
+        """Return the cached read if there is one, else read and store it.
+
+        Hits and misses accumulate on ``self.hits`` and ``self.misses``, which is
+        how you check the cache is actually working rather than quietly missing
+        on every page.
+
+        :param page: the page to read
+        :returns: a :class:`ReadResult`.  On a hit, ``cost`` is zero and
+            ``latency_ms`` is ``0.0`` -- the cached run's figures would
+            misreport this run.  Spans and warnings are restored; ``raw`` is not,
+            being unbounded in size.
+        """
         key = self._key(page)
         cached = self.cache.get(key)
         if cached is not None:
@@ -6518,9 +7508,16 @@ class RetryingBackend(BaseBackend):
                                                  ConfigError)) -> None:
         """Wrap ``inner`` with bounded retries.
 
-        :param attempts: total tries, including the first
-        :param base_delay: seconds before the first retry; doubles thereafter
-        :param retry_on: exception types worth retrying
+        :param inner: the backend to wrap
+        :param attempts: total tries, including the first.  ``3`` absorbs the
+            usual transient provider failure; beyond ``5`` you are queueing on an
+            outage rather than retrying a blip.
+        :param base_delay: seconds before the first retry, doubling thereafter --
+            ``0.5`` gives 0.5s, 1s, 2s.  Raise it when the provider rate-limits
+            by window rather than by concurrency.
+        :param retry_on: exception types worth retrying.  ``(Exception,)`` is
+            deliberately broad, since provider SDKs raise their own hierarchies;
+            narrow it if you would rather fail fast on unrecognised errors.
         :param give_up_on: exception types that never become successes -- these
             win over ``retry_on``, so a bad API key fails once, not three times
         """
@@ -6537,15 +7534,37 @@ class RetryingBackend(BaseBackend):
         return self.inner.is_available()
 
     def supports(self, page: Page) -> bool:
-        """Delegates to the wrapped backend."""
+        """Delegates to the wrapped backend.
+
+        :param page: the page in question
+        :returns: whatever the wrapped backend answers
+        """
         return self.inner.supports(page)
 
     def estimate_cost(self, page: Page) -> Cost:
-        """Delegates to the wrapped backend (the estimate excludes retries)."""
+        """Delegates to the wrapped backend (the estimate excludes retries).
+
+        Deliberately optimistic: budgeting for the worst case would reserve
+        ``attempts`` times the money for calls that usually succeed first time.
+        Retries that do happen are charged to ``Cost.wasted_calls`` after the
+        fact.
+
+        :param page: the page that would be read
+        :returns: the wrapped backend's estimate for a single attempt
+        """
         return self.inner.estimate_cost(page)
 
     def read(self, page: Page) -> ReadResult:
-        """Read with retries, recording any billed-but-failed attempts."""
+        """Read with retries, recording any billed-but-failed attempts.
+
+        :param page: the page to read
+        :returns: the successful :class:`ReadResult`, with ``cost.wasted_calls``
+            incremented per failed attempt and a warning naming the first few
+            failures -- a provider that times out after generating tokens has
+            already billed for them
+        :raises Exception: whatever ``inner`` raised, once every attempt is spent
+            or the error type is in ``give_up_on``
+        """
         wasted = [0]
         failures: List[str] = []
 
@@ -6584,8 +7603,14 @@ class EnsembleBackend(BaseBackend):
                  name: Optional[str] = None) -> None:
         """Pair two backends for cross-checked reading.
 
-        :param primary: its spans are returned (better geometry is expected here)
-        :param secondary: read for agreement only
+        :param primary: its spans are returned, so this should be the backend
+            with the better geometry -- a classical OCR engine rather than a VLM,
+            which reports no coordinates at all.
+        :param secondary: read for agreement only; its spans are attached to the
+            result rather than returned.  Pick something that fails
+            *differently* -- pairing two Tesseract configurations agrees on its
+            own mistakes and tells you nothing.
+        :param name: overrides the generated ``"ensemble:a+b"`` registry name
         """
         BaseBackend.__init__(self, name=name or "ensemble:%s+%s"
                              % (primary.name, secondary.name))
@@ -6597,11 +7622,22 @@ class EnsembleBackend(BaseBackend):
         return self.primary.is_available() and self.secondary.is_available()
 
     def supports(self, page: Page) -> bool:
-        """True only when both backends support the page."""
+        """True only when both backends support the page.
+
+        :param page: the page in question
+        :returns: ``False`` if either backend declines -- there is no agreement
+            signal to be had from one read
+        """
         return self.primary.supports(page) and self.secondary.supports(page)
 
     def estimate_cost(self, page: Page) -> Cost:
-        """The sum of both backends' estimates -- an ensemble is not free."""
+        """The sum of both backends' estimates -- an ensemble is not free.
+
+        :param page: the page that would be read
+        :returns: both estimates added together.  Worth reserving for the pages
+            that need it: :class:`RuleRouter` can send only low-quality pages
+            here and leave clean ones on a single cheap read.
+        """
         return self.primary.estimate_cost(page) + self.secondary.estimate_cost(page)
 
     def read(self, page: Page) -> ReadResult:
@@ -6609,6 +7645,12 @@ class EnsembleBackend(BaseBackend):
 
         The agreement score lands in ``span.meta["cross_read_agreement"]``, where
         confidence fusion picks it up.
+
+        :param page: the page to read; both backends see the same one
+        :returns: a :class:`ReadResult` carrying the *primary's* spans, the summed
+            cost, both sets of warnings, and both raw reads under
+            ``raw["primary"]`` and ``raw["secondary"]`` -- which is how
+            geometry is recovered for a VLM read by :func:`locate_value`
         """
         first = self.primary.read(page)
         second = self.secondary.read(page)
@@ -6646,6 +7688,17 @@ def default_router(page: Page) -> Optional[str]:
     4. whatever local engine is installed, if no vision model is configured.
 
     Returns ``None`` for blank pages, which the reader skips.
+
+    Only ever names a backend that :meth:`BackendRegistry.available` reports as
+    installed, so the same code path works on a machine with nothing but
+    Tesseract and on one with every engine present.
+
+    :param page: a page whose quality and layout have been measured.  Without
+        measurement every reading is zero, so the "degraded" test never fires
+        and clean-page routing is used throughout.
+    :returns: a registered backend name such as ``"pymupdf"``, ``"paddle"`` or
+        ``"vlm:claude"``; or ``None`` for a blank page, and also when no backend
+        at all is installed
     """
     if page.kind is PageKind.BLANK or page.is_blank:
         return None
@@ -6694,14 +7747,32 @@ class RuleRouter(object):
                  fallback: Optional[str] = None) -> None:
         """Build a router from ordered rules.
 
-        :param rules: ``(predicate, backend_name)`` pairs, first match wins
-        :param fallback: name returned when no rule matches (``None`` skips)
+        :param rules: ``(predicate, backend_name)`` pairs, evaluated in order
+            with the first match winning.  The predicate takes a :class:`Page`,
+            so any measured property is fair game::
+
+                RuleRouter([(lambda p: p.layout.has_handwriting, "vlm:claude"),
+                            (lambda p: p.layout.is_tabular, "paddle")],
+                           fallback="tesseract")
+
+        :param fallback: name returned when no rule matches.  ``None`` means the
+            page is skipped entirely -- usually you want a cheap local engine
+            here instead, or pass ``fallback=default_router(page)``-style logic
+            as a final catch-all rule.
         """
         self.rules = list(rules or [])
         self.fallback = fallback
 
     def add(self, predicate: Callable[[Page], bool], backend_name: str) -> RuleRouter:
-        """Append a rule.  Returns ``self``, so rules chain."""
+        """Append a rule.  Returns ``self``, so rules chain.
+
+        Appends, so it is always lower priority than the rules already present.
+
+        :param predicate: ``Callable[[Page], bool]``; one that raises is logged
+            and skipped rather than failing the document
+        :param backend_name: registered name to route to when it matches
+        :returns: ``self``, so calls chain -- ``router.add(a, "x").add(b, "y")``
+        """
         self.rules.append((predicate, backend_name))
         return self
 
@@ -6710,6 +7781,10 @@ class RuleRouter(object):
 
         A predicate that raises is logged and skipped rather than failing the
         document: a broken rule should not cost you the other 200 pages.
+
+        :param page: the page to route
+        :returns: the first matching rule's backend name, else ``fallback``,
+            which may be ``None`` to skip the page
         """
         for predicate, name in self.rules:
             try:
@@ -6732,8 +7807,17 @@ class BudgetRouter(object):
                  currency: str = "USD") -> None:
         """Wrap ``inner`` with a spending ceiling.
 
-        :param budget: total spend allowed, in ``currency``
-        :param cheap_backend: what to use once the budget would be exceeded
+        :param inner: the router whose choice is second-guessed -- typically the
+            built-in :func:`default_router`, or a :class:`RuleRouter`
+        :param budget: total spend allowed across the whole document, in
+            ``currency``.  Meaningless until :func:`Pricing.set_pricing` is
+            called -- an unpriced model estimates ``0.00`` and never triggers a
+            downgrade.
+        :param cheap_backend: registered name used once the budget would be
+            exceeded.  ``"tesseract"`` needs no model download and no network;
+            if it is not registered the page is skipped instead.
+        :param currency: label for messages and reports only; no conversion is
+            performed, so it must match the units of your registered prices
         """
         self.inner = inner
         self.budget = float(budget)
@@ -6743,7 +7827,13 @@ class BudgetRouter(object):
         self.downgrades = 0
 
     def record(self, cost: Cost) -> None:
-        """Add an actual cost to the running total.  Called by the reader."""
+        """Add an actual cost to the running total.  Called by the reader.
+
+        Actual, not estimated: the running total tracks what the provider really
+        billed, so an estimate that was optimistic still shows up here.
+
+        :param cost: the :class:`Cost` of a completed read
+        """
         self.spent += cost.amount
 
     def remaining(self) -> float:
@@ -6755,6 +7845,15 @@ class BudgetRouter(object):
 
         Returns ``None`` if even the cheap backend is unavailable -- skipping a
         page is preferable to silently blowing through a ceiling.
+
+        Downgrades are counted on ``self.downgrades`` and logged, so a run that
+        quietly fell back to cheap OCR halfway through is visible afterwards
+        rather than showing up as an unexplained accuracy drop.
+
+        :param page: the page to route
+        :returns: the inner router's choice when it fits the remaining budget,
+            otherwise ``cheap_backend``; ``None`` when the inner router skipped
+            the page or the cheap backend is not registered
         """
         name = self.inner(page)
         if name is None:
@@ -6793,7 +7892,33 @@ _register_default_backends()
 def read_page(page: Page, backend: Optional[Union[str, TextBackend]] = None,
               router: Optional[RouterFn] = default_router,
               replace_spans: bool = True) -> ReadResult:
-    """Read one page with an explicit backend, or one chosen by ``router``."""
+    """Read one page with an explicit backend, or one chosen by ``router``.
+
+    The single-page entry point, useful for debugging a page that came out wrong
+    without running the whole document.
+
+    :param page: the page to read.  Its ``history`` gains a ``"read"`` entry
+        either way, including when no backend would take it.
+    :param backend: force a specific reader, as a registered name
+        (``"pymupdf"``, ``"tesseract"``, ``"paddle"``, ``"vlm:claude"``) or an
+        instance of :class:`TextBackend`.  Overrides ``router`` when both given.
+    :param router: chooses the backend when ``backend`` is ``None``.  Defaults
+        to :func:`default_router`; ``None`` with no ``backend`` reads nothing.
+    :param replace_spans: overwrite ``page.spans`` with the result.  Set
+        ``False`` to read without disturbing the page -- which is how you compare
+        two backends on the same page, or keep a native text layer while reading
+        it again with OCR.
+    :returns: a :class:`ReadResult`.  When no backend was selected or the chosen
+        one declined the page, the result is empty with an explanatory warning
+        rather than an exception -- one unreadable page must not cost the
+        document.
+
+    Compare two engines on a page that read badly::
+
+        a = read_page(page, backend="tesseract", replace_spans=False)
+        b = read_page(page, backend="paddle", replace_spans=False)
+        print(a.text(), "|", b.text())
+    """
     # Resolved into its own name rather than reassigning the parameter: the
     # parameter admits a name or an instance, the local is always an instance.
     chosen: TextBackend
@@ -6825,14 +7950,34 @@ def read(doc: Document, backend: Optional[Union[str, TextBackend]] = None,
          on_page: Optional[Callable[[Page, ReadResult], None]] = None) -> Document:
     """Read every page of ``doc``, choosing a backend per page.
 
-    :param backend: force one backend for all pages (name or instance)
-    :param router: per-page backend chooser (ignored when ``backend`` is set)
-    :param max_workers: read pages concurrently (safe: backends hold their own locks)
-    :param budget: hard ceiling in USD; raises :class:`BudgetExceeded` when passed
-    :param on_page: callback invoked as ``on_page(page, result)`` for progress
+    :param doc: a document, normally already preprocessed.  Reading an
+        unmeasured document works, but :func:`default_router` then sees a
+        perfect page everywhere and routes accordingly.
+    :param backend: force one reader for all pages, as a registered name or an
+        instance of :class:`TextBackend`.  Overrides ``router``.
+    :param router: per-page backend chooser, ignored when ``backend`` is set.
+        Defaults to :func:`default_router`; see also :class:`RuleRouter` and
+        the ceiling-aware :class:`BudgetRouter`.
+    :param max_workers: threads for concurrent page reads.  ``0`` runs serially.
+        Safe to raise -- backends hold their own locks -- and the win is large
+        for network-bound vision backends.  Local engines that already use every
+        core benefit far less.
+    :param in_place: mutate ``doc`` rather than working on a copy
+    :param budget: hard ceiling in USD across the document, checked after each
+        page.  Distinct from :class:`BudgetRouter`, which downgrades to stay
+        under; this one stops.  Requires :func:`Pricing.set_pricing` to mean
+        anything.
+    :param on_page: called as ``on_page(page, result)`` after each page, for
+        progress reporting.  Runs outside the internal lock, so it may be slow,
+        but it is called from worker threads when ``max_workers`` is set.
+    :returns: the read :class:`Document`.  Costs, warnings and the per-page
+        backend choices accumulate onto ``meta["read_cost"]`` and
+        ``meta["read_backends"]`` -- the latter being how you check the router
+        did what you expected.
+    :raises BudgetExceeded: the running total passed ``budget``
 
-    Costs, warnings and per-page backend choices are accumulated onto the
-    returned Document's ``meta``.
+    A page whose read raises is logged, recorded as a document warning, and
+    skipped; the other pages still get read.
     """
     target = doc if in_place else doc.copy()
     total = Cost.zero()
@@ -6922,6 +8067,15 @@ class Text(object):
         Per-span rather than per-document, because a hospital letterhead in
         Devanagari over a table of Latin numerals is one page with two scripts, and
         routing a recogniser at the page level would get one of them wrong.
+
+        :param text: the text to inspect; digits and whitespace are ignored, as
+            they carry no script information
+        :param minimum: least character count for a script to be reported.
+            ``1`` reports whatever dominates, which is right for a single span;
+            raise it to ignore a stray character in a long string.
+        :returns: an ISO 15924 code -- ``"Latn"``, ``"Deva"``, ``"Arab"``,
+            ``"Beng"``, ``"Taml"``, ``"Hani"`` and the rest -- or ``None`` for
+            empty text or text that is all digits and punctuation
         """
         if not text:
             return None
@@ -6945,6 +8099,10 @@ class Text(object):
 
         A Devanagari ``४८२५०`` and an ASCII ``48250`` are the same amount, and every
         validator downstream should only ever have to handle one of them.
+
+        :param text: any text; non-digit characters pass through untouched
+        :returns: the text with every Unicode decimal digit -- Devanagari,
+            Arabic-Indic, Bengali, full-width and the rest -- mapped to ASCII
         """
         return text.translate(_DIGIT_MAP) if text else text
 
@@ -6956,12 +8114,29 @@ class Text(object):
         The four forms are spelled out in the annotation because they are the
         only values :mod:`unicodedata` accepts; anything else is a ``ValueError``
         from the standard library rather than a docpipe error.
+
+        :param text: the text to normalise
+        :param form: ``"NFKC"`` (default), ``"NFC"``, ``"NFD"``, or ``"NFKD"``.
+            The compatibility forms (``NFKC``/``NFKD``) are what fold ``ﬁ`` to
+            ``fi`` and full-width to ASCII, which is what OCR output needs.  Use
+            ``"NFC"`` when the exact original characters must survive.
+        :returns: the normalised text
         """
         return unicodedata.normalize(form, text) if text else text
 
     @staticmethod
     def normalize_whitespace(text: str, collapse_newlines: bool = False) -> str:
-        """Collapse runs of whitespace, preserving line structure by default."""
+        """Collapse runs of whitespace, preserving line structure by default.
+
+        :param text: the text to tidy
+        :param collapse_newlines: also fold line breaks into spaces.  Leave it
+            ``False`` for page text, where line structure is what
+            label-and-value parsing depends on; set it ``True`` for a single
+            field value that OCR split across lines.
+        :returns: the text with whitespace runs collapsed, leading and trailing
+            whitespace stripped, and runs of three or more blank lines reduced
+            to one
+        """
         if not text:
             return text
         out = _WHITESPACE_RE.sub(" ", text)
@@ -6974,7 +8149,17 @@ class Text(object):
 
     @staticmethod
     def normalize_text(text: str) -> str:
-        """The standard cleanup: Unicode form, ASCII digits, tidy whitespace."""
+        """The standard cleanup: Unicode form, ASCII digits, tidy whitespace.
+
+        Applies :func:`Text.normalize_unicode`, then
+        :func:`Text.normalize_digits`, then :func:`Text.normalize_whitespace`, in
+        that order -- digit mapping has to follow the compatibility fold, or
+        full-width digits are missed.
+
+        :param text: the text to clean; ``None`` is treated as empty
+        :returns: the normalised text.  Safe for free text: nothing here guesses
+            at characters, unlike :func:`Text.fix_ocr_confusions`.
+        """
         return normalize_whitespace(normalize_digits(normalize_unicode(text or "")))
 
     @staticmethod
@@ -6984,6 +8169,13 @@ class Text(object):
         Never apply this to free text.  ``expect="numeric"`` on a field declared as
         an amount is safe and recovers a lot of otherwise-lost values; the same
         substitution on a patient's name turns "Sonia" into "50nia".
+
+        :param text: the field value to repair
+        :param expect: ``"numeric"`` maps letters onto digits (``O`` to ``0``,
+            ``l`` and ``I`` to ``1``, ``S`` to ``5``, ``B`` to ``8``);
+            ``"alpha"`` maps the other way for a known-alphabetic field.  Any
+            other value leaves the text untouched rather than guessing.
+        :returns: the repaired text
         """
         if not text:
             return text
@@ -7011,6 +8203,18 @@ class Text(object):
         Returns a :class:`decimal.Decimal` -- never a float, because money and
         binary floating point should not meet.  Returns ``None`` when no number is
         present.
+
+        :param text: the text to parse, currency symbols and labels included.
+            ``None`` returns ``None``.
+        :param decimal_separator: ``"auto"`` (default) infers the convention from
+            separator positions, which is what handles Indian grouping.  Force
+            it with ``"dot"`` or ``"comma"`` when a batch is known to be one
+            convention and short values like ``"1,50"`` are genuinely ambiguous.
+        :param allow_negative: honour accounting negatives -- a leading minus,
+            parentheses, and a ``DR`` marker.  ``False`` returns the magnitude,
+            for a field that cannot meaningfully be negative.
+        :returns: the amount as a :class:`decimal.Decimal`, or ``None`` when the
+            text holds no number
         """
         if text is None:
             return None
@@ -7068,7 +8272,15 @@ class Text(object):
 
     @staticmethod
     def detect_currency(text: str) -> Optional[str]:
-        """ISO currency code implied by ``text``, or ``None``."""
+        """ISO currency code implied by ``text``, or ``None``.
+
+        :param text: text that may carry a symbol (``₹``, ``$``, ``€``) or a code
+            (``INR``, ``USD``)
+        :returns: the ISO 4217 code, or ``None`` when nothing identifies one.
+            Ambiguous symbols resolve to the most likely code for these document
+            classes, so treat the answer as a hint -- pass the currency in
+            ``context`` when you know it.
+        """
         if not text:
             return None
         lowered = normalize_unicode(text).lower()
@@ -7089,6 +8301,17 @@ class Text(object):
         named month, an ISO date) always win over the flag.
 
         Returns ``None`` rather than guessing when the text holds no date.
+
+        :param text: the text to parse; ``None`` returns ``None``
+        :param dayfirst: how to read a genuinely ambiguous ``03/04/2024``.
+            ``True`` (default) reads it as 3 April.  Only consulted when both
+            numbers are 12 or below -- a day above 12, a named month, or an ISO
+            date decides for itself.
+        :param min_year: reject dates before this year.  Guards against an OCR
+            misread producing a plausible but absurd date.
+        :param max_year: reject dates after this year
+        :returns: a :class:`datetime.date`, or ``None`` when no date is present
+            or every candidate falls outside the year range
         """
         if not text:
             return None
@@ -7131,7 +8354,16 @@ class Text(object):
 
     @staticmethod
     def parse_bool(text: Optional[str]) -> Optional[bool]:
-        """Parse a checkbox-ish value from a form."""
+        """Parse a checkbox-ish value from a form.
+
+        :param text: the cell's text.  ``None`` returns ``None``; so does
+            anything unrecognised, which keeps "the box was unreadable" distinct
+            from "the box was unticked".
+        :returns: ``True`` for ``"yes"``, ``"y"``, ``"true"``, ``"1"``, ``"x"``,
+            ``"✓"``, ``"✔"``, ``"checked"``; ``False`` for ``"no"``, ``"n"``,
+            ``"false"``, ``"0"``, ``""``, ``"-"``, ``"unchecked"``; ``None``
+            otherwise.  Matching is case-insensitive.
+        """
         if text is None:
             return None
         token = str(text).strip().lower()
@@ -7145,7 +8377,20 @@ class Text(object):
     def normalize_spans(spans: Sequence[TextSpan], digits: bool = True,
                         unicode_form: Optional[Literal["NFC", "NFD", "NFKC", "NFKD"]]
                         = "NFKC") -> List[TextSpan]:
-        """Return normalised copies of ``spans``, tagging each with its script."""
+        """Return normalised copies of ``spans``, tagging each with its script.
+
+        Copies rather than mutating, so the original read stays available for
+        comparison -- which matters when a normalisation is suspected of losing
+        something.
+
+        :param spans: the spans to normalise
+        :param digits: map every Unicode digit to ASCII
+        :param unicode_form: Unicode normalisation form, or ``None`` to skip it.
+            ``"NFKC"`` is the default and the right choice for OCR output.
+        :returns: new spans with normalised text and ``script`` filled in where
+            it was missing.  Geometry, confidence and meta carry through
+            untouched.
+        """
         out = []
         for span in spans:
             text = span.text
@@ -7159,7 +8404,17 @@ class Text(object):
 
     @staticmethod
     def normalize_document(doc: Document, in_place: bool = False, **kwargs: Any) -> Document:
-        """Normalise every span in a document."""
+        """Normalise every span in a document.
+
+        Run automatically at the end of :func:`Pipeline.run_document` unless
+        ``normalize=False``.
+
+        :param doc: the document to normalise
+        :param in_place: mutate ``doc`` rather than working on a copy
+        :param kwargs: forwarded to :func:`Text.normalize_spans` -- ``digits``,
+            ``unicode_form``
+        :returns: the normalised document
+        """
         target = doc if in_place else doc.copy()
         for page in target.pages:
             page.spans = normalize_spans(page.spans, **kwargs)
@@ -7323,6 +8578,13 @@ class DiskCache(object):
 
         A corrupt or truncated entry counts as a miss: a cache is an
         optimisation, and it must never be able to fail a run.
+
+        :param key: the cache key, normally a content hash produced
+            by :func:`Util.stable_hash`
+        :returns: the stored value, or ``None`` when the key is absent, the
+            cache is disabled, or the entry could not be read.  All four cases
+            look the same to a caller by design -- there is nothing useful to do
+            differently about a corrupt entry.
         """
         if not self.enabled:
             return None
@@ -7343,6 +8605,11 @@ class DiskCache(object):
 
         Written to a temp file and renamed, which is atomic on POSIX -- so a
         concurrent reader sees either the old entry or the new one, never half.
+
+        :param key: the cache key
+        :param value: any JSON-serialisable value.  A value that will not
+            serialise is logged and dropped rather than raised: failing a read
+            because its result would not cache is the wrong trade.
         """
         if not self.enabled:
             return
@@ -7358,7 +8625,14 @@ class DiskCache(object):
             logger.debug("cache write failed for %s: %s", key, exc)
 
     def __contains__(self, key: str) -> bool:
-        """``key in cache`` -- true when a value is stored for it."""
+        """``key in cache`` -- true when a value is stored for it.
+
+        Implemented as a full :meth:`get`, so it costs a read.  When you intend
+        to fetch the value anyway, call :meth:`get` once and test for ``None``.
+
+        :param key: the cache key
+        :returns: whether a readable value is stored
+        """
         return self.get(key) is not None
 
     def clear(self) -> None:
@@ -7404,7 +8678,12 @@ class Tracer(object):
     """
 
     def __init__(self, enabled: bool = True) -> None:
-        """Start a trace.  ``enabled=False`` makes every span a no-op."""
+        """Start a trace.  ``enabled=False`` makes every span a no-op.
+
+        :param enabled: ``False`` makes :meth:`span` return null context
+            managers, so instrumentation can stay in the code with no
+            measurable cost when tracing is off
+        """
         self.enabled = enabled
         self.root = TraceSpan("root", time.time())
         self._stack = [self.root]
@@ -7413,7 +8692,11 @@ class Tracer(object):
     class _Span(object):
         """Context manager that closes its span and pops the tracer's stack."""
         def __init__(self, tracer: Tracer, span: TraceSpan) -> None:
-            """Bind a span to the tracer that will close it."""
+            """Bind a span to the tracer that will close it.
+
+            :param tracer: the tracer whose stack this span was pushed onto
+            :param span: the open :class:`TraceSpan` to close on exit
+            """
             self.tracer = tracer
             self.span = span
 
@@ -7434,6 +8717,14 @@ class Tracer(object):
 
         Returns a no-op context manager when tracing is disabled, so callers
         never need to branch.
+
+        :param name: the span's label, e.g. ``"read"`` or ``"extract"``
+        :param attributes: arbitrary key-value pairs recorded on the span, e.g.
+            ``pages=12`` or ``backend="paddle"``.  They survive
+            into :meth:`TraceSpan.to_dict`, so this is where to put whatever
+            would make a slow trace explicable afterwards.
+        :returns: a context manager yielding the :class:`TraceSpan`, so the block
+            can add attributes it only learns partway through
         """
         if not self.enabled:
             return _NullContext()
@@ -7485,7 +8776,13 @@ class CostTracker(object):
         recorded before the check, so the reported total is what was actually
         spent rather than the last figure under the ceiling.
 
-        :param backend: attributes the spend, for the per-backend breakdown
+        :param cost: the :class:`Cost` to accumulate
+        :param backend: attributes the spend, for the per-backend breakdown.
+            Empty means "unattributed", which still counts towards the total.
+        :returns: the new running total
+        :raises BudgetExceeded: the total passed the budget.  The spend is
+            already recorded when this raises, so ``self.total`` afterwards is
+            the true figure.
         """
         with self._lock:
             self.total = self.total + cost
@@ -7530,13 +8827,27 @@ class Confidence(object):
 
     @staticmethod
     def logit(p: float, eps: float = 1e-6) -> float:
-        """Log-odds of ``p``, clamped away from the infinities."""
+        """Log-odds of ``p``, clamped away from the infinities.
+
+        :param p: a probability in ``0.0..1.0``
+        :param eps: clamp distance from each end, so ``0.0`` and ``1.0`` map to
+            large finite values rather than infinities.  ``1e-6`` bounds the
+            result to about +/-13.8.
+        :returns: ``log(p / (1 - p))``
+        """
         p = clamp(p, eps, 1.0 - eps)
         return math.log(p / (1.0 - p))
 
     @staticmethod
     def sigmoid(z: float) -> float:
-        """Inverse of :func:`Confidence.logit`, numerically safe at both tails."""
+        """Inverse of :func:`Confidence.logit`, numerically safe at both tails.
+
+        Branches on the sign so neither tail overflows ``exp``, which the naive
+        form does for ``z`` beyond about -700.
+
+        :param z: a log-odds value, any real number
+        :returns: the probability in ``0.0..1.0``
+        """
         if z >= 0:
             return 1.0 / (1.0 + math.exp(-z))
         e = math.exp(z)
@@ -7564,6 +8875,22 @@ class Confidence(object):
         :data:`_SIGNAL_CLAMP`.
 
         Returns ``prior`` when no signal is available.
+
+        :param signals: named signal values in ``0.0..1.0``, or ``None`` for
+            "not measured".  The names the default weights recognise are
+            ``page_quality``, ``backend_conf``, ``cross_read``, ``logprob``,
+            ``validation`` and ``format_match``.  An unrecognised name is
+            ignored, so adding a signal means adding a weight for it too.
+        :param weights: relative influence per signal.  ``None`` uses the
+            defaults in :data:`DEFAULT_CONFIDENCE_WEIGHTS`.  Only the ratios
+            matter, since the pool renormalises.  Zero or negative drops a
+            signal entirely.
+        :param prior: returned when every signal is absent.  ``0.5`` is the
+            honest "no evidence either way"; lower it if your documents are
+            hard enough that silence should read as doubt.
+        :returns: the fused score in ``0.0..1.0``, rounded to 4 places.
+            *Uncalibrated* -- it ranks reliably, but is not a probability until
+            a :class:`Calibrator` fitted on your own labelled data is applied.
         """
         weight_map = dict(weights or DEFAULT_CONFIDENCE_WEIGHTS)
         total_weight = 0.0
@@ -7590,6 +8917,14 @@ class Confidence(object):
         to the evidence region: a page can be pristine at the top and destroyed at
         the bottom, and a total read from the destroyed part should not inherit the
         page's average health.
+
+        :param quality: the page's measured :class:`PageQuality`
+        :param bbox: the evidence region to localise to.  ``None`` uses the
+            page-wide measurement, which is the right fallback but a blunt one.
+        :param page: the page ``bbox`` belongs to, needed to crop the raster.
+            Both this and ``bbox`` must be given for localisation to happen.
+        :returns: the prior in ``0.0..1.0``, ready to pass
+            to :func:`Confidence.fuse_confidence` as its ``page_quality`` signal
         """
         base = quality.score
         if bbox is None or page is None or not page.has_raster():
@@ -7622,6 +8957,16 @@ class Confidence(object):
         Greedy best-IoU matching.  Unmatched spans are returned paired with
         ``None`` so that a backend which simply *missed* a field is penalised, not
         silently ignored.
+
+        :param a: spans from the first read, normally the one with better geometry
+        :param b: spans from the second read
+        :param iou_threshold: least intersection-over-union for two spans to pair,
+            in ``0.0..1.0``.  ``0.3`` is deliberately loose, because two engines
+            word-segment differently and demanding tight overlap would report
+            disagreement where there is only different tokenisation.
+        :returns: ``(a_span, b_span)`` pairs.  An unmatched span from ``a``
+            appears as ``(span, None)`` and one from ``b`` as ``(None, span)``,
+            so both directions of miss are visible.
         """
         pairs: List[Tuple[Optional[TextSpan], Optional[TextSpan]]] = []
         remaining = list(b)
@@ -7655,6 +9000,20 @@ class Confidence(object):
 
         Returns ``0.0`` if either read is empty: one method finding nothing where
         the other found text is maximal disagreement, not a missing measurement.
+
+        :param a: spans from the first read
+        :param b: spans from the second read
+        :param iou_threshold: geometric pairing threshold, with the meaning it
+            has in :func:`Confidence.align_spans`
+        :param min_geometric_fraction: fraction of spans that must pair
+            geometrically before the geometric score is trusted, in ``0.0..1.0``.
+            Below it the comparison falls back to token sequences.  ``0.2`` is
+            low on purpose: a vision read has approximate boxes, so requiring
+            more would discard the signal exactly when it is most valuable.
+        :returns: agreement in ``0.0..1.0``.  Feed it in as the ``cross_read``
+            signal of :func:`Confidence.fuse_confidence` -- it is the strongest
+            single signal available, because two methods that fail identically
+            are rare.
         """
         if not a or not b:
             return 0.0
@@ -7692,6 +9051,16 @@ class Confidence(object):
 
         Numbers compare numerically (``48250`` and ``48,250.00`` agree), dates
         compare as dates, and everything else compares as normalised strings.
+
+        :param a: the first value, of any type
+        :param b: the second value
+        :param numeric_tolerance: relative slack for numbers, so ``0.001`` allows
+            a tenth of a percent.  ``0.0`` demands exact equality, which is right
+            for amounts -- two engines reading the same digits should agree
+            exactly, and a near miss is a misread, not a rounding difference.
+        :returns: ``1.0`` or ``0.0`` for numbers, booleans and dates, which either
+            match or do not; a graded string similarity otherwise.  ``0.0`` when
+            either value is ``None``.
         """
         if a is None or b is None:
             return 0.0
@@ -7715,6 +9084,16 @@ class Confidence(object):
         A weak signal on its own, but a genuinely independent one: it catches the
         field-shifted-by-one-row failure that every other signal misses, because a
         date sitting in an amount field is fluent, high-confidence and wrong.
+
+        :param value: the extracted value to check
+        :param expected_type: the declared type -- ``"number"``, ``"integer"``,
+            ``"amount"``, ``"date"``, ``"boolean"``, ``"string"``, and their
+            aliases.  Matching is by name, so an unrecognised type returns
+            ``None`` rather than a guess.
+        :returns: ``1.0`` when the value is well formed for the type, ``0.0``
+            when it is not, or ``None`` when the type carries no format
+            expectation -- a free-text field cannot be malformed.  ``None`` is
+            dropped by the fusion pool rather than scored as failure.
         """
         if value is None:
             return 0.0
@@ -7747,6 +9126,18 @@ class Confidence(object):
 
         This is the plot that answers "is a 0.9 right 90% of the time?".  Until it
         is drawn, a confidence number is an assertion, not a measurement.
+
+        :param scores: predicted confidences in ``0.0..1.0``
+        :param labels: whether each prediction was actually correct
+        :param bins: equal-width bins over the confidence range.  ``10`` is
+            conventional.  Watch the ``count`` per bin -- a bin holding three
+            samples says nothing, however tempting its accuracy looks.
+        :returns: one dict per bin with ``bin_low``, ``bin_high``, ``count``,
+            ``mean_confidence``, ``accuracy`` and ``gap``.  A positive ``gap``
+            means underconfidence, negative means overconfidence, which is the
+            usual direction.  Empty bins are included with zero counts so the
+            list always has ``bins`` entries.
+        :raises ConfigError: ``scores`` and ``labels`` differ in length
         """
         if len(scores) != len(labels):
             raise ConfigError("scores and labels differ in length")
@@ -7774,6 +9165,16 @@ class Confidence(object):
 
         The single number to track per release.  Under 0.05 is a defensible target
         for a shipped extraction pipeline.
+
+        :param scores: predicted confidences in ``0.0..1.0``
+        :param labels: whether each prediction was actually correct
+        :param bins: histogram bins over the confidence range.  ``10`` is
+            conventional; more bins resolve finer structure but need far more
+            samples per bin to mean anything.
+        :returns: the error in ``0.0..1.0``; ``0.0`` is perfect calibration, and
+            also what an empty input returns.  Pair it with the sharpness-aware
+            Brier score, which a constant predictor cannot game; that lives
+            at :func:`Confidence.brier_score`.
         """
         curve = reliability_curve(scores, labels, bins)
         total = sum(b["count"] for b in curve)
@@ -7784,7 +9185,14 @@ class Confidence(object):
     @staticmethod
     def brier_score(scores: Sequence[float], labels: Sequence[bool]) -> float:
         """Mean squared error of the probabilities.  Rewards sharpness *and*
-        calibration, unlike ECE, which a constant predictor can game."""
+        calibration, unlike ECE, which a constant predictor can game.
+
+        :param scores: predicted confidences in ``0.0..1.0``
+        :param labels: whether each prediction was actually correct
+        :returns: the mean squared error in ``0.0..1.0``, lower being better.
+            A model that always predicts the base rate scores a perfect ECE and
+            a poor Brier, which is exactly the difference worth watching.
+        """
         if not scores:
             return 0.0
         return round(sum((float(s) - (1.0 if l else 0.0)) ** 2
@@ -7865,11 +9273,23 @@ class Calibrator(object):
         raise NotImplementedError
 
     def predict(self, score: float) -> float:
-        """Map one raw score onto a calibrated probability."""
+        """Map one raw score onto a calibrated probability.
+
+        Implementations must be monotone: calibration changes what a number
+        means, never the ranking between two fields.
+
+        :param score: a raw fused confidence in ``0.0..1.0``
+        :returns: the calibrated probability in ``0.0..1.0``
+        :raises NotImplementedError: on the base class
+        """
         raise NotImplementedError
 
     def predict_many(self, scores: Sequence[float]) -> List[float]:
-        """Calibrate a sequence of scores."""
+        """Calibrate a sequence of scores.
+
+        :param scores: raw fused confidences
+        :returns: the calibrated probabilities, in the same order
+        """
         return [self.predict(s) for s in scores]
 
     def to_dict(self) -> Dict[str, Any]:
@@ -7878,7 +9298,17 @@ class Calibrator(object):
 
     @staticmethod
     def from_dict(d: Mapping[str, Any]) -> Calibrator:
-        """Rebuild whichever calibrator ``d`` describes."""
+        """Rebuild whichever calibrator ``d`` describes.
+
+        The dispatcher that makes a fitted calibrator round-trip through an eval
+        report -- which is how a calibration fitted last month gets applied to
+        this month's run.
+
+        :param d: a mapping from any calibrator's ``to_dict``, tagged with
+            ``kind``: ``"platt"``, ``"isotonic"``, or ``"identity"``
+        :returns: the reconstructed calibrator
+        :raises ConfigError: ``kind`` is missing or unrecognised
+        """
         kind = d.get("kind")
         if kind == "platt":
             return PlattCalibrator.from_dict(d)
@@ -7893,11 +9323,22 @@ class IdentityCalibrator(Calibrator):
     """Pass scores through unchanged.  The honest default before fitting."""
 
     def fit(self, scores: Sequence[float], labels: Sequence[bool]) -> IdentityCalibrator:
-        """Nothing to fit.  Returns ``self``."""
+        """Nothing to fit.  Returns ``self``.
+
+        :param scores: ignored
+        :param labels: ignored
+        :returns: ``self``, unchanged.  The point of this class is to be a
+            drop-in that documents "no calibration was applied" instead of
+            leaving ``calibrator=None`` ambiguous.
+        """
         return self
 
     def predict(self, score: float) -> float:
-        """The score itself, clamped to ``[0, 1]``."""
+        """The score itself, clamped to ``[0, 1]``.
+
+        :param score: a fused confidence
+        :returns: the same value, clamped
+        """
         return float(clamp(score, 0.0, 1.0))
 
     def to_dict(self) -> Dict[str, Any]:
@@ -7915,7 +9356,13 @@ class PlattCalibrator(Calibrator):
     """
 
     def __init__(self, a: float = 1.0, b: float = 0.0) -> None:
-        """Start from ``a``, ``b`` -- the defaults are the identity mapping."""
+        """Start from ``a``, ``b`` -- the defaults are the identity mapping.
+
+        :param a: slope applied to the logit of the raw score.  ``1.0`` with
+            ``b=0.0`` is the identity, so an unfitted calibrator changes nothing.
+        :param b: intercept in logit space; negative shifts scores down, which is
+            what fitting produces when the raw scores are overconfident.
+        """
         self.a = float(a)
         self.b = float(b)
         self.n = 0
@@ -7924,11 +9371,18 @@ class PlattCalibrator(Calibrator):
             learning_rate: float = 0.25) -> PlattCalibrator:
         """Fit ``a`` and ``b`` by gradient descent on the log-loss.
 
-        :param iterations: full-batch gradient steps
-        :param learning_rate: step size; the default is stable for this loss
-
         Targets are smoothed by Platt's correction so a perfectly separable set
-        cannot drive the weights to infinity.  Returns ``self``.
+        cannot drive the weights to infinity.
+
+        :param scores: raw fused confidences in ``0.0..1.0``
+        :param labels: whether each prediction was actually correct
+        :param iterations: full-batch gradient steps.  ``400`` converges on the
+            few-hundred-sample sets this is meant for; raising it is cheap but
+            rarely changes the fit.
+        :param learning_rate: step size.  ``0.25`` is stable for this loss --
+            larger values oscillate, and the fit silently ends up worse rather
+            than failing.
+        :returns: ``self``, fitted
         """
         xs = [logit(clamp(float(s), 0.0, 1.0)) for s in scores]
         ys = [1.0 if bool(l) else 0.0 for l in labels]
@@ -7959,7 +9413,13 @@ class PlattCalibrator(Calibrator):
         return self
 
     def predict(self, score: float) -> float:
-        """``sigmoid(a * logit(score) + b)``."""
+        """``sigmoid(a * logit(score) + b)``.
+
+        :param score: a fused confidence in ``0.0..1.0``
+        :returns: the calibrated probability, rounded to 4 places.  Monotone in
+            ``score``, so calibration never reorders two fields -- it only
+            changes what the numbers mean.
+        """
         return round(float(sigmoid(self.a * logit(clamp(score, 0.0, 1.0)) + self.b)), 4)
 
     def to_dict(self) -> Dict[str, Any]:
@@ -7974,6 +9434,10 @@ class PlattCalibrator(Calibrator):
         :meth:`Calibrator.from_dict` -- the base declares the dispatcher every
         calibrator must answer to, and a classmethod would take an extra
         positional parameter it does not have.
+
+        :param d: a mapping from :meth:`to_dict`, with ``a``, ``b`` and ``n``
+        :returns: the reconstructed calibrator; missing keys fall back to the
+            identity mapping rather than raising
         """
         obj = PlattCalibrator(float(d.get("a", 1.0)), float(d.get("b", 0.0)))
         obj.n = int(d.get("n", 0))
@@ -7996,7 +9460,15 @@ class IsotonicCalibrator(Calibrator):
 
     def __init__(self, thresholds: Optional[Sequence[float]] = None,
                  values: Optional[Sequence[float]] = None) -> None:
-        """Start from an optional fitted step function."""
+        """Start from an optional fitted step function.
+
+        Normally built by :meth:`fit` or :meth:`from_dict` rather than directly.
+
+        :param thresholds: ascending score breakpoints of the step function
+        :param values: the calibrated probability for each breakpoint, one per
+            entry in ``thresholds``.  Both empty gives an unfitted calibrator
+            that passes scores through.
+        """
         self.thresholds = list(thresholds or [])
         self.values = list(values or [])
         self.n = 0
@@ -8005,10 +9477,15 @@ class IsotonicCalibrator(Calibrator):
             min_samples: int = 50) -> IsotonicCalibrator:
         """Fit a monotone step function by pool-adjacent-violators.
 
-        :param min_samples: refuse to fit below this, rather than overfit --
-            raises :class:`ConfigError` pointing at :class:`PlattCalibrator`
-
-        Returns ``self``.
+        :param scores: predicted confidences in ``0.0..1.0``
+        :param labels: whether each prediction was actually correct
+        :param min_samples: refuse to fit below this many samples rather than
+            overfit.  ``50`` is already optimistic for a free-form step
+            function; a few hundred is where it starts beating Platt scaling.
+        :returns: ``self``, fitted
+        :raises ConfigError: fewer than ``min_samples`` samples were supplied.
+            The message points at :class:`PlattCalibrator`, whose two parameters
+            survive a small set.
         """
         points = sorted(zip([clamp(float(s), 0.0, 1.0) for s in scores],
                             [1.0 if bool(l) else 0.0 for l in labels]))
@@ -8036,7 +9513,13 @@ class IsotonicCalibrator(Calibrator):
         return self
 
     def predict(self, score: float) -> float:
-        """The fitted step at ``score``; the raw score when unfitted."""
+        """The fitted step at ``score``; the raw score when unfitted.
+
+        :param score: a raw fused confidence in ``0.0..1.0``
+        :returns: the calibrated probability, rounded to 4 places.  Piecewise
+            constant, so nearby raw scores can map to the same output -- the
+            price of not assuming a parametric shape.
+        """
         if not self.thresholds:
             return float(clamp(score, 0.0, 1.0))
         x = clamp(float(score), 0.0, 1.0)
@@ -8057,6 +9540,11 @@ class IsotonicCalibrator(Calibrator):
 
         A staticmethod for the same reason as :meth:`PlattCalibrator.from_dict`:
         it has to match the dispatcher declared on :class:`Calibrator`.
+
+        :param d: a mapping from :meth:`to_dict`, with ``thresholds``, ``values``
+            and ``n``
+        :returns: the reconstructed calibrator; without ``thresholds`` it is
+            unfitted and passes scores through
         """
         obj = IsotonicCalibrator(d.get("thresholds"), d.get("values"))
         obj.n = int(d.get("n", 0))
@@ -8159,6 +9647,14 @@ class SchemaAdapter(object):
 
         Built by :meth:`from_schema` rather than directly -- it is the classmethod
         that knows how to reduce each supported schema shape to these arguments.
+
+        :param schema: the project's original schema object, retained so
+            that :meth:`build` can instantiate it.  ``None`` means "dict only",
+            and building then returns a plain dict.
+        :param json_schema: the JSON Schema sent to the model in the prompt
+        :param fields: the flat :class:`FieldSpec` list used for coercion and
+            per-field confidence
+        :param name: label for the schema, used in prompts and reports
         """
         self.schema = schema
         self.json_schema = json_schema
@@ -8173,6 +9669,20 @@ class SchemaAdapter(object):
         Accepts a pydantic v1 or v2 model, a dataclass, a ``{field: type}`` dict,
         or an existing adapter (returned unchanged).  Anything else raises
         :class:`ConfigError` naming the shapes that do work.
+
+        :param schema: one of --
+
+            * a pydantic model class (v1 or v2), which carries descriptions and
+              required-ness and so gives the model the most to work with;
+            * a dataclass, whose annotations become the field types;
+            * a ``{field: type}`` dict such as
+              ``{"invoice_no": str, "total": float, "items": list}``, the
+              quickest way to try something;
+            * an existing :class:`SchemaAdapter`, returned unchanged so callers
+              can pass either without checking.
+
+        :returns: an adapter exposing ``json_schema`` and ``fields``
+        :raises ConfigError: the object is none of the above
         """
         if isinstance(schema, SchemaAdapter):
             return schema
@@ -8288,7 +9798,13 @@ class SchemaAdapter(object):
 
     # -- use --------------------------------------------------------------
     def field(self, name: str) -> Optional[FieldSpec]:
-        """The spec for ``name``, or ``None`` when the schema has no such field."""
+        """The spec for ``name``, or ``None`` when the schema has no such field.
+
+        :param name: the field name to look up
+        :returns: its :class:`FieldSpec`, or ``None``.  ``None`` is normal, not
+            an error: a model may return a field the schema never asked for, and
+            that value is coerced as a string rather than dropped.
+        """
         for spec in self.fields:
             if spec.name == name:
                 return spec
@@ -8301,6 +9817,15 @@ class SchemaAdapter(object):
         instantiated -- a validation failure must not lose the extraction, it
         must be *reported alongside* it, because a reviewer can still use
         eleven correct fields out of twelve.
+
+        :param data: already-coerced field values
+        :returns: an instance of the project's schema -- a pydantic model, a
+            dataclass instance, or a plain dict when the adapter was built from
+            a dict spec.  Dataclass construction drops keys the dataclass does
+            not declare.
+        :raises ExtractionError: the schema rejected the data.  :func:`extract`
+            catches this and records it as a warning, so the per-field results
+            survive even when the object cannot be built.
         """
         if self.schema is None:
             return dict(data)
@@ -8320,7 +9845,14 @@ class SchemaAdapter(object):
         return dict(data)
 
     def coerce(self, name: str, value: Any) -> Any:
-        """Convert a raw JSON value to the declared type, tolerantly."""
+        """Convert a raw JSON value to the declared type, tolerantly.
+
+        :param name: the field the value belongs to; an unknown one is coerced
+            as a string rather than rejected
+        :param value: the raw value as the model returned it
+        :returns: the coerced value, or ``None`` when it could not be coerced --
+            which confidence fusion then scores as a format mismatch
+        """
         spec = self.field(name)
         return coerce_value(value, spec.type_name if spec else "string",
                             spec.item_type if spec else None)
@@ -8333,6 +9865,24 @@ def coerce_value(value: Any, type_name: str, item_type: Optional[str] = None) ->
     ``"Rs. 48,250.00"``, and rejecting that loses a correct extraction over a
     formatting preference.  Returns ``None`` when the value cannot be coerced,
     which the confidence machinery then scores as a format mismatch.
+
+    :param value: the raw JSON value.  ``None`` passes straight through, since
+        "the field is absent" is different from "the field would not parse".
+    :param type_name: the JSON Schema type to coerce to -- ``"string"``,
+        ``"number"``, ``"integer"``, ``"boolean"``, ``"date"``, ``"array"``, or
+        ``"object"``.  Unknown names are treated as ``"string"``.
+    :param item_type: element type for ``"array"``, applied to each entry.  A
+        non-list value under ``"array"`` is wrapped in a one-element list, since
+        a model asked for a list of one item routinely returns the item.
+    :returns: the coerced value, or ``None`` when coercion failed
+
+    What tolerance buys::
+
+        coerce_value("Rs. 48,250.00", "number")   # -> 48250.0
+        coerce_value("1,20,000", "number")        # -> 120000.0  (lakh grouping)
+        coerce_value("15/03/2024", "date")        # -> "2024-03-15"
+        coerce_value("yes", "boolean")            # -> True
+        coerce_value("not a number", "number")    # -> None
     """
     if value is None:
         return None
@@ -8395,6 +9945,16 @@ def format_document_text(doc: Document, include_page_markers: bool = True,
     Page markers are not decoration: they are what lets an extracted value be
     traced back to a page when the model is asked to cite one, and what keeps
     a 40-page bundle's fields from being attributed to page 1.
+
+    :param doc: a document that has been read.  Pages with no text are skipped
+        entirely rather than emitting an empty marker.
+    :param include_page_markers: prefix each page with ``--- page N ---``,
+        numbered from 1 to match what a human sees.  Turn it off only when
+        feeding a consumer that cannot tolerate the markers.
+    :param max_chars: truncate at this many characters; ``0`` means no limit.
+        Truncation prefers a whole-page boundary, falling back to a partial page
+        only when the remaining room is large enough to be worth using.
+    :returns: the rendered text, pages separated by blank lines
     """
     parts = []
     used = 0
@@ -8416,7 +9976,23 @@ def format_document_text(doc: Document, include_page_markers: bool = True,
 
 def build_extraction_prompt(adapter: SchemaAdapter, document_text: str, context: str = "",
                             extra_instructions: str = "") -> str:
-    """Assemble the user prompt: schema, domain context, then document text."""
+    """Assemble the user prompt: schema, domain context, then document text.
+
+    The order is deliberate.  The schema comes first so the model knows what it
+    is looking for before it reads, and the document goes last inside a fence so
+    that instructions embedded in a scanned page read as data rather than as
+    something to obey.
+
+    :param adapter: the schema, whose ``json_schema`` is embedded verbatim
+    :param document_text: the page text, normally produced
+        by :func:`format_document_text`
+    :param context: domain hints, e.g. ``"Indian private hospital bill, INR"``.
+        Omitted from the prompt entirely when empty.
+    :param extra_instructions: run-specific notes, appended after the context
+        and also omitted when empty
+    :returns: the complete user prompt, ending with the instruction to reply
+        with JSON only
+    """
     sections = [
         "Extract the following fields from the document below.",
         "",
@@ -8439,6 +10015,19 @@ def chunk_pages(doc: Document, max_chars: int = 60000,
     Splitting on page boundaries rather than character counts keeps tables and
     totals intact, and the one-page overlap catches the field that straddles a
     page break -- which is exactly where discharge dates and totals live.
+
+    :param doc: the document to split
+    :param max_chars: character budget per chunk.  ``60000`` fits current context
+        windows with room for the schema and the reply.  ``0`` or less disables
+        chunking and returns the document whole.
+    :param overlap_pages: pages repeated at the start of each subsequent chunk.
+        ``1`` catches the straddling field; ``0`` disables the overlap and is
+        right only when pages are genuinely independent.  Overlap costs tokens
+        at every boundary, which is why it is one page and not three.
+    :returns: one or more :class:`Document` chunks sharing the original's
+        ``source_uri`` and ``meta``.  Always at least one, so callers need no
+        empty-case branch.  A single page longer than ``max_chars`` is never
+        split, since splitting mid-table is worse than one oversized call.
     """
     if max_chars <= 0:
         return [doc]
@@ -8471,6 +10060,7 @@ class LLMClient(Protocol):  # pragma: no cover - structural type
                  images: Optional[Sequence[bytes]] = None) -> Tuple[str, Cost]:
         """Complete ``prompt`` and report what it cost.
 
+        :param prompt: the fully assembled user prompt
         :param system: system instructions, when the provider supports them
         :param images: JPEG page images to send alongside the prompt
         :returns: ``(text, cost)``
@@ -8504,7 +10094,14 @@ class BaseLLMClient(object):
 
     def complete(self, prompt: str, system: Optional[str] = None,
                  images: Optional[Sequence[bytes]] = None) -> Tuple[str, Cost]:
-        """Complete ``prompt``.  Subclasses implement this."""
+        """Complete ``prompt``.  Subclasses implement this.
+
+        :param prompt: the fully assembled user prompt
+        :param system: system instructions, when the provider supports them
+        :param images: JPEG page images to send alongside the prompt
+        :returns: ``(text, cost)``
+        :raises NotImplementedError: always -- this is the extension point
+        """
         raise NotImplementedError
 
 
@@ -8523,8 +10120,12 @@ class EchoClient(BaseLLMClient):
                  cost: Optional[Cost] = None, record: bool = True, **options: Any) -> None:
         """Configure the double.
 
-        :param response: a JSON string, a mapping, or ``fn(prompt) -> response``
-        :param cost: the cost to report, for exercising budget logic
+        :param response: what to return -- a JSON string (``'{"total": 100}'``),
+            a mapping (``{"total": 100}``, encoded for you), or a callable
+            ``fn(prompt) -> str | mapping``, which is how you make the double
+            answer differently per chunk or assert on what it was asked.
+        :param cost: the :class:`Cost` to report per call, for exercising budget
+            and pricing logic.  Defaults to one call at zero money.
         :param record: keep every prompt in ``self.prompts``, so a test can assert
             on what the pipeline actually asked for
         """
@@ -8536,7 +10137,17 @@ class EchoClient(BaseLLMClient):
 
     def complete(self, prompt: str, system: Optional[str] = None,
                  images: Optional[Sequence[bytes]] = None) -> Tuple[str, Cost]:
-        """Return the canned response (JSON-encoded if it is not a string)."""
+        """Return the canned response (JSON-encoded if it is not a string).
+
+        :param prompt: recorded on ``self.prompts`` when ``record`` is set, and
+            passed to ``response`` when that is a callable
+        :param system: accepted and ignored -- the double does not model system
+            instructions
+        :param images: accepted and ignored
+        :returns: ``(text, cost)`` with the configured cost.  Deterministic by
+            construction, which is what makes accuracy assertions in the test
+            suite exact rather than plausible.
+        """
         if self.record:
             self.prompts.append(prompt)
         response = self.response(prompt) if callable(self.response) else self.response
@@ -8555,7 +10166,10 @@ class AnthropicClient(BaseLLMClient):
                  **options: Any) -> None:
         """Configure the Claude client.
 
-        :param api_key: falls back to ``ANTHROPIC_API_KEY``
+        :param model: Claude model id, e.g. ``"claude-sonnet-5"``.  Also the
+            pricing key -- see :func:`Pricing.set_pricing`.
+        :param api_key: falls back to the ``ANTHROPIC_API_KEY`` environment
+            variable when ``None``
         :param client: a pre-built SDK client, injected instead of constructed
         """
         BaseLLMClient.__init__(self, model=model, **options)
@@ -8580,7 +10194,16 @@ class AnthropicClient(BaseLLMClient):
 
     def complete(self, prompt: str, system: Optional[str] = None,
                  images: Optional[Sequence[bytes]] = None) -> Tuple[str, Cost]:
-        """One Messages API call, with any page images attached first."""
+        """One Messages API call, with any page images attached first.
+
+        :param prompt: the fully assembled user prompt
+        :param system: system instructions, when the provider supports them
+        :param images: JPEG page images sent alongside the prompt, for pages OCR
+            handled badly.  Ignored by providers without vision.
+        :returns: ``(text, cost)`` -- the raw completion, and what it billed as
+            a :class:`Cost`.  The text goes through :func:`parse_json_lenient`,
+            so a fenced code block or a prose preamble is tolerated.
+        """
         content: List[Dict[str, Any]] = []
         for blob in (images or []):
             content.append({"type": "image", "source": {
@@ -8609,8 +10232,13 @@ class OpenAIClient(BaseLLMClient):
                  client: Any = None, **options: Any) -> None:
         """Configure the OpenAI client.
 
-        :param api_key: falls back to ``OPENAI_API_KEY``
-        :param client: a pre-built SDK client, injected instead of constructed
+        :param model: OpenAI model id, e.g. ``"gpt-4o"``.  Also the pricing key.
+        :param api_key: falls back to the ``OPENAI_API_KEY`` environment
+            variable when ``None``
+        :param client: a pre-built SDK client, injected instead of constructed --
+            for a proxy, custom transport, or a test double
+        :param options: forwarded to :class:`BaseLLMClient` -- ``max_tokens``,
+            ``temperature``
         """
         BaseLLMClient.__init__(self, model=model, **options)
         self._api_key = api_key
@@ -8634,7 +10262,16 @@ class OpenAIClient(BaseLLMClient):
 
     def complete(self, prompt: str, system: Optional[str] = None,
                  images: Optional[Sequence[bytes]] = None) -> Tuple[str, Cost]:
-        """One chat-completions call, with any page images attached."""
+        """One chat-completions call, with any page images attached.
+
+        :param prompt: the fully assembled user prompt
+        :param system: system instructions, when the provider supports them
+        :param images: JPEG page images sent alongside the prompt, for pages OCR
+            handled badly
+        :returns: ``(text, cost)`` -- the raw completion, and what it billed as
+            a :class:`Cost`.  The text goes through :func:`parse_json_lenient`,
+            so a fenced code block or a prose preamble is tolerated.
+        """
         content: List[Dict[str, Any]] = [{"type": "text", "text": prompt}]
         for blob in (images or []):
             url = "data:image/jpeg;base64,%s" % base64.b64encode(blob).decode("ascii")
@@ -8664,6 +10301,15 @@ def parse_json_lenient(text: Optional[str]) -> Any:
     extraction over any of that would be throwing away a correct answer on a
     presentation detail, so this walks through progressively more forgiving
     strategies and raises only when nothing parses.
+
+    :param text: the model's raw reply.  ``None`` and empty both raise, since
+        there is a real difference between "the model said nothing" and "the
+        model said something unparseable".
+    :returns: the decoded object -- usually a ``dict``, sometimes a ``list``
+        when the model wrapped its answer in one
+    :raises ExtractionError: no strategy recovered valid JSON.  :func:`extract`
+        catches this per chunk and records a warning, so one unparseable chunk
+        does not lose the others.
     """
     if text is None:
         raise ExtractionError("model returned no text")
@@ -8836,6 +10482,26 @@ def locate_value(doc: Document, value: Any, min_score: float = 0.72,
     matched on their digits alone, so "Rs 48,250.00" is found for ``48250``.
 
     Returns the best matches sorted by score, one per page at most.
+
+    :param doc: a document that has been read, so its pages carry spans
+    :param value: the extracted value to locate.  Numbers and dates are matched
+        in every form they might be printed in, so ``48250`` finds
+        ``"Rs 48,250.00"`` and ``"2024-04-12"`` finds ``"12-04-2024"``.
+        ``None`` returns no evidence.
+    :param min_score: least similarity for a match to count, in ``0.0..1.0``.
+        ``0.72`` tolerates the usual OCR damage while rejecting coincidence.
+        Raise it towards ``0.85`` when values are long and distinctive, lower it
+        only if you would rather have approximate evidence than none.
+    :param max_span_window: how many consecutive spans on a line may be joined
+        to form a candidate.  ``8`` covers ``"Rs"``, ``"1,23,456.78"`` split
+        across word spans, and a label sharing the line.  Raising it costs time
+        quadratically and invites spurious matches.
+    :param pages: restrict the search to these page indices; ``None`` searches
+        every page.  Worth passing when the model reported which page it read a
+        value from -- it is faster and avoids matching a repeated header.
+    :returns: the best :class:`Evidence` per page scoring at least
+        ``min_score``, sorted best first.  Empty when nothing matched, which is
+        itself a signal -- confidence fusion scores an unlocatable value lower.
     """
     if value is None:
         return []
@@ -8918,6 +10584,13 @@ def backend_confidence_for(doc: Document, evidence: Sequence[Evidence]) -> Optio
 
     Returns ``None`` when no supporting span carries a confidence, which keeps
     "the engine declined to say" distinct from "the engine said zero".
+
+    :param doc: the document the evidence points into
+    :param evidence: spans of evidence, as returned by :func:`locate_value`
+    :returns: the mean confidence over overlapping spans, rounded to 4 places;
+        or ``None`` when no supporting span reported one.  Vision backends
+        report nothing here, which is why cross-read agreement carries the
+        weight for them.
     """
     values: List[float] = []
     for item in evidence:
@@ -8974,6 +10647,14 @@ class Validators(object):
         list of those.  A validator that *raises* is itself reported as an issue
         rather than aborting extraction: a buggy rule must not cost you the
         document.
+
+        :param model: the built schema object to validate
+        :param validators: the rules to run.  Each takes the model and returns
+            ``None`` (passed), a string (an error), a :class:`ValidationIssue`,
+            or a list of those.
+        :returns: every issue raised, in validator order.  A validator that
+            raised contributes one issue of severity ``"warning"`` naming the
+            exception.
         """
         issues: List[ValidationIssue] = []
         for validator in validators or []:
@@ -9004,6 +10685,23 @@ class Validators(object):
         The single most valuable check on a bill, because it is *independent* of
         the reading: an OCR error in any one amount breaks the sum, which is why
         this feeds confidence fusion rather than just producing a warning.
+
+        :param items_field: attribute or key holding the line items, e.g.
+            ``"line_items"`` or ``"charges"``
+        :param amount_field: the per-item amount attribute, e.g. ``"amount"``
+        :param total_field: the stated document total, e.g. ``"total"`` or
+            ``"net_payable"``
+        :param tolerance: absolute slack, as a :class:`decimal.Decimal`.
+            ``0.02`` absorbs two paise of rounding.  Decimal rather than float
+            on purpose -- money compared in binary floating point produces
+            failures nobody can reproduce.
+        :param relative_tolerance: extra slack proportional to the total, so
+            ``0.005`` allows half a percent.  Use it when the document rounds
+            its own total, and keep it at ``0.0`` otherwise: a percentage
+            tolerance on a large bill hides real errors.
+        :returns: a ``Validator`` closure.  It passes quietly when either field
+            is missing, since "this document has no line items" is not an
+            arithmetic failure.
         """
         def validate(model: Any) -> Optional[ValidationIssue]:
             """Compare the summed line items against the stated total."""
@@ -9028,7 +10726,22 @@ class Validators(object):
 
     @staticmethod
     def date_order(earlier_field: str, later_field: str, allow_equal: bool = True) -> Validator:
-        """Validator factory: one date must not precede another."""
+        """Validator factory: one date must not precede another.
+
+        Catches the digit-transposition errors OCR makes on dates, which are
+        otherwise invisible -- ``2024`` misread as ``2074`` is still a valid date.
+
+        :param earlier_field: the field that should come first, e.g.
+            ``"admission_date"``
+        :param later_field: the field that should come second, e.g.
+            ``"discharge_date"``
+        :param allow_equal: treat equal dates as valid.  ``True`` is right for
+            same-day admission and discharge; set ``False`` when the two genuinely
+            cannot coincide.
+        :returns: a ``Validator`` closure, passing quietly when either date is
+            missing.  Both values must be comparable -- coerce them to dates
+            first via a ``date``-typed schema field.
+        """
         def validate(model: Any) -> Optional[ValidationIssue]:
             """Check that the earlier field really is not after the later one."""
             a = _get_attr(model, earlier_field)
@@ -9046,7 +10759,22 @@ class Validators(object):
     @staticmethod
     def field_matches(field_name: str, pattern: str,
                       message: Optional[str] = None) -> Validator:
-        """Validator factory: a field must match a regular expression."""
+        """Validator factory: a field must match a regular expression.
+
+        The cheapest way to catch a value the model invented in the right shape
+        but the wrong place -- a GSTIN that is 14 characters, an invoice number
+        missing its prefix.
+
+        :param field_name: the field to check
+        :param pattern: a regular expression, applied with ``re.search`` so it
+            need not match the whole value.  Anchor it with ``^...$`` when it
+            should, e.g. ``"^[0-9]{2}[A-Z]{5}[0-9]{4}[A-Z][0-9]Z[A-Z0-9]$"`` for
+            a GSTIN.
+        :param message: the issue text on failure; ``None`` generates one naming
+            the field and the pattern
+        :returns: a ``Validator`` closure, passing quietly when the field is
+            absent -- absence is a completeness question, not a format one
+        """
         compiled = re.compile(pattern)
 
         def validate(model: Any) -> Optional[ValidationIssue]:
@@ -9146,16 +10874,38 @@ class Extraction(Generic[T]):
     latency_ms: float = 0.0
 
     def __getitem__(self, name: str) -> FieldResult:
-        """``result["total"]`` -- the :class:`FieldResult`.  Raises on unknown names."""
+        """``result["total"]`` -- the :class:`FieldResult`.  Raises on unknown names.
+
+        :param name: a schema field name
+        :returns: its :class:`FieldResult`, carrying value, confidence and
+            evidence together
+        :raises KeyError: no such field.  Use :meth:`value` when a missing field
+            should be a default rather than an error.
+        """
         return self.fields[name]
 
     def value(self, name: str, default: Any = None) -> Any:
-        """The extracted value for ``name``, or ``default`` if missing or null."""
+        """The extracted value for ``name``, or ``default`` if missing or null.
+
+        Deliberately conflates "absent" and "null": both mean the document did
+        not state it.  Use ``name in result.fields`` to tell them apart.
+
+        :param name: a schema field name
+        :param default: returned when the field is absent or its value is
+            ``None``
+        :returns: the coerced value, already converted to the declared type
+        """
         result = self.fields.get(name)
         return default if result is None or result.value is None else result.value
 
     def confidence(self, name: str) -> float:
-        """Confidence for ``name``, or ``0.0`` when the field is absent."""
+        """Confidence for ``name``, or ``0.0`` when the field is absent.
+
+        :param name: a schema field name
+        :returns: the fused confidence in ``0.0..1.0``, or ``0.0`` for an unknown
+            field.  Uncalibrated unless a ``calibrator`` was fitted on your own
+            labelled data -- it ranks reliably, but it is not a probability.
+        """
         result = self.fields.get(name)
         return result.confidence if result else 0.0
 
@@ -9170,7 +10920,16 @@ class Extraction(Generic[T]):
         return round(sum(values) / len(values), 4) if values else 0.0
 
     def low_confidence(self, threshold: float = 0.7) -> List[FieldResult]:
-        """Fields a human should look at.  The point of the whole exercise."""
+        """Fields a human should look at.  The point of the whole exercise.
+
+        :param threshold: confidence below which a field is queued for review.
+            ``0.7`` is a starting point, not a recommendation -- pick it from
+            your own reliability curve, where :meth:`EvalReport.regression_vs`
+            and :func:`Confidence.reliability_curve` tell you what a given score
+            actually buys on your documents.
+        :returns: the qualifying :class:`FieldResult` objects, least confident
+            first, so a review queue is already in priority order
+        """
         return sorted([f for f in self.fields.values() if f.confidence < threshold],
                       key=lambda f: f.confidence)
 
@@ -9205,6 +10964,14 @@ def merge_extracted_data(chunks: Sequence[Mapping[str, Any]]) -> Dict[str, Any]:
     First non-null wins for scalars (earlier pages hold headers and identifiers);
     lists are concatenated with duplicates dropped, because line items are
     spread across pages and each chunk sees only its own.
+
+    :param chunks: the parsed object from each chunk, in document order.  Order
+        matters: "first non-null wins" makes the earliest chunk authoritative
+        for scalars, which is why chunks must not be reordered or run
+        out-of-sequence.
+    :returns: one merged dict.  Duplicate list entries are dropped by comparing
+        their JSON encoding, so the page repeated by ``overlap_pages`` does not
+        double every line item it carried.
     """
     merged: Dict[str, Any] = {}
     for chunk in chunks:
@@ -9240,14 +11007,57 @@ def extract(doc: Document, schema: SchemaLike, context: str = "",
     chunking, parsing, coercion, evidence recovery, confidence fusion -- is
     library.
 
-    :param doc: a document that has already been read (see :func:`read`)
-    :param schema: pydantic model, dataclass, or ``{field: type}`` dict
-    :param context: domain hints, e.g. "Indian private hospital bill, INR"
-    :param client: an :class:`LLMClient`; required unless the schema is empty
-    :param validators: business rules; their outcome feeds each field's confidence
-    :param include_images: also send page rasters, for pages OCR handled badly
-    :param calibrator: maps fused scores onto calibrated probabilities
-    :param retries: attempts on transport or parse failure
+    :param doc: a document that has already been read, so its pages carry spans
+        -- see :func:`read`.  An unread document yields empty prompt text and
+        no evidence to locate values against.
+    :param schema: a pydantic model, a dataclass, or a ``{field: type}`` dict
+        such as ``{"invoice_no": str, "total": float}``.  A pydantic model gives
+        the model the most to work with, since field descriptions reach the
+        prompt.  See :meth:`SchemaAdapter.from_schema`.
+    :param context: domain hints pasted into the prompt, e.g.
+        ``"Indian private hospital bill, INR"``.  The cheapest accuracy in the
+        library -- it is what disambiguates lakh grouping and local date order.
+    :param client: an :class:`LLMClient` -- one of :class:`AnthropicClient`,
+        or :class:`OpenAIClient`, or :class:`EchoClient` in tests.  Required.
+    :param validators: business rules run over the built object.  Each outcome
+        feeds the confidence of the fields it names, so a failing sum lowers
+        confidence on the amounts rather than only logging a complaint.
+    :param system: system prompt; defaults to :data:`DEFAULT_EXTRACTION_SYSTEM`.
+        Replace it only if you know what you are giving up -- it is what keeps
+        the model from inferring values that are not on the page.
+    :param extra_instructions: appended to the user prompt, after the schema and
+        the context.  For per-run notes ("this batch has two bills per page"),
+        not for domain vocabulary, which belongs in ``context``.
+    :param max_chars: characters of document text per model call.  ``60000`` is
+        a safe fit for current context windows with room for the schema.  A
+        document above it is split into page-aligned chunks and the results
+        merged; a warning records that this happened.
+    :param overlap_pages: pages repeated at each chunk boundary, so a field
+        straddling a page break is not lost.  ``1`` is usually enough; ``0``
+        disables it and is only right when pages are known to be independent.
+    :param include_images: also send up to 8 page rasters alongside the text.
+        Worth it for pages OCR handled badly, and it costs vision tokens on
+        every call -- so it is off by default rather than "on just in case".
+    :param weights: override the confidence fusion weights; ``None`` uses
+        the defaults in :data:`DEFAULT_CONFIDENCE_WEIGHTS`.  The signals and
+        what they mean are set out in :func:`Confidence.fuse_confidence`.
+    :param calibrator: maps fused scores onto calibrated probabilities.  Without
+        one, confidence ranks correctly but is not a probability -- ``0.9`` does
+        not mean 90% right.  Fit a :class:`PlattCalibrator` on your own labelled
+        set to change that.
+    :param locate_evidence: search the document for each value to recover its
+        bounding box.  Leave it on: provenance is unrecoverable afterwards, and
+        it is also a confidence signal.  Turning it off saves time on very large
+        documents at the cost of both.
+    :param min_evidence_score: least match score for evidence to count, in
+        ``0.0..1.0``, passed to :func:`locate_value`.
+    :param retries: extra attempts on transport or parse failure, so ``2`` means
+        up to three tries.  Configuration errors and missing dependencies are
+        never retried.
+    :returns: an :class:`Extraction` carrying the built ``model``, and one
+        per-field :class:`FieldResult` with its confidence and evidence, plus
+        the accumulated cost, validation issues and warnings
+    :raises ConfigError: no ``client`` was given
 
     Confidence is fused from independent signals and is *uncalibrated* unless a
     ``calibrator`` fitted on your own labelled set is supplied.  See
@@ -9451,7 +11261,20 @@ class FieldRule(object):
 
 
 def extract_with_rules(doc: Document, rules: Sequence[FieldRule]) -> Dict[str, FieldResult]:
-    """Extract fields by anchoring on printed labels.  No model, no network."""
+    """Extract fields by anchoring on printed labels.  No model, no network.
+
+    The deterministic alternative to :func:`extract`, for fields that sit beside
+    a fixed printed label.  Free, instant and exactly repeatable -- but it only
+    works where the layout is stable, so the usual arrangement is rules for the
+    reliable fields and a model for the rest.
+
+    :param doc: a document that has been read, so its pages carry spans
+    :param rules: the label-anchored rules to apply; see :class:`FieldRule`
+    :returns: a :class:`FieldResult` per rule, keyed by ``rule.name``.  Every
+        rule produces an entry: one that matched nothing reports that in its
+        ``warnings`` and carries a ``None`` value, so a caller can tell "absent"
+        from "never looked for".
+    """
     out: Dict[str, FieldResult] = {}
     for rule in rules:
         out[rule.name] = _apply_rule(doc, rule)
@@ -9649,6 +11472,21 @@ def compare_values(expected: Any, predicted: Any, type_name: str = "string",
     whether a miss was a single transposed digit or complete garbage -- the
     difference between a tuning problem and a broken pipeline.  Tolerance
     matching is what a human reviewer would call correct.
+
+    :param expected: the ground-truth value.  Two ``None`` values count as a
+        correct match -- the pipeline agreeing that a field is absent is right,
+        not a miss.
+    :param predicted: what the pipeline produced
+    :param type_name: how to compare -- ``"number"``, ``"integer"``, ``"amount"``,
+        ``"date"``, ``"array"``, ``"object"``, or ``"string"``.  Drives the
+        comparison, so a truth value typed as a string is compared textually even
+        when it looks numeric; that is what ``EvalSuite.field_types`` overrides.
+    :param numeric_tolerance: relative slack for numbers, so ``0.005`` allows half
+        a percent.  Applied to the larger magnitude of the pair.
+    :param fuzzy_threshold: similarity at or above which a string counts as
+        within tolerance, in ``0.0..1.0``.  ``0.9`` treats a single wrong
+        character in a long value as close enough for a human.
+    :returns: ``(exact, fuzzy_similarity, within_tolerance)``
     """
     if expected is None and predicted is None:
         return True, 1.0, True
@@ -9731,6 +11569,16 @@ class EvalSuite(object):
 
         The JSON may be the truth mapping directly, or ``{"truth": {...},
         "tags": [...]}`` when a case needs grouping metadata.
+
+        :param directory: folder holding the documents and their truth files
+        :param truth_suffix: extension identifying truth files.  Everything with
+            this suffix becomes a case; the document is whichever sibling shares
+            the stem, found by extension.
+        :param name: label shown in reports; defaults to the folder's basename
+        :returns: the loaded suite
+        :raises ConfigError: the directory does not exist.  A truth file with no
+            matching document is recorded on the case rather than raising, so
+            one stray file does not block the suite.
         """
         if not os.path.isdir(directory):
             raise ConfigError("no such dataset directory: %s" % directory)
@@ -9760,12 +11608,24 @@ class EvalSuite(object):
         return cls(cases, name=name or os.path.basename(os.path.abspath(directory)))
 
     def add(self, case: EvalCase) -> EvalSuite:
-        """Append a case.  Returns ``self``, so cases chain."""
+        """Append a case.  Returns ``self``, so cases chain.
+
+        :param case: the labelled case to add
+        :returns: ``self``, so calls chain
+        """
         self.cases.append(case)
         return self
 
     def filter(self, predicate: Callable[[EvalCase], bool]) -> EvalSuite:
-        """A new suite holding only the cases satisfying ``predicate``."""
+        """A new suite holding only the cases satisfying ``predicate``.
+
+        :param predicate: ``Callable[[EvalCase], bool]``, e.g.
+            ``lambda c: "handwritten" in c.tags`` to measure a hard subset
+            separately -- an aggregate number hides exactly the regressions
+            worth catching.
+        :returns: a new suite sharing the surviving cases, keeping the original's
+            name and field types
+        """
         return EvalSuite([c for c in self.cases if predicate(c)], self.name, self.field_types)
 
     def __len__(self) -> int:
@@ -9781,6 +11641,27 @@ class EvalSuite(object):
         A pipeline that raises on one document is recorded as an error for that
         case and the run continues -- a suite that aborts on the first bad
         scan measures nothing.
+
+        :param pipelines: name to callable, each taking a document path and
+            returning an :class:`Extraction`.  A configured :class:`Pipeline` is
+            already such a callable.  Pass two to A/B them against identical
+            cases::
+
+                report = suite.run({"baseline": current, "candidate": tuned})
+
+        :param metrics: which of :data:`KNOWN_METRICS` to compute; ``None``
+            computes all of them.
+        :param max_workers: threads across cases.  ``0`` runs serially.  Cases
+            are independent, so this scales well -- but it multiplies your
+            concurrent API calls by the same factor.
+        :param numeric_tolerance: relative slack for numeric comparison, passed
+            to :func:`compare_values`.  ``0.005`` is half a percent.
+        :param on_case: called as ``on_case(pipeline_name, case_id)`` for
+            progress reporting.
+        :returns: an :class:`EvalReport` holding every per-field outcome, not
+            just the aggregates -- which is what lets the CI gate
+            of :meth:`EvalReport.regression_vs` name what broke.
+        :raises ConfigError: a metric name is not in :data:`KNOWN_METRICS`
         """
         chosen = list(metrics or KNOWN_METRICS)
         unknown = [m for m in chosen if m not in KNOWN_METRICS]
@@ -9877,7 +11758,13 @@ class EvalReport(object):
         return sorted(self.results)
 
     def outcomes(self, pipeline: str) -> List[FieldOutcome]:
-        """Every field outcome for ``pipeline``, across all cases."""
+        """Every field outcome for ``pipeline``, across all cases.
+
+        :param pipeline: the pipeline name to pull results for
+        :returns: every :class:`FieldOutcome` from every case, flattened.  Empty
+            for an unknown name rather than raising, so a caller iterating over
+            pipeline names cannot trip on one that produced nothing.
+        """
         out: List[FieldOutcome] = []
         for case in self.results.get(pipeline, []):
             out.extend(case.outcomes)
@@ -9885,7 +11772,14 @@ class EvalReport(object):
 
     # -- metrics ----------------------------------------------------------
     def compute(self, pipeline: str) -> Dict[str, float]:
-        """All requested metrics for one pipeline."""
+        """All requested metrics for one pipeline.
+
+        :param pipeline: the pipeline name to score
+        :returns: metric name to value, covering whichever entries
+            of :data:`KNOWN_METRICS` the run requested.  ``cost_per_doc`` reads
+            ``0.0`` until :func:`Pricing.set_pricing` is called, though token
+            counts behind it are real.
+        """
         cases = self.results.get(pipeline, [])
         outcomes = self.outcomes(pipeline)
         numeric = [o for o in outcomes
@@ -9915,6 +11809,10 @@ class EvalReport(object):
     def by_field(self, pipeline: Optional[str] = None) -> Dict[str, Dict[str, Any]]:
         """Per-field accuracy -- which fields degraded, not just the average.
 
+        :param pipeline: which pipeline's results to use; ``None`` takes the only
+            one, which is unambiguous for a single-pipeline report
+
+
         The aggregate hides everything that matters.  A pipeline can gain two
         points overall while losing eight on the total amount, which is the
         only field anyone downstream actually cares about.
@@ -9939,6 +11837,10 @@ class EvalReport(object):
     def by_page_quality(self, pipeline: Optional[str] = None) -> Dict[str, Dict[str, Any]]:
         """Accuracy split by page condition -- did we only improve on clean pages?
 
+        :param pipeline: which pipeline's results to use; ``None`` takes the only
+            one, which is unambiguous for a single-pipeline report
+
+
         A change that lifts the average by improving pages that were already
         fine, while leaving the degraded ones untouched, has not solved the
         problem it was meant to solve.  This is the split that catches that.
@@ -9959,7 +11861,15 @@ class EvalReport(object):
 
     def confidence_curve(self, pipeline: Optional[str] = None,
                          bins: int = 10) -> List[Dict[str, float]]:
-        """Is a 0.9 right 90% of the time?  This is the answer."""
+        """Is a 0.9 right 90% of the time?  This is the answer.
+
+        :param pipeline: which pipeline's results to use; ``None`` takes the only
+            one, which is unambiguous for a single-pipeline report
+        :param bins: equal-width confidence bins; ``10`` is conventional
+        :returns: the reliability curve as computed
+            by :func:`Confidence.reliability_curve` -- one dict per bin with
+            ``count``, ``mean_confidence``, ``accuracy`` and ``gap``
+        """
         pipeline = pipeline or (self.pipelines()[0] if self.pipelines() else "")
         outcomes = self.outcomes(pipeline)
         return reliability_curve([o.confidence for o in outcomes],
@@ -9968,6 +11878,16 @@ class EvalReport(object):
     def fit_calibrator(self, pipeline: Optional[str] = None,
                        kind: str = "platt") -> Calibrator:
         """Fit a calibrator on this report, ready to pass to :func:`extract`.
+
+        :param pipeline: which pipeline's results to use; ``None`` takes the only
+            one, which is unambiguous for a single-pipeline report
+        :param kind: ``"platt"`` (default) or ``"isotonic"``.  Platt fits two
+            parameters and works from a few hundred labelled fields; isotonic
+            assumes no shape but needs a few thousand not to overfit.
+        :returns: a fitted :class:`Calibrator`.  Serialise it with ``to_dict``
+            and pass it to :func:`extract` or :class:`Pipeline` to make the
+            confidence numbers mean what they say.
+        :raises ConfigError: too few samples for the chosen kind
 
         This closes the loop: measure, calibrate, ship the calibrator, and the
         confidence numbers a reviewer sees start meaning what they say.
@@ -9983,13 +11903,28 @@ class EvalReport(object):
         raise ConfigError("unknown calibrator kind %r" % kind)
 
     def errors(self, pipeline: Optional[str] = None) -> List[Tuple[str, str]]:
-        """``(case_id, error)`` for every case the pipeline failed on."""
+        """``(case_id, error)`` for every case the pipeline failed on.
+
+        :param pipeline: which pipeline's results to use; ``None`` takes the only
+            one, which is unambiguous for a single-pipeline report
+        :returns: ``(case_id, error_message)`` pairs.  Empty is what you want;
+            a non-empty list means those cases scored zero for reasons that have
+            nothing to do with extraction accuracy.
+        """
         pipeline = pipeline or (self.pipelines()[0] if self.pipelines() else "")
         return [(c.case_id, c.error) for c in self.results.get(pipeline, []) if c.error]
 
     def worst_cases(self, pipeline: Optional[str] = None,
                     limit: int = 10) -> List[Tuple[str, float]]:
-        """Cases with the lowest field accuracy -- where to look first."""
+        """Cases with the lowest field accuracy -- where to look first.
+
+        :param pipeline: which pipeline's results to use; ``None`` takes the only
+            one, which is unambiguous for a single-pipeline report
+        :param limit: how many to return, worst first
+        :returns: ``(case_id, accuracy)`` pairs.  Read these before tuning
+            anything -- an aggregate that moved usually moved because of a
+            handful of documents with a shared cause.
+        """
         pipeline = pipeline or (self.pipelines()[0] if self.pipelines() else "")
         scored = []
         for case in self.results.get(pipeline, []):
@@ -10003,7 +11938,15 @@ class EvalReport(object):
 
     # -- comparison -------------------------------------------------------
     def compare(self, baseline_pipeline: str, candidate_pipeline: str) -> Dict[str, Any]:
-        """Metric deltas and per-field regressions between two pipelines."""
+        """Metric deltas and per-field regressions between two pipelines.
+
+        :param baseline_pipeline: the name to measure against
+        :param candidate_pipeline: the name being evaluated
+        :returns: a dict of metric deltas plus the per-field accuracy changes,
+            signed so that positive means the candidate improved.  Both names
+            must be present in this report -- comparing across two separate runs
+            is :meth:`EvalReport.regression_vs`.
+        """
         base = self.compute(baseline_pipeline)
         candidate = self.compute(candidate_pipeline)
         deltas = dict((k, round(candidate.get(k, 0.0) - base.get(k, 0.0), 4))
@@ -10057,6 +12000,23 @@ class EvalReport(object):
         Timing metrics vary between runs on shared CI hardware regardless of
         the code.  Pass ``metrics=["field_exact", "numeric_tolerance"]`` to gate
         on accuracy alone when that matters more than a stable wall clock.
+
+        :param baseline: a path to a report saved by :meth:`save`, or else
+            an :class:`EvalReport` already in memory
+        :param pipeline: which pipeline in *this* report to compare; ``None``
+            takes the first.  The baseline is matched by the same name, falling
+            back to its own first pipeline.
+        :param tolerance: movement treated as noise.  Absolute for rate metrics,
+            fractional for the unbounded ones, so ``0.02`` means "two accuracy
+            points, or two percent slower".  ``0.0`` gates on any movement at
+            all, which is only realistic for a deterministic suite.
+        :param metrics: restrict the gate to these metric names; ``None``
+            compares every metric present in either report.
+        :returns: a dict with the per-metric before/after/delta and a
+            ``regressions`` list.  An empty ``regressions`` list is the pass
+            condition -- which is what ``docpipe eval --baseline`` exits
+            non-zero on.
+        :raises ConfigError: the baseline report contains no pipelines
         """
         other = EvalReport.load(baseline) if isinstance(baseline, str) else baseline
         pipeline = pipeline or (self.pipelines()[0] if self.pipelines() else "")
@@ -10130,6 +12090,10 @@ class EvalReport(object):
 
         Returns ``path``.  This is the file :meth:`regression_vs` reads as a
         baseline, so it is worth committing alongside a release.
+
+        :param path: destination file; parent directories are created, and an
+            existing file is overwritten
+        :returns: ``path``, so it can be used inline
         """
         directory = os.path.dirname(os.path.abspath(path))
         if directory:
@@ -10140,7 +12104,14 @@ class EvalReport(object):
 
     @classmethod
     def load(cls, path: str) -> EvalReport:
-        """Read a report back from a file written by :meth:`save`."""
+        """Read a report back from a file written by :meth:`save`.
+
+        :param path: a file written by :meth:`save`
+        :returns: the reconstructed report, with every per-field outcome intact
+            so the comparison can name individual fields
+        :raises OSError: the file could not be read
+        :raises ValueError: the file is not valid JSON
+        """
         with open(path, "r", encoding="utf-8") as fh:
             payload = json.load(fh)
         report = cls(suite=payload.get("suite", ""),
@@ -10545,7 +12516,19 @@ def _cli_eval(args: Any) -> int:
 
 
 def main(argv: Optional[Sequence[str]] = None) -> int:
-    """Entry point for ``python -m docpipe``."""
+    """Entry point for ``python -m docpipe``.
+
+    Subcommands are ``caps``, ``info``, ``quality``, ``preprocess``, ``read``,
+    ``extract`` and ``eval``.  Run ``docpipe <command> --help`` for each one's
+    flags.
+
+    :param argv: the argument list, excluding the program name.  ``None``
+        reads :data:`sys.argv`, which is what the console entry point does; pass
+        a list to drive the CLI from a test.
+    :returns: the process exit code -- ``0`` on success, ``1`` on error, and ``1``
+        from ``eval --baseline`` when a metric regressed, which is what makes it
+        usable as a CI gate
+    """
     import argparse
 
     parser = argparse.ArgumentParser(
