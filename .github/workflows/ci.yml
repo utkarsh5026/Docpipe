@@ -4,6 +4,9 @@ on:
   push:
     branches: ["main"]
   pull_request:
+  # The release workflow calls this one, so a tag cannot publish anything that
+  # would not have passed on main.
+  workflow_call:
 
 jobs:
   test:
@@ -34,6 +37,29 @@ jobs:
           print("docpipe.py parses as Python 3.8")
           PY
 
+      - name: Version is stated once, in two places that agree
+        # docpipe.py carries __version__ because a vendored copy has no
+        # pyproject.toml to read it from.  That duplication is the point, so the
+        # drift it invites gets caught here rather than in a published wheel.
+        run: |
+          python - <<'PY'
+          import io, re, sys
+
+          meta = io.open("pyproject.toml", encoding="utf-8").read()
+          # Deliberately not tomllib: this job also runs on 3.8, where it does
+          # not exist.  The field is a plain literal, so a regex is honest here.
+          declared = re.search(r'(?m)^version\s*=\s*"([^"]+)"', meta).group(1)
+
+          source = io.open("docpipe.py", encoding="utf-8").read()
+          dunder = re.search(r'(?m)^__version__\s*=\s*"([^"]+)"', source).group(1)
+
+          if declared != dunder:
+              sys.exit("version drift: pyproject says %s, docpipe.__version__ "
+                       "says %s" % (declared, dunder))
+          print("version %s, consistent across pyproject.toml and docpipe.py"
+                % declared)
+          PY
+
       - name: Import without any optional dependency
         # The core must stay pure-stdlib importable: a missing optional
         # dependency has to fail at the point of use, not at import time.
@@ -52,9 +78,35 @@ jobs:
               import docpipe
               assert docpipe.parse_amount("1,23,456.78") is not None
               assert docpipe.fuse_confidence({"validation": 0.9}) > 0.5
+              assert docpipe.Text.parse_amount("1,23,456.78") is not None
+              assert docpipe.Confidence.fuse_confidence({"validation": 0.9}) > 0.5
               print("core imports and runs with no optional dependencies")
           """)
           sys.exit(subprocess.call([sys.executable, "-c", script]))
+          PY
+
+      - name: Every namespaced staticmethod keeps its module-level alias
+        # The aliases are load-bearing: the staticmethods call one another through
+        # the bare names, resolved from module globals at call time.  Losing one
+        # breaks its namespace from the inside, and only at runtime.
+        run: |
+          python - <<'PY'
+          import docpipe, sys
+          names = ["Caps", "Util", "Image", "Quality", "Ingest", "Ops",
+                   "Policies", "Pricing", "Text", "Confidence", "Validators"]
+          bad = []
+          for cls_name in names:
+              cls = getattr(docpipe, cls_name)
+              for attr, raw in vars(cls).items():
+                  if attr.startswith("_") or not isinstance(raw, staticmethod):
+                      continue
+                  if getattr(docpipe, attr, None) is not getattr(cls, attr):
+                      bad.append("%s.%s" % (cls_name, attr))
+          if bad:
+              sys.exit("missing or mismatched module-level alias: %s" % ", ".join(bad))
+          total = sum(len([a for a, r in vars(getattr(docpipe, n)).items()
+                           if isinstance(r, staticmethod)]) for n in names)
+          print("%d staticmethods across %d namespaces, all aliased" % (total, len(names)))
           PY
 
       - name: Tests
