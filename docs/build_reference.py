@@ -400,7 +400,9 @@ def render_doc(text: str, heading_level: int = 3) -> str:
                         and (len(lines[i]) - len(lines[i].lstrip())) > 0:
                     body.append(lines[i].strip())
                     i += 1
-                label = name if kind == "param" else kind
+                # ':raises ConfigError:' carries the exception in the name slot;
+                # dropping it would render every raises clause as bare "raises".
+                label = name if kind == "param" else ("%s %s" % (kind, name) if name else kind)
                 items.append((label, " ".join(b for b in body if b)))
             out.append("<dl class='fields'>")
             for label, body in items:
