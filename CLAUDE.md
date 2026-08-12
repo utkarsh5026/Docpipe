@@ -26,6 +26,11 @@ up — the module docstring at the top of `docpipe.py` carries the same reasonin
 the layer numbering in the module docstring. New code goes in the section it belongs to —
 find the banner first, don't append to the end of the file.
 
+Within a section, groups of free functions that share a subject live on a **namespace
+class** as staticmethods — `Caps`, `Util`, `Image`, `Quality`, `Ingest`, `Ops`, `Policies`,
+`Pricing`, `Text`, `Confidence`, `Validators`. See *The namespace classes* below before
+adding a function to one.
+
 ## Non-negotiable constraints
 
 These are load-bearing promises, each enforced by CI. Breaking one is a defect, not a
@@ -45,22 +50,25 @@ type costs nothing.
 
 **3. The core imports with zero optional dependencies.** `dependencies = []` is deliberate.
 Nothing heavy may be imported at module import time. Every optional import goes through
-`require(name, purpose)` (raises `MissingDependency` with a pip hint) or `have(name)` at the
-point of use. CI imports `docpipe` with `numpy`, `cv2`, `PIL`, `fitz` and `pydantic` all
+`Caps.require(name, purpose)` (raises `MissingDependency` with a pip hint) or
+`Caps.have(name)` at the point of use. CI imports `docpipe` with `numpy`, `cv2`, `PIL`, `fitz` and `pydantic` all
 blocked and asserts core functions still run.
 
 A missing dependency must fail where the user called it, not three frames deep in a backend.
 
 **4. OpenCV is optional.** Image ops need a pure-NumPy fallback. `DOCPIPE_DISABLE_OPENCV=1`
-(or `set_opencv_enabled(False)` / `with without_opencv():`) forces the fallback path, and CI
+(or `Caps.set_opencv_enabled(False)` / `with Caps.without_opencv():`) forces the fallback
+path, and CI
 re-runs the image tests that way. The `both_image_backends` fixture in `tests/conftest.py` is
 parametrized over both paths — use it for anything touching pixels.
 
 **5. Every public name is in `__all__` (section 16) and appears in the reference.** The docs
 workflow fails if an `__all__` entry has no entry on the generated page. Adding a public
-function means: implement it → add to `__all__` → docstring it.
+function means: implement it as a staticmethod on the right namespace class → add its
+module-level alias next to the others → docstring it. `__all__` gains an entry only when
+you add a *new namespace or top-level object*, not for each function.
 
-**6. Everything has a docstring.** 516/516 functions and 71/71 classes, and it stays that
+**6. Everything has a docstring.** 516/516 functions and 82/82 classes, and it stays that
 way. `docs/build_reference.py` reads the source with `ast` and never imports it, so it
 depends on the source's conventions:
 
@@ -107,23 +115,69 @@ done, that's a bug in the library.
 - **`page.history` records every op applied.** That's what makes an eval result attributable
   to a change. Ops must append to it.
 - **`PRICING` ships empty on purpose.** Token counts are always tracked; money reads `0.00`
-  and warns until the consumer calls `set_pricing`. A wrong price is worse than a missing one.
+  and warns until the consumer calls `Pricing.set_pricing`. A wrong price is worse than a
+  missing one.
+
+## The namespace classes
+
+Eleven classes group free functions by subject so the export surface is 113 names instead of
+221. Each is a pure namespace — no state, no `__init__`, nothing to instantiate.
+
+```python
+class Image(object):
+    """Raster primitives, each with an OpenCV path and a NumPy fallback."""
+
+    @staticmethod
+    def to_gray(img: ImageArray) -> GrayImage:
+        """..."""
+        arr = ensure_uint8(img)      # the flat alias, not Image.ensure_uint8
+        ...
+
+
+# Module-level aliases.  These are load-bearing, not merely back-compatible: ...
+ensure_uint8 = Image.ensure_uint8
+to_gray      = Image.to_gray
+```
+
+Three things about this that will bite you if you don't know them:
+
+- **The aliases are load-bearing.** Staticmethods call one another through the *bare* names,
+  resolved from module globals at call time. Deleting an alias as "back-compat cruft" breaks
+  the class from the inside. Every alias block carries a comment saying so.
+- **Defaults and decorators run when the class body executes.** A module constant named in a
+  default argument (`min_chars: int = MIN_NATIVE_CHARS`) or in a decorator must be defined
+  *above* the class. That is why a few constants sit just before their namespace.
+- **`@staticmethod` goes outermost**, above `@register_op`.
+
+Only add a class when a group of functions genuinely shares a subject. Stateful classes
+(`Page`, `BaseBackend`, `EvalSuite`), the layer entry points (`read`, `preprocess`,
+`extract`, `process`) and op machinery (`Op`, `compose`, `register_op`) stay top-level.
 
 ## Extension patterns
 
-**A preprocessing op** — a raster function decorated into an `Op` factory:
+**A preprocessing op** — a raster function decorated into an `Op` factory, as a staticmethod
+on `Ops`:
 
 ```python
-@register_op("my_op", geometric=False, needs_raster=True)
-def my_op(img: ImageArray, page: Page, strength: float = 1.0) -> Optional[ImageArray]:
-    """One line on what distortion this corrects, then why the threshold is what it is."""
+class Ops(object):
     ...
-    return out   # or None, meaning "nothing to correct" — the page is left untouched
+    @staticmethod
+    @register_op("my_op", geometric=False, needs_raster=True)
+    def my_op(img: ImageArray, page: Page, strength: float = 1.0) -> Optional[ImageArray]:
+        """One line on what distortion this corrects, then why the threshold is what it is."""
+        ...
+        return out   # or None, meaning "nothing to correct" — the page is left untouched
+
+
+my_op = Ops.my_op    # with the other aliases below the class
 ```
 
 `geometric=True` means the op moves pixels, so existing span coordinates must be remapped
-(see `deskew` for the affine mapping pattern). Add the name to `__all__`, and consider
-whether `default_policy` should reach for it.
+(see `deskew` for the affine mapping pattern). `__all__` does not change — `Ops` is already
+exported. Consider whether `default_policy` should reach for it.
+
+Registering an op from *outside* this file needs no class at all: `register_op` populates
+`OP_FACTORIES` from anywhere.
 
 **A reading backend** — subclass `BaseBackend`, implement `_read` (not `read`; the base
 handles timing, span sourcing and script detection) and `is_available`, then register a
@@ -151,6 +205,30 @@ docpipe eval datasets/bills --schema s.json --baseline reports/prev.json   # non
 ```
 
 `/check` runs the whole CI gate locally; `/docs` rebuilds and verifies the reference.
+
+## Releasing
+
+The PyPI distribution is **`docpipe-core`** — the plain name `docpipe` belongs to an
+unrelated project. The import name is unaffected: one module, `docpipe.py`, so
+`pip install docpipe-core` still gives `import docpipe`. Don't "fix" the mismatch.
+
+The version is stated twice — `pyproject.toml` and `__version__` in `docpipe.py` — because a
+vendored copy has no `pyproject.toml` to read it from. CI fails if the two drift, and
+`publish.yml` fails if the tag disagrees with either.
+
+```bash
+# bump both, then:
+git tag v0.2.0 && git push origin v0.2.0
+```
+
+The tag triggers `publish.yml`: it re-runs the full `ci.yml` gate on that commit, checks
+tag ↔ version agreement, builds, `twine check --strict`s, installs the wheel into a clean
+venv *outside the checkout* (inside it, `sys.path` picks up `./docpipe.py` and the check
+proves nothing), and uploads via PyPI Trusted Publishing — no API token in secrets.
+
+`MANIFEST.in` puts `tests/` **including `conftest.py`** in the sdist. Every fixture lives in
+that file; shipping the tests without it gives downstream packagers a suite that cannot
+collect.
 
 ## Style
 

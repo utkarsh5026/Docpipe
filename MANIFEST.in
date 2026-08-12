@@ -1,0 +1,23 @@
+# What goes into the sdist beyond the module itself.
+#
+# setuptools picks up tests/test_*.py on its own but not conftest.py, which is
+# where every fixture lives -- an sdist with one and not the other ships a test
+# suite that cannot collect.  Downstream packagers build from the sdist and run
+# the suite to decide whether the build is good, so it is included in full.
+recursive-include tests *.py
+
+# The prose a user needs when they have the tarball and no network.
+include LICENSE
+include README.md
+include How-to-use.md
+include CLAUDE.md
+
+# The reference generator reads docpipe.py with `ast` and needs nothing else,
+# so it works straight out of the sdist.
+recursive-include docs *.py
+
+# Never ship the caches or the built page.
+global-exclude *.py[cod]
+global-exclude .DS_Store
+prune site
+prune __pycache__

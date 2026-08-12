@@ -3,7 +3,12 @@ requires = ["setuptools>=61.0"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "docpipe"
+# The distribution is `docpipe-core` because `docpipe` on PyPI belongs to an
+# unrelated project.  The *import* name is unaffected -- this ships one module,
+# `docpipe.py`, so `pip install docpipe-core` still gives you `import docpipe`.
+name = "docpipe-core"
+# Kept in lockstep with `__version__` in docpipe.py; the release workflow
+# refuses to publish if the two disagree with each other or with the tag.
 version = "0.1.0"
 description = "A single-file document intelligence substrate: ingest, adaptive preprocessing, pluggable OCR/VLM backends, schema-driven extraction with provenance, calibrated confidence, and an evaluation harness."
 readme = "README.md"
@@ -27,8 +32,8 @@ classifiers = [
 
 # The core -- IR, normalisation, confidence fusion, extraction plumbing and the
 # eval harness -- is pure standard library.  Everything heavier is optional and
-# imported lazily, so `pip install docpipe` stays small and the library can be
-# vendored as a single file.
+# imported lazily, so `pip install docpipe-core` stays small and the library can
+# be vendored as a single file.
 dependencies = []
 
 [project.optional-dependencies]
@@ -46,27 +51,62 @@ surya = ["surya-ocr>=0.6"]
 # Vision-language backends and extraction clients.
 anthropic = ["anthropic>=0.40"]
 openai = ["openai>=1.40"]
+# The unified Google SDK (`from google import genai`), which reaches both the
+# Gemini Developer API and Vertex AI.  Not the deprecated `google-generativeai`.
+gemini = ["google-genai>=1.0"]
 
 # Schema-driven extraction (v1 and v2 are both supported).
 schema = ["pydantic>=1.10"]
 
+# The worked example in examples/hospital_bill.ipynb.  It renders its own bill,
+# degrades it, and reads it with a stub backend, so it needs neither an OCR
+# engine nor an API key -- numpy and pillow are the whole runtime.  `ipykernel`
+# is the only hard requirement for an editor's Jupyter client; `jupyterlab` is
+# the browser UI and `nbconvert` the command-line runner.
+notebook = [
+    "numpy>=1.19",
+    "pillow>=9.0",
+    "ipykernel>=6.0",
+    "jupyterlab>=4.0",
+    "nbconvert>=7.0",
+]
+
 dev = [
-    "docpipe[core,schema]",
+    "docpipe-core[core,schema]",
     "pytest>=7.0",
     "pytest-cov>=4.0",
+    # Release plumbing: `build` produces the sdist and wheel, `twine` checks the
+    # rendered metadata before anything reaches PyPI.
+    "build>=1.0",
+    "twine>=5.0",
 ]
 
 # Everything that installs cleanly without a GPU or a system package.
-all = ["docpipe[core,schema,tesseract,rapidocr,anthropic,openai]"]
+all = ["docpipe-core[core,schema,tesseract,rapidocr,anthropic,openai,gemini]"]
 
 [project.scripts]
 docpipe = "docpipe:main"
 
 [project.urls]
+Homepage = "https://github.com/utkarsh5026/Docpipe"
+Documentation = "https://utkarsh5026.github.io/Docpipe/"
 Repository = "https://github.com/utkarsh5026/Docpipe"
+Issues = "https://github.com/utkarsh5026/Docpipe/issues"
 
 [tool.setuptools]
 py-modules = ["docpipe"]
+
+[tool.pyright]
+# Pylance/pyright pick this up automatically, so an editor reports the same
+# thing CI would.  The floor the library promises is the floor it is checked
+# against: annotations that only work on a newer stdlib fail here first.
+include = ["docpipe.py", "tests", "docs", "examples"]
+pythonVersion = "3.8"
+typeCheckingMode = "standard"
+# Optional dependencies are absent by design and resolve to Any at their point
+# of use; missing stubs for them are not findings.
+reportMissingImports = false
+reportMissingModuleSource = false
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
