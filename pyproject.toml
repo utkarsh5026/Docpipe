@@ -50,7 +50,7 @@ surya = ["surya-ocr>=0.6"]
 
 # Vision-language backends and extraction clients.
 anthropic = ["anthropic>=0.40"]
-openai = ["openai>=1.40"]
+openai = ["openai>=3.19.2"]
 # The unified Google SDK (`from google import genai`), which reaches both the
 # Gemini Developer API and Vertex AI.  Not the deprecated `google-generativeai`.
 gemini = ["google-genai>=1.0"]
