@@ -73,12 +73,12 @@ notebook = [
 
 dev = [
     "docpipe-core[core,schema]",
-    "pytest>=7.0",
-    "pytest-cov>=4.0",
+    "pytest>=9.1.1",
+    "pytest-cov>=7.1.0",
     # Release plumbing: `build` produces the sdist and wheel, `twine` checks the
     # rendered metadata before anything reaches PyPI.
-    "build>=1.0",
-    "twine>=5.0",
+    "build>=1.6.1",
+    "twine>=7.0.0",
 ]
 
 # Everything that installs cleanly without a GPU or a system package.
