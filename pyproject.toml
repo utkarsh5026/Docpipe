@@ -68,7 +68,7 @@ notebook = [
     "pillow>=9.0",
     "ipykernel>=6.0",
     "jupyterlab>=4.0",
-    "nbconvert>=7.0",
+    "nbconvert>=7.17.1",
 ]
 
 dev = [
