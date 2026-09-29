@@ -45,7 +45,7 @@ tesseract = ["pytesseract>=0.3.10"]
 paddle = ["paddleocr>=2.7"]
 rapidocr = ["rapidocr-onnxruntime>=1.3"]
 easyocr = ["easyocr>=1.7"]
-doctr = ["python-doctr>=0.8"]
+doctr = ["python-doctr>=1.0.1"]
 surya = ["surya-ocr>=0.6"]
 
 # Vision-language backends and extraction clients.
